@@ -85,6 +85,49 @@ pve_oci_cluster_lxc_node_for_vmid() {
   printf '%s\n' "$out"
 }
 
+# refresh / cmd_refresh: decide if vmid is an LXC when pct config is missing on this member.
+# Sets PVE_OCI_REFRESH_PCT_OK=1 when pct config works here; else PVE_OCI_REFRESH_PCT_OK=0 and
+# PVE_OCI_REFRESH_LXC_ON_NODE to the node name used for a successful pvesh …/lxc/…/config probe.
+# Optional compose_node_hint is tried after the cluster-reported hosting node.
+# Returns 0 if config is readable (pct or pvesh); 1 if not a resolvable LXC.
+pve_oci_lxc_refresh_resolve_context() {
+  local vmid="$1" hint="${2:-}" host_from_api="" n=""
+
+  PVE_OCI_REFRESH_PCT_OK=0
+  PVE_OCI_REFRESH_LXC_ON_NODE=""
+  [[ "$vmid" =~ ^[0-9]+$ ]] || return 1
+
+  if pct config "$vmid" &>/dev/null; then
+    PVE_OCI_REFRESH_PCT_OK=1
+    if command -v pvecm >/dev/null 2>&1; then
+      PVE_OCI_REFRESH_LXC_ON_NODE="$(pvecm nodename 2>/dev/null || hostname -s)"
+    else
+      PVE_OCI_REFRESH_LXC_ON_NODE="$(hostname -s)"
+    fi
+    return 0
+  fi
+
+  host_from_api="$(pve_oci_cluster_lxc_node_for_vmid "$vmid" 2>/dev/null || true)"
+  n=""
+  if [[ -n "$host_from_api" ]] && pvesh get "/nodes/${host_from_api}/lxc/${vmid}/config" --output-format json &>/dev/null; then
+    n="$host_from_api"
+  elif [[ -n "$hint" && "$hint" != "$host_from_api" ]] && pvesh get "/nodes/${hint}/lxc/${vmid}/config" --output-format json &>/dev/null; then
+    n="$hint"
+  elif [[ -n "$hint" && -z "$host_from_api" ]] && pvesh get "/nodes/${hint}/lxc/${vmid}/config" --output-format json &>/dev/null; then
+    n="$hint"
+  fi
+
+  if [[ -n "$n" ]]; then
+    PVE_OCI_REFRESH_LXC_ON_NODE="$n"
+    if [[ -n "$host_from_api" && -n "$hint" && "$host_from_api" != "$hint" ]]; then
+      echo "refresh: warning: compose node: '${hint}' != cluster placement '${host_from_api}' (using node '${n}' for existence)." >&2
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
 # Tags string for pct UI (semicolon-separated). Uses pct(1) when /etc/pve is visible here; else
 # pvesh GET /nodes/<host>/lxc/<vmid>/config when cluster resources list the CT (other member / pmxcfs).
 pve_oci_lxc_tags_pct_or_api() {

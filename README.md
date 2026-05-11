@@ -128,7 +128,7 @@ See **`compose.example.yaml`**: a minimal working service plus **long commented 
 |---------|----------|
 | **plan** | No changes. For each service: CT exists?, **marker path** + **`tags:`**, **`ref`** read from **`/etc/pve-oci-compose.json`** only, would **apply** / **refresh**? If the vmid is an **existing LXC** without compose marker/tag (e.g. OCI created outside this tool), **plan** prints a **WARNING** and **would REFUSE** for **apply** so you can verify before pulling templates. |
 | **apply** | If missing, **create**, then sentinel tag **`pve-oci-compose`** + guest JSON marker (**`pct mount`** briefly on a stopped CT). **plan**/`refresh` use **`pct exec`** when running else **`pct mount`** to read the JSON. Before pull/create, **apply** checks **`pvesh get /cluster/resources`** so a vmid already used by a **QEMU** guest fails immediately (LXC-only **`pct config`** is not enough). An LXC may **run on another cluster node**: **`pct config`** can fail on the member where you run the script even though the guest exists; the tool then uses the API (**hosting node** from resources + **`pvesh …/lxc/<vmid>/config`**) for **tags** and still treats the vmid as taken. If the vmid is an existing LXC without a compose marker/tag, **apply** refuses (same as “not adopted”) instead of pulling then failing at **`pct create`**. |
-| **refresh** | If compose **`image`** ≠ stored **`ref`** ( **`--force`** always), refresh rootfs then reconcile tag + JSON. |
+| **refresh** | If compose **`image`** ≠ stored **`ref`** ( **`--force`** always), refresh rootfs then reconcile tag + JSON. Existence uses **`pct config`** or, when that fails on a cluster member, **`pvesh`** on the hosting node ( **`/cluster/resources`** ) and your compose **`node:`** hint; if the CT is on another member, the tool tells you to re-run refresh there (**`pct mount`** is local to the host that holds the rootfs). |
 | **pull** | For each service, run the create script with **`--pull-only`** (and your `template_storage` / `image`). |
 
 ### Flags
@@ -159,7 +159,7 @@ Use **pinned tags or digests** in compose when you care about exactly when a ref
 - **Why a scratch CT for refresh:** Proxmox turns an OCI template into a runnable root tree via **`pct create`** (unpack + metadata). There is no supported one-step “re-unpack this vztmpl **onto** an existing CT’s root volume in place.” Alternatives would be hand-unpacking the **`.tar`** to a directory and **`rsync`** (still scratch space + you must mirror whatever **`pct create`** does), or a second volume you swap in (**ZFS** dataset replace, etc.)—more moving parts. The temp VMID is only a **read source** for **`rsync`**; **`PVE_OCI_CREATE_QUIET=1`** trims duplicate create-style banners so logs read as “refresh,” not “go start this CT.”
 - **Stateful data**: keep long-lived data on **`mp`** volumes or bind mounts, not only on rootfs—the refresh worker replaces the root tree (see the refresh script README for details).
 - **Snapshots / backups**: refresh uses the worker’s snapshot behaviour; production DR is still **vzdump** / PBS / your policy—not replaced by this tool.
-- **Clusters**: run on the node that owns the CT; remote placement is out of scope for this driver.
+- **Clusters**: run **refresh** on the node that owns the CT (**`pct mount`** / **`rsync`** need local storage). If you run it elsewhere, the driver resolves the guest via the API (and **`node:`** in compose) and errors with the hosting node name instead of “vmid does not exist.”
 
 ## Help
 

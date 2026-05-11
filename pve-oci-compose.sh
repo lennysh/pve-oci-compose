@@ -731,7 +731,7 @@ cmd_apply() {
 }
 
 cmd_refresh() {
-  local json sname svc vmid image merged stored ts stack effpool sa rj
+  local json sname svc vmid image merged stored ts stack effpool sa rj compose_node me adopt_ex
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
@@ -751,7 +751,21 @@ cmd_refresh() {
     export PVE_OCI_COMPOSE_SERVICE="$sname"
     export PVE_OCI_COMPOSE_REF="$image"
 
-    pct config "$vmid" &>/dev/null || die "refresh: [$sname] vmid $vmid does not exist"
+    compose_node="$(jq -r '.node // empty' <<<"$svc")"
+    unset PVE_OCI_REFRESH_PCT_OK PVE_OCI_REFRESH_LXC_ON_NODE 2>/dev/null || true
+    if ! pve_oci_lxc_refresh_resolve_context "$vmid" "$compose_node"; then
+      die "refresh: [$sname] vmid $vmid does not exist (no local pct config and no LXC config via pvesh / cluster API)"
+    fi
+    if [[ "${PVE_OCI_REFRESH_PCT_OK:-0}" -ne 1 ]]; then
+      me="$(pvecm nodename 2>/dev/null || hostname -s)"
+      if [[ -n "${PVE_OCI_REFRESH_LXC_ON_NODE:-}" && "${PVE_OCI_REFRESH_LXC_ON_NODE}" != "$me" ]]; then
+        adopt_ex=""
+        [[ "$ADOPT" -eq 1 ]] && adopt_ex=" --adopt"
+        die "refresh: [$sname] CT $vmid is on Proxmox node '${PVE_OCI_REFRESH_LXC_ON_NODE}' but this shell is on '${me}'. refresh runs pct mount/rsync on the host that owns the guest. Log in to '${PVE_OCI_REFRESH_LXC_ON_NODE}', cd to the directory that holds ${COMPOSE_FILE}, and run the same refresh${adopt_ex} command there."
+      fi
+      die "refresh: [$sname] vmid $vmid: pvesh sees this node as '${PVE_OCI_REFRESH_LXC_ON_NODE:-?}' but pct config failed here (check cluster quorum / pmxcfs / membership)."
+    fi
+    unset PVE_OCI_REFRESH_PCT_OK PVE_OCI_REFRESH_LXC_ON_NODE 2>/dev/null || true
 
     stored="$(pve_oci_stored_ref "$vmid")"
 
