@@ -7,6 +7,8 @@ name: example-stack
 
 defaults:
   template_storage: "" # vztmpl storage id for oci-registry-pull; omit or "" to auto-pick when unique
+  # net0 is passed to pct --net0. Add tag=VLAN for 802.1Q on a VLAN-aware bridge (see PVE wiki: VLAN on bridge).
+  # Example VLAN 42:  'name=eth0,bridge=vmbr0,tag=42,ip=dhcp'
   net0: "name=eth0,bridge=vmbr0,ip=dhcp"
   unprivileged: 1
   onboot: 0
