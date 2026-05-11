@@ -338,7 +338,7 @@ run_or_print() {
 }
 
 cmd_plan() {
-  local json sname svc spec vmid image rootfs tags stored exists hint mr stack effpool sa desc_preview
+  local json sname svc spec vmid image rootfs tags stored exists hint mr stack effpool sa desc_preview managedp guest_svc mrj ck
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
@@ -379,6 +379,7 @@ cmd_plan() {
     else
       exists=no
     fi
+    ck="$(pve_oci_cluster_resources_vmid_kind "$vmid")"
 
     echo "=== service: $sname (vmid $vmid) ==="
     echo "  exists:        $exists"
@@ -413,19 +414,41 @@ cmd_plan() {
       printf '%s\n' "$desc_preview" | sed 's/^/    /'
     fi
     if [[ "$exists" == yes ]]; then
-      if [[ -z "$stored" ]]; then
-        echo "  plan apply:    no-op (already exists)"
-        echo "  plan refresh:  blocked (guest marker unreadable — use --adopt if intentional)"
+      managedp=0
+      [[ -n "$stored" ]] && managedp=1
+      [[ "$tags" == *pve-oci-compose* ]] && managedp=1
+      if [[ "$managedp" -eq 0 ]]; then
+        echo "  WARNING:       vmid $vmid exists but is **not** compose-managed (no readable ${mr} and no pve-oci-compose tag). Common case: LXC from OCI created in the Proxmox UI or another workflow, not this compose file."
+        echo "  plan apply:    would **REFUSE** (cannot create over that CT; use a different vmid: or remove/rename the CT first)"
+        echo "  plan refresh:  blocked (no marker — use --adopt only after you intentionally align this CT with this compose service)"
       else
-        echo "  stored ref:    $stored"
-        if [[ "$stored" == "$image" ]]; then
-          echo "  plan refresh:  skip (ref matches)"
+        mrj="$(pve_oci_marker_read_rootfs_json "$vmid" 2>/dev/null || true)"
+        guest_svc="$(printf '%s' "$mrj" | jq -r '.service // empty' 2>/dev/null || true)"
+        if [[ -n "$guest_svc" && "$guest_svc" != "$sname" ]]; then
+          echo "  WARNING:       guest marker service is '${guest_svc}' but compose service key is '${sname}' (vmid binding mismatch)."
+          echo "  plan apply:    would **REFUSE** (wrong service name for this vmid)"
         else
-          echo "  plan refresh:  would run refresh → $image"
+          if [[ -n "$stored" ]]; then
+            echo "  stored ref:    $stored"
+          else
+            echo "  stored ref:    <unreadable from plan context — tag marks compose-managed; try refresh when CT is running or mountable>"
+          fi
+          if [[ -z "$stored" ]]; then
+            echo "  plan refresh:  drift check needs readable ${mr} (same rules as refresh command)"
+          elif [[ "$stored" == "$image" ]]; then
+            echo "  plan refresh:  skip (ref matches)"
+          else
+            echo "  plan refresh:  would run refresh → $image"
+          fi
+          echo "  plan apply:    no-op (already exists, compose-managed)"
         fi
-        echo "  plan apply:    no-op (already exists)"
       fi
     else
+      case "$ck" in
+        qemu)
+          echo "  WARNING:       vmid $vmid is already used by a QEMU VM (shared id space); apply would refuse before pull."
+          ;;
+      esac
       echo "  plan apply:    would create from $image"
       echo "  plan refresh:  n/a (CT missing)"
     fi
@@ -608,7 +631,24 @@ cmd_apply() {
       resolved="$spec"
     fi
 
+    cluster_kind="$(pve_oci_cluster_resources_vmid_kind "$resolved")"
+
     if pct config "$resolved" &>/dev/null; then
+      stored="$(pve_oci_stored_ref "$resolved")"
+      tags="$(pve_oci_pct_tags "$resolved")"
+      managed=0
+      [[ -n "$stored" ]] && managed=1
+      [[ "$tags" == *pve-oci-compose* ]] && managed=1
+      if [[ "$managed" -eq 0 ]]; then
+        die "apply: [$sname] vmid $resolved is an existing LXC not managed by pve-oci-compose (no readable guest marker ${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json} and no pve-oci-compose tag). Typical: OCI template deployed from the Proxmox UI or another script, not this compose file. apply will not pull or create over it. Use a different vmid:, remove/rename that CT, or after you intentionally align it with this stack use refresh --adopt (not apply). Same refusal if vmid: next and the cluster next id points at an unmanaged CT."
+      fi
+      if [[ "$managed" -eq 1 && "$spec" != next ]]; then
+        mrj="$(pve_oci_marker_read_rootfs_json "$resolved" 2>/dev/null || true)"
+        guest_svc="$(printf '%s' "$mrj" | jq -r '.service // empty' 2>/dev/null || true)"
+        if [[ -n "$guest_svc" && "$guest_svc" != "$sname" ]]; then
+          die "apply: [$sname] vmid $resolved is already bound to compose service '${guest_svc}', not '${sname}'. Change vmid: or the services: key."
+        fi
+      fi
       echo "apply: [$sname] vmid $resolved already exists — skip create"
       effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
       if [[ -n "$effpool" && "$DRY_RUN" -eq 0 ]]; then
@@ -620,6 +660,15 @@ cmd_apply() {
       fi
       continue
     fi
+
+    case "$cluster_kind" in
+      qemu)
+        die "apply: [$sname] vmid $resolved is already used by a QEMU VM (or other non-LXC guest) in the cluster—LXC and VM ids share one namespace. Choose another vmid or retire that guest before apply."
+        ;;
+      lxc)
+        die "apply: [$sname] vmid $resolved is listed as an LXC on the cluster but pct config did not return a config (sync or permissions). Cannot apply safely."
+        ;;
+    esac
 
     echo "apply: [$sname] creating vmid $resolved from $image"
     effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"

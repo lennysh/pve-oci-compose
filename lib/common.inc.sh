@@ -29,6 +29,42 @@ pve_oci_next_cluster_id() {
   printf '%s\n' "$id"
 }
 
+# Which guest type holds vmid in the cluster (qemu and lxc both reserve the same vmid namespace).
+# stdout: one of: free | lxc | qemu | unknown
+pve_oci_cluster_resources_vmid_kind() {
+  local vmid="$1" raw out
+  [[ "$vmid" =~ ^[0-9]+$ ]] || {
+    printf 'unknown\n'
+    return 0
+  }
+  command -v pvesh >/dev/null 2>&1 || {
+    printf 'unknown\n'
+    return 0
+  }
+  command -v jq >/dev/null 2>&1 || {
+    printf 'unknown\n'
+    return 0
+  }
+  raw="$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null)" || {
+    printf 'unknown\n'
+    return 0
+  }
+  out="$(printf '%s\n' "$raw" | jq -r --argjson vid "$vmid" '
+    def unwrap:
+      if type == "string" then (if test("^\\s*\\{") then fromjson else . end)
+      else . end;
+    (unwrap | if type == "object" and (.data != null) then .data else . end)
+    | if type == "array" then . else [] end
+    | map(select((.type == "lxc" or .type == "qemu") and (.vmid == $vid)))
+    | if length == 0 then "free"
+      elif .[0].type == "qemu" then "qemu"
+      else "lxc"
+      end
+  ' 2>/dev/null)" || out=""
+  [[ -n "$out" ]] || out="unknown"
+  printf '%s\n' "$out"
+}
+
 # Encode a REST path segment (e.g. task UPID) so colons in UPID don't break parsing of the URL.
 pve_api_quote_path_segment() {
   python3 -c '
@@ -138,23 +174,21 @@ pve_oci_marker_ref_from_json_text() {
   printf '%s' "$1" | _pve_oci_marker_ref_from_json_blob || return 1
 }
 
-# Best-effort: ref from marker file inside guest (pct exec while running else mount).
-pve_oci_marker_read_rootfs_ref() {
-  local vmid="$1" mr mp js r
+# Raw marker JSON from guest rootfs (pct exec while running else mount). stdout; exit 1 if missing.
+pve_oci_marker_read_rootfs_json() {
+  local vmid="$1" mr mp js
   mr="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
   [[ "$mr" == /* ]] || mr="/$mr"
-  js=""
   mp="$(pve_oci_ct_rootfs_mountpoint "$vmid")"
-
-  # pct status prints a single-word status line (normally "running" when active).
+  js=""
   if [[ "$(pct status "$vmid" 2>/dev/null | tr -d '\r')" == running ]]; then
     js="$(pct exec "$vmid" -- cat "$mr" 2>/dev/null || true)"
-    if [[ -n "$js" ]]; then
-      r="$(pve_oci_marker_ref_from_json_text "$js")" || r=""
-      if [[ -n "$r" ]]; then printf '%s\n' "$r"; return 0; fi
-    fi
+    [[ -n "$js" ]] && {
+      printf '%s' "$js"
+      return 0
+    }
+    return 1
   fi
-
   if ! pct mount "$vmid" >/dev/null 2>&1; then
     return 1
   fi
@@ -162,7 +196,18 @@ pve_oci_marker_read_rootfs_ref() {
   if [[ -r "${mp%/}${mr}" ]]; then js="$(cat -- "${mp%/}${mr}")" || js=""; fi
   pct unmount "$vmid" >/dev/null 2>&1 || true
   trap - EXIT
-  [[ -z "$js" ]] && return 1
+  [[ -n "$js" ]] && {
+    printf '%s' "$js"
+    return 0
+  }
+  return 1
+}
+
+# Best-effort: ref from marker file inside guest (pct exec while running else mount).
+pve_oci_marker_read_rootfs_ref() {
+  local vmid="$1" js r
+  js="$(pve_oci_marker_read_rootfs_json "$vmid" 2>/dev/null)" || return 1
+  [[ -n "$js" ]] || return 1
   r="$(pve_oci_marker_ref_from_json_text "$js")" || return 1
   [[ -n "$r" ]] || return 1
   printf '%s\n' "$r"

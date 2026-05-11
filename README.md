@@ -126,8 +126,8 @@ See **`compose.example.yaml`**: a minimal working service plus **long commented 
 
 | Command | Behavior |
 |---------|----------|
-| **plan** | No changes. For each service: CT exists?, **marker path** + **`tags:`**, **`ref`** read from **`/etc/pve-oci-compose.json`** only, would **apply** / **refresh**? |
-| **apply** | If missing, **create**, then sentinel tag **`pve-oci-compose`** + guest JSON marker (**`pct mount`** briefly on a stopped CT). **plan**/`refresh` use **`pct exec`** when running else **`pct mount`** to read the JSON. |
+| **plan** | No changes. For each service: CT exists?, **marker path** + **`tags:`**, **`ref`** read from **`/etc/pve-oci-compose.json`** only, would **apply** / **refresh**? If the vmid is an **existing LXC** without compose marker/tag (e.g. OCI created outside this tool), **plan** prints a **WARNING** and **would REFUSE** for **apply** so you can verify before pulling templates. |
+| **apply** | If missing, **create**, then sentinel tag **`pve-oci-compose`** + guest JSON marker (**`pct mount`** briefly on a stopped CT). **plan**/`refresh` use **`pct exec`** when running else **`pct mount`** to read the JSON. Before pull/create, **apply** checks **`pvesh get /cluster/resources`** so a vmid already used by a **QEMU** guest fails immediately (LXC-only **`pct config`** is not enough). If the vmid is an existing LXC without a compose marker/tag, **apply** refuses (same as “not adopted”) instead of pulling then failing at **`pct create`**. |
 | **refresh** | If compose **`image`** ≠ stored **`ref`** ( **`--force`** always), refresh rootfs then reconcile tag + JSON. |
 | **pull** | For each service, run the create script with **`--pull-only`** (and your `template_storage` / `image`). |
 
