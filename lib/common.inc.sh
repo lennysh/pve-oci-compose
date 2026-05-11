@@ -65,6 +65,58 @@ pve_oci_cluster_resources_vmid_kind() {
   printf '%s\n' "$out"
 }
 
+# Hosting node name for an LXC vmid (from /cluster/resources). stdout; exit 1 if not found / not lxc.
+pve_oci_cluster_lxc_node_for_vmid() {
+  local vmid="$1" raw out
+  [[ "$vmid" =~ ^[0-9]+$ ]] || return 1
+  command -v pvesh >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  raw="$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null)" || return 1
+  out="$(printf '%s\n' "$raw" | jq -r --argjson vid "$vmid" '
+    def unwrap:
+      if type == "string" then (if test("^\\s*\\{") then fromjson else . end)
+      else . end;
+    (unwrap | if type == "object" and (.data != null) then .data else . end)
+    | if type == "array" then . else [] end
+    | map(select(.type == "lxc" and .vmid == $vid))
+    | if length > 0 then (.[0].node // empty) else empty end
+  ' 2>/dev/null)" || out=""
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# Tags string for pct UI (semicolon-separated). Uses pct(1) when /etc/pve is visible here; else
+# pvesh GET /nodes/<host>/lxc/<vmid>/config when cluster resources list the CT (other member / pmxcfs).
+pve_oci_lxc_tags_pct_or_api() {
+  local vmid="$1" node raw tags
+  tags="$(pct config "$vmid" 2>/dev/null | sed -n 's/^tags: //p' | head -1 || true)"
+  tags="${tags//$'\r'/}"
+  [[ -n "${tags//[[:space:]]/}" ]] && {
+    printf '%s\n' "$tags"
+    return 0
+  }
+  node="$(pve_oci_cluster_lxc_node_for_vmid "$vmid" 2>/dev/null)" || node=""
+  [[ -z "$node" ]] && {
+    printf '%s\n' ""
+    return 0
+  }
+  raw="$(pvesh get "/nodes/${node}/lxc/${vmid}/config" --output-format json 2>/dev/null)" || raw=""
+  tags="$(printf '%s\n' "$raw" | jq -r '
+    def unwrap:
+      if type == "string" then (if test("^\\s*\\{") then fromjson else . end)
+      else . end;
+    def cfg:
+      (unwrap | if type == "object" and (.data != null) then .data else . end);
+    cfg
+    | if type == "object" and (.tags | type) == "string" then .tags
+      elif type == "object" and (.tags != null) then (.tags | tostring)
+      elif type == "array" then
+        ([.[] | select(.key == "tags")] | first | .value // empty)
+      else empty end
+  ' 2>/dev/null)" || tags=""
+  printf '%s\n' "${tags:-}"
+}
+
 # Encode a REST path segment (e.g. task UPID) so colons in UPID don't break parsing of the URL.
 pve_api_quote_path_segment() {
   python3 -c '
@@ -108,8 +160,7 @@ pve_task_status_from_json() {
 PVE_OCI_ROOTFS_MARKER="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
 
 pve_oci_pct_tags() {
-  local vmid="$1"
-  pct config "$vmid" 2>/dev/null | sed -n 's/^tags: //p' | head -1 || true
+  pve_oci_lxc_tags_pct_or_api "${1:?}"
 }
 
 pve_oci_ct_rootfs_mountpoint() {

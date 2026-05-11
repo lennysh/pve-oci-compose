@@ -338,7 +338,7 @@ run_or_print() {
 }
 
 cmd_plan() {
-  local json sname svc spec vmid image rootfs tags stored exists hint mr stack effpool sa desc_preview managedp guest_svc mrj ck
+  local json sname svc spec vmid image rootfs tags stored exists hint mr stack effpool sa desc_preview managedp guest_svc mrj ck hostn pct_readable
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
@@ -372,17 +372,29 @@ cmd_plan() {
     vmid="$spec"
     mr="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
     effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
+    ck="$(pve_oci_cluster_resources_vmid_kind "$vmid")"
     tags="$(pve_oci_pct_tags "$vmid")"
     stored="$(pve_oci_stored_ref "$vmid")"
-    if pct config "$vmid" &>/dev/null; then
+    pct_readable=no
+    pct config "$vmid" &>/dev/null && pct_readable=yes
+    if [[ "$pct_readable" == yes ]]; then
+      exists=yes
+    elif [[ "$ck" == lxc ]]; then
       exists=yes
     else
       exists=no
     fi
-    ck="$(pve_oci_cluster_resources_vmid_kind "$vmid")"
 
     echo "=== service: $sname (vmid $vmid) ==="
     echo "  exists:        $exists"
+    if [[ "$exists" == yes && "$pct_readable" == no && "$ck" == lxc ]]; then
+      hostn="$(pve_oci_cluster_lxc_node_for_vmid "$vmid" 2>/dev/null || true)"
+      if [[ -n "$hostn" ]]; then
+        echo "  cluster note:  LXC vmid $vmid runs on node '${hostn}'; this member cannot read pct config for it (pmxcfs/quorum). Tags above may come from pvesh GET /nodes/${hostn}/lxc/${vmid}/config."
+      else
+        echo "  cluster note:  pct config is unreadable here but the LXC is listed in the cluster API; tags may come from pvesh on the hosting node when resolvable."
+      fi
+    fi
     echo "  image (file):  $image"
     echo "  rootfs:        $rootfs"
     ns_plan="$(jq -r '
@@ -632,15 +644,22 @@ cmd_apply() {
     fi
 
     cluster_kind="$(pve_oci_cluster_resources_vmid_kind "$resolved")"
-
+    lxc_there=0
     if pct config "$resolved" &>/dev/null; then
+      lxc_there=1
+    elif [[ "$cluster_kind" == lxc ]]; then
+      # CT may live on another node: /cluster/resources still lists it; pct config can fail here without pmxcfs.
+      lxc_there=1
+    fi
+
+    if [[ "$lxc_there" -eq 1 ]]; then
       stored="$(pve_oci_stored_ref "$resolved")"
       tags="$(pve_oci_pct_tags "$resolved")"
       managed=0
       [[ -n "$stored" ]] && managed=1
       [[ "$tags" == *pve-oci-compose* ]] && managed=1
       if [[ "$managed" -eq 0 ]]; then
-        die "apply: [$sname] vmid $resolved is an existing LXC not managed by pve-oci-compose (no readable guest marker ${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json} and no pve-oci-compose tag). Typical: OCI template deployed from the Proxmox UI or another script, not this compose file. apply will not pull or create over it. Use a different vmid:, remove/rename that CT, or after you intentionally align it with this stack use refresh --adopt (not apply). Same refusal if vmid: next and the cluster next id points at an unmanaged CT."
+        die "apply: [$sname] vmid $resolved is an existing LXC not managed by pve-oci-compose (no readable guest marker ${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json} and no pve-oci-compose tag in pct/pvesh). Typical: OCI template deployed from the Proxmox UI or another script, not this compose file. apply will not pull or create over it. Use a different vmid:, remove/rename that CT, or after you intentionally align it with this stack use refresh --adopt (not apply). Same refusal if vmid: next and the cluster next id points at an unmanaged CT."
       fi
       if [[ "$managed" -eq 1 && "$spec" != next ]]; then
         mrj="$(pve_oci_marker_read_rootfs_json "$resolved" 2>/dev/null || true)"
@@ -664,9 +683,6 @@ cmd_apply() {
     case "$cluster_kind" in
       qemu)
         die "apply: [$sname] vmid $resolved is already used by a QEMU VM (or other non-LXC guest) in the cluster—LXC and VM ids share one namespace. Choose another vmid or retire that guest before apply."
-        ;;
-      lxc)
-        die "apply: [$sname] vmid $resolved is listed as an LXC on the cluster but pct config did not return a config (sync or permissions). Cannot apply safely."
         ;;
     esac
 
