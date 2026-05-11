@@ -243,15 +243,46 @@ print(json.dumps({"service": svc, "ref": ref}, separators=(",", ":"), ensure_asc
 
 # --- Proxmox CT description (Markdown from compose) -------------------------
 # stdin: one merged service object (JSON). argv1: stack label; argv2: optional stack-level about.
+# argv3: JSON for compose "repo" key (null = default footer URL, false = no footer, string = URL).
 # stdout: text for pct --description, or empty to omit the flag (nothing to document).
 pve_oci_compose_pct_description() {
-  local stack="${1:-}" sabout="${2:-}"
+  local stack="${1:-}" sabout="${2:-}" repo_json="${3:-null}"
   python3 -c '
 import json, sys
+from urllib.parse import urlparse
+
+DEFAULT_REPO = "https://github.com/lennysh/pve-oci-compose"
 
 stack = sys.argv[1]
 stack_about = sys.argv[2]
+repo_raw = sys.argv[3] if len(sys.argv) > 3 else "null"
+try:
+    repo_cfg = json.loads(repo_raw)
+except json.JSONDecodeError:
+    repo_cfg = None
+
 svc = json.load(sys.stdin)
+
+
+def repo_footer_url(cfg):
+    if cfg is False:
+        return None
+    if isinstance(cfg, str) and cfg.strip():
+        return cfg.strip()
+    return DEFAULT_REPO
+
+
+def link_label_for_url(url):
+    if url == DEFAULT_REPO:
+        return "lennysh/pve-oci-compose"
+    try:
+        p = urlparse(url)
+        parts = [x for x in p.path.split("/") if x]
+        if len(parts) >= 2:
+            return f"{parts[-2]}/{parts[-1]}"
+        return parts[-1] if parts else "repository"
+    except Exception:
+        return "repository"
 
 def sstrip(x):
     if x is None:
@@ -341,8 +372,19 @@ if about_text:
     lines.append("")
     lines.extend(["## Notes", "", about_text])
 
+footer_url = repo_footer_url(repo_cfg)
+if footer_url:
+    lines.append("")
+    lines.extend(
+        [
+            "---",
+            "",
+            f"- **Source:** [{link_label_for_url(footer_url)}]({footer_url})",
+        ]
+    )
+
 sys.stdout.write("\n".join(lines).rstrip() + "\n")
-' "$stack" "$sabout"
+' "$stack" "$sabout" "$repo_json"
 }
 
 # --- Datacenter resource pool (UI grouping) --------------------------------

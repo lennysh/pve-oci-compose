@@ -73,6 +73,8 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   node, memory, swap, cores, cpulimit, cpuunits, ostype, arch, unprivileged, features, onboot
   nameserver, searchdomain, entrypoint, env (map or list of KEY=val), description, guest_ports, about
   tags (pct UI tags). Top-level about (string) is optional stack notes merged into the built description.
+  Top-level repo: optional string URL for the Source footer (default https://github.com/lennysh/pve-oci-compose);
+  use repo: false to omit that footer from composed descriptions.
   timezone, password, ssh_public_keys (host file path), start, startup, hookscript, protection
   ha_managed, cmode, console, tty, ignore_unpack_errors, pct_debug, bwlimit
   lxc_dev            list of pct --dev0 … device specs (order = list order)
@@ -145,9 +147,15 @@ if stack_about is not None and not isinstance(stack_about, str):
     sys.stderr.write("pve-oci-compose: top-level 'about' must be a string (multiline text) if set\n")
     sys.exit(1)
 
+repo = doc.get("repo")
+if repo is not None and not isinstance(repo, (str, bool)):
+    sys.stderr.write("pve-oci-compose: top-level 'repo' must be a string (URL), false, or omitted\n")
+    sys.exit(1)
+
 out = {
     "project": doc.get("name") or doc.get("project"),
     "stack_about": stack_about,
+    "repo": repo,
     "services": {},
 }
 for sname, svc in services.items():
@@ -352,7 +360,7 @@ cmd_plan() {
       echo "  rootfs:        $rootfs"
       echo "  plan apply:    would allocate next free vmid and create from $image"
       echo "  plan refresh:  n/a until vmid is fixed in the file (run apply to write it)"
-      desc_preview="$(printf '%s' "$svc" | pve_oci_compose_pct_description "$stack" "$sa" 2>/dev/null || true)"
+      desc_preview="$(printf '%s' "$svc" | pve_oci_compose_pct_description "$stack" "$sa" "$(jq -c '.repo' <<<"$json")" 2>/dev/null || true)"
       if [[ -n "$desc_preview" ]]; then
         echo "  pct description (preview):"
         printf '%s\n' "$desc_preview" | sed 's/^/    /'
@@ -399,7 +407,7 @@ cmd_plan() {
     echo "  marker (path): ${mr}"
     echo "  pool (target): ${effpool:-<none>}"
     echo "  tags:          ${tags:-<none>}"
-    desc_preview="$(printf '%s' "$svc" | pve_oci_compose_pct_description "$stack" "$sa" 2>/dev/null || true)"
+    desc_preview="$(printf '%s' "$svc" | pve_oci_compose_pct_description "$stack" "$sa" "$(jq -c '.repo' <<<"$json")" 2>/dev/null || true)"
     if [[ -n "$desc_preview" ]]; then
       echo "  pct description (preview):"
       printf '%s\n' "$desc_preview" | sed 's/^/    /'
@@ -430,6 +438,7 @@ fill_create_args() {
   local resolved_vmid="$2"
   local stack_default="${3:-}"
   local stack_about="${4:-}"
+  local compose_repo_json="${5:-null}"
   local ts ref vmid hostname node mem cores ostype arch feats v pool nk nv j desc_built
 
   OCI_CREATE_ARGS=()
@@ -507,7 +516,7 @@ fill_create_args() {
   [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--cpulimit "$v")
   v="$(jq -r '.cpuunits // empty | if type == "number" then tostring elif type == "string" then . else empty end' <<<"$svcjson")"
   [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--cpuunits "$v")
-  desc_built="$(printf '%s' "$svcjson" | pve_oci_compose_pct_description "${stack_default:-}" "${stack_about:-}")"
+  desc_built="$(printf '%s' "$svcjson" | pve_oci_compose_pct_description "${stack_default:-}" "${stack_about:-}" "${compose_repo_json}")"
   [[ -n "$desc_built" ]] && OCI_CREATE_ARGS+=(--description "$desc_built")
   v="$(jq -r '.tags // empty | if type == "string" then . else empty end' <<<"$svcjson")"
   [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--tags "$v")
@@ -581,10 +590,11 @@ fill_create_args() {
 OCI_CREATE_ARGS=()
 
 cmd_apply() {
-  local json sname svc spec resolved image merged stack effpool sa
+  local json sname svc spec resolved image merged stack effpool sa rj
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
+  rj="$(jq -c '.repo' <<<"$json")"
   while IFS= read -r sname; do
     unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
@@ -618,7 +628,7 @@ cmd_apply() {
     elif [[ -n "$effpool" && "$DRY_RUN" -eq 1 ]]; then
       echo "apply: [$sname] DRY-RUN: would ensure pool '$effpool' exists before pct create --pool"
     fi
-    fill_create_args "$svc" "$resolved" "$stack" "$sa"
+    fill_create_args "$svc" "$resolved" "$stack" "$sa" "$rj"
     run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then

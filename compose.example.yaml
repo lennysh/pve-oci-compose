@@ -6,6 +6,9 @@
 # Optional top-level **about:** (multiline string) is merged into the Proxmox **Notes** section of
 # the composed CT **description** for every service that opts into the rich description (see
 # **guest_ports** / per-service **about** below). Omit it if you prefer no stack-wide blurb.
+#
+# Optional **repo:** — URL string for the “Source” footer on composed descriptions (default is the
+# upstream GitHub repo). Use **repo: false** to omit that footer.
 
 # Used as the default Datacenter → Permissions → **resource pool** id (pct --pool) unless you set
 # `defaults.pool` / per-service `pool` (use `pool: ""` to opt out). Missing pools are auto-created
