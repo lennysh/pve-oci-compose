@@ -42,6 +42,7 @@ while [[ "${1:-}" == -* ]]; do
 done
 
 [[ ${1:-} ]] && [[ ${2:-} ]] || oci_refresh_usage
+ORIG_REF_RAW="$2"
 if [[ "$SKIP_SNAPSHOT" -ne 0 && "$ALLOW_FAILED_SNAPSHOT" -ne 0 ]]; then
   echo "Cannot combine --no-snapshot with --allow-failed-snapshot (nothing to allow)." >&2
   exit 1
@@ -308,6 +309,16 @@ out_detail "Mount-point excludes needed so rsync --delete does not hit bind-moun
 out_detail "${M_NEW}/ → ${M_OLD}/"
 rsync -aHAX --delete "${excludes[@]}" "${M_NEW}/" "${M_OLD}/"
 out_ok "rsync done"
+
+svc_mark="${PVE_OCI_COMPOSE_SERVICE:--}"
+ref_mark="${PVE_OCI_COMPOSE_REF:-$ORIG_REF_RAW}"
+out_sub "Guest compose marker (${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json})"
+if pve_oci_marker_write_mountpoint "$M_OLD" "$svc_mark" "$ref_mark"; then
+  out_kv "Written" "(included in pct snapshots / rollback)"
+  out_detail "Driver prefers this JSON over tags for drift detection."
+else
+  out_warn "Could not write guest marker — run compose refresh or apply afterward."
+fi
 
 trap - EXIT
 out_sub "Cleanup: unmount → destroy ${TEMP} → start ${OLD}"

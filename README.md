@@ -83,7 +83,7 @@ The file is YAML with a single top-level mapping.
 
 - **`name`** or **`project`** (optional): informational label for humans; surfaced in **plan** output.
 - **`defaults`** (optional): mapping shallow-merged into **each** service; any key on a service overrides `defaults`.
-- **`services`** (required): mapping of **service name** → **service spec** (use stable names without spaces; embedded in compose **pct tags**, see marker section).
+- **`services`** (required): mapping of **service name** → **service spec** (use stable names; stored inside the CT marker JSON plus the **`pve-oci-compose`** tag).
 
 ### Per-service fields
 
@@ -103,9 +103,9 @@ See `compose.example.yaml` for a minimal working shape.
 
 | Command | Behavior |
 |---------|----------|
-| **plan** | No changes. For each service: CT exists?, **tags** + stored image ref?, would **apply** create?, would **refresh**? |
-| **apply** | If the target CT does not exist, run **create** (pull + `pct create`), then **`pct set --tags`** merge-in the compose marker (below). Legacy **description-only** markers are cleared when superseded by tags. With **`vmid: next`**, writes the allocated id back into the compose file unless disabled. Existing CTs are left unchanged (no implicit recreate). |
-| **refresh** | If the compose image ref differs from the stored ref in **tags** (or **`--force`**), run the refresh worker, then update **tags**. |
+| **plan** | No changes. For each service: CT exists?, **marker path** + **`tags:`**, **`ref`** read from **`/etc/pve-oci-compose.json`** only, would **apply** / **refresh**? |
+| **apply** | If missing, **create**, then sentinel tag **`pve-oci-compose`** + guest JSON marker (**`pct mount`** briefly on a stopped CT). **plan**/`refresh` use **`pct exec`** when running else **`pct mount`** to read the JSON. |
+| **refresh** | If compose **`image`** ≠ stored **`ref`** ( **`--force`** always), refresh rootfs then reconcile tag + JSON. |
 | **pull** | For each service, run the create script with **`--pull-only`** (and your `template_storage` / `image`). |
 
 ### Flags
@@ -113,23 +113,18 @@ See `compose.example.yaml` for a minimal working shape.
 | Flag | Meaning |
 |------|--------|
 | `-f`, `--file PATH` | Compose file (default `./compose.yaml`). |
-| `--adopt` | **refresh** only: allow refreshing a CT with no compose **tags** and no legacy `pve-oci-compose … ref=…` **description**; marker tags are written after success. |
+| `--adopt` | **refresh** only: allow refreshing when guest marker JSON is missing/unreadable (**e.g.** hand-created CT). |
 | `--force` | **refresh** only: run refresh even when the stored ref already matches the compose image. |
 | `-n`, `--dry-run` | Print worker invocations; do not run them. |
 | `--no-write-compose` | After **apply** with `vmid: next` / `auto` / `null`, do not rewrite the compose file (same as **`PVE_OCI_COMPOSE_NO_WRITE=1`**). |
 
-## Tags marker (ownership and refresh drift)
+## Compose marker (UI + drift + snapshots)
 
-Proxmox **tags** allow only `[a-z0-9_.+-]` per segment, so the image ref cannot be stored raw. After **apply** / **refresh** the driver merges **`pct --tags`** with any tags you already have and adds:
+Canonical **`service`** + **`ref`** live in a small JSON file on the CT root disk (default **`/etc/pve-oci-compose.json`**, configurable with **`PVE_OCI_ROOTFS_MARKER`**). **`pct rollback`** restores that file with the rest of rootfs—so **`plan` / `--force` / drift checks** align with whatever image tree is actually on disk.
 
-- **`pve-oci-compose`** — ownership sentinel  
-- **`pveocid1` + URL-safe Base64(JSON `{"service","ref"}`)** — canonical compose service name + image ref string  
+Optional host tag (**`pve-oci-compose`**) stays short; **`ref`** drift always comes from the guest JSON (**`stopped`**: **`pct mount`** briefly; **`running`**: **`pct exec cat`**).
 
-**Legacy:** CTs provisioned earlier may still expose only **`pve-oci-compose service=… ref=…`** as **`pct`** **notes** (**description**). **plan** / **refresh** read **tags first**, then fall back to that description line until you next **apply**/ **refresh**.
-
-**Rollback note:** **`pct rollback`** restores the CT rootfs from the snapshot but does **not** revert **`/etc/pve/lxc/*.conf`**, so **tags** still show the newer ref until you **`pct set`** them again—or run compose **refresh**/ **apply** as appropriate after a rollback.
-
-**refresh** compares the stored **`ref`** to the current compose **`image`** / **`reference`**. If neither tags nor legacy description carries a **`ref`**, **refresh** skips unless **`--adopt`**.
+After **refresh**, the driver also updates the JSON via **`pct exec`** so the host does not need another mount.
 
 Use **pinned tags or digests** in compose when you care about exactly when a refresh runs; floating `:latest` is easy to misread across machines.
 

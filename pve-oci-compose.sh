@@ -27,14 +27,15 @@ Usage: pve-oci-compose.sh [options] <command>
 Commands:
   plan      Show create / refresh intent per service (no changes).
   apply     Create missing CTs (oci-registry-pull + pct create; see lib/oci-create.inc.sh).
-  refresh   Replace rootfs when the compose image ref differs from tags (or legacy
-            description marker; see below), or with --force (lib/oci-refresh.inc.sh).
+  refresh   Replace rootfs when compose image ref differs from the guest marker JSON
+            (or with --force); see lib/oci-refresh.inc.sh.
   pull      Pull OCI templates only (--pull-only) for each service.
 
 Options:
   -f, --file PATH   Compose file (default: ./compose.yaml or $COMPOSE_FILE)
-  --adopt           Allow refresh when the CT has no compose tags (nor legacy marker
-                    description); tags are written after a successful refresh.
+  --adopt           Refresh an unmanaged CT: no guest marker JSON yet (manual guest);
+                    marker file + sentinel tag applied after success. Path: see
+                    PVE_OCI_ROOTFS_MARKER (default /etc/pve-oci-compose.json).
   --force           refresh: run refresh even when stored ref matches compose image.
   -n, --dry-run     Print commands only (apply / refresh / pull).
   --no-write-compose After apply with vmid: next (or auto / null), do not rewrite the compose
@@ -46,10 +47,10 @@ vmid in compose:
   After a successful apply, the compose file is rewritten with the numeric vmid (PyYAML
   round-trip: comments/formatting may change — back up the file or pass --no-write-compose).
 
-Compose marker after create / refresh (pct tags, merged with existing tags):
-  pve-oci-compose  plus  pveocid1<base64url(json{service,ref})> — see lib/common.inc.sh.
-  Older CTs may still expose the image only as a legacy description line:
-    pve-oci-compose service=<name> ref=<image>
+Compose marker after create / refresh:
+  Sentinel tag **pve-oci-compose** (short UI hint) merged with existing tags,
+  JSON file inside the CT rootfs (**/etc/pve-oci-compose.json** by default — **PVE_OCI_ROOTFS_MARKER**)
+  holds canonical **service** + **ref** for plan/refresh; it is part of pct snapshots.
 
 Requirements:
   - Run on a PVE node as root; jq; python3; PyYAML (python3-yaml package).
@@ -229,7 +230,7 @@ run_or_print() {
 }
 
 cmd_plan() {
-  local json sname svc spec vmid image rootfs tags desc stored exists hint
+  local json sname svc spec vmid image rootfs tags stored exists hint mr
   json="$(compose_json)"
   echo "Compose file: $COMPOSE_FILE"
   jq -r '.project // empty' <<<"$json" | sed '/^$/d' | sed 's/^/Project: /' || true
@@ -254,8 +255,8 @@ cmd_plan() {
     fi
 
     vmid="$spec"
+    mr="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
     tags="$(pve_oci_pct_tags "$vmid")"
-    desc="$(pve_oci_pct_description "$vmid")"
     stored="$(pve_oci_stored_ref "$vmid")"
     if pct config "$vmid" &>/dev/null; then
       exists=yes
@@ -267,12 +268,12 @@ cmd_plan() {
     echo "  exists:        $exists"
     echo "  image (file):  $image"
     echo "  rootfs:        $rootfs"
+    echo "  marker (path): ${mr}"
     echo "  tags:          ${tags:-<none>}"
-    echo "  description:   ${desc:-<none>}"
     if [[ "$exists" == yes ]]; then
       if [[ -z "$stored" ]]; then
         echo "  plan apply:    no-op (already exists)"
-        echo "  plan refresh:  blocked (no compose tags / legacy marker) — use --adopt on refresh"
+        echo "  plan refresh:  blocked (guest marker unreadable — use --adopt if intentional)"
       else
         echo "  stored ref:    $stored"
         if [[ "$stored" == "$image" ]]; then
@@ -361,13 +362,14 @@ cmd_apply() {
     run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
-      merged="$(pve_oci_tags_merge_for_pct_set "$(pve_oci_pct_tags "$resolved")" "$sname" "$image")"
+      merged="$(pve_oci_tags_merge_sentinel_only "$(pve_oci_pct_tags "$resolved")")"
       printf 'DRY-RUN:'
       printf ' %q' pct set "$resolved" --tags "$merged"
       printf '\n'
+      echo "apply: [$sname] would write guest ${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json} (pct mount briefly)"
     else
-      pve_oci_set_managed_tags "$resolved" "$sname" "$image"
-      echo "apply: [$sname] set compose marker tags"
+      pve_oci_set_managed_marker "$resolved" "$sname" "$image"
+      echo "apply: [$sname] sentinel tag + guest marker file (${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json})"
       if [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 1 ]]; then
         compose_write_service_vmid "$COMPOSE_FILE" "$sname" "$resolved"
       elif [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 0 ]]; then
@@ -388,6 +390,10 @@ cmd_refresh() {
     unset OCI_REFRESH_TEMPLATE_STORAGE || true
     ts="$(jq -r '.template_storage // .storage // empty' <<<"$svc")"
     [[ -n "$ts" ]] && export OCI_REFRESH_TEMPLATE_STORAGE="$ts"
+    unset PVE_OCI_COMPOSE_SERVICE || true
+    unset PVE_OCI_COMPOSE_REF || true
+    export PVE_OCI_COMPOSE_SERVICE="$sname"
+    export PVE_OCI_COMPOSE_REF="$image"
 
     pct config "$vmid" &>/dev/null || die "refresh: [$sname] vmid $vmid does not exist"
 
@@ -395,7 +401,7 @@ cmd_refresh() {
 
     if [[ -z "$stored" ]]; then
       if [[ "$ADOPT" -ne 1 ]]; then
-        echo "refresh: [$sname] CT $vmid not managed (no compose tags / legacy description) — skip (use --adopt)"
+        echo "refresh: [$sname] CT $vmid has no readable guest marker — skip (use --adopt for unmanaged CTs)"
         continue
       fi
       echo "refresh: [$sname] --adopt: treating unmanaged CT $vmid as $sname"
@@ -410,12 +416,13 @@ cmd_refresh() {
     run_or_print oci_refresh_main "$vmid" "$image"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
-      merged="$(pve_oci_tags_merge_for_pct_set "$(pve_oci_pct_tags "$vmid")" "$sname" "$image")"
+      merged="$(pve_oci_tags_merge_sentinel_only "$(pve_oci_pct_tags "$vmid")")"
       printf 'DRY-RUN:'
       printf ' %q' pct set "$vmid" --tags "$merged"
       printf '\n'
+      echo "refresh: [$sname] DRY-RUN: guest marker JSON not written; tag merge shown above only"
     else
-      pve_oci_set_managed_tags "$vmid" "$sname" "$image"
+      pve_oci_set_managed_marker "$vmid" "$sname" "$image"
     fi
   done < <(jq -r '.services | keys[]' <<<"$json")
 }

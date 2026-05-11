@@ -64,27 +64,117 @@ pve_task_status_from_json() {
   ' 2>/dev/null
 }
 
-# --- pve-oci-compose CT marker via pct tags ---------------------------------
-# Proxmox tag grammar (pve-tag): [a-z0-9_][a-z0-9_.+-]* — raw image refs are invalid.
-# We use a fixed pair:  pve-oci-compose  +  pveocid1<base64url(json{"service","ref"})>.
-
-pve_oci_pct_description() {
-  local vmid="$1"
-  pct config "$vmid" 2>/dev/null | sed -n 's/^description: //p' | head -1 || true
-}
+# --- pve-oci-compose CT marker ----------------------------------------------
+# Canonical ref + service live on the **guest rootfs** (included in pct snapshots /
+# rollback). UI shows only the short sentinel tag **`pve-oci-compose`** (plus your own tags).
+#
+# Optionally override path (must stay under `/etc/` or templates may omit it inconsistently).
+PVE_OCI_ROOTFS_MARKER="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
 
 pve_oci_pct_tags() {
   local vmid="$1"
   pct config "$vmid" 2>/dev/null | sed -n 's/^tags: //p' | head -1 || true
 }
 
-# Internal: stdin program is "-"; argv: mode args…
-_pve_oci_tags_py() {
+pve_oci_ct_rootfs_mountpoint() {
+  printf '/var/lib/lxc/%s/rootfs' "$1"
+}
+
+# Write JSON marker under an already-mounted rootfs tree (absolute host path ending in …/rootfs).
+pve_oci_marker_write_mountpoint() {
+  local mp="$1" svc="$2" ref="$3"
+  local mr p
+  mr="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
+  [[ "$mr" == /* ]] || mr="/$mr"
+  p="${mp%/}${mr}"
+  install -d "$(dirname "$p")"
+  python3 -c '
+import json, sys
+svc, ref, path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump({"service": svc, "ref": ref}, f, separators=(",", ":"), ensure_ascii=False)
+    f.write("\n")
+' "$svc" "$ref" "$p" || return 1
+}
+
+# Stopped CT: mount briefly, write marker, unmount (used after oci create).
+pve_oci_marker_write_after_create_stopped() {
+  local vmid="$1" svc="$2" ref="$3"
+  local mp
+  mp="$(pve_oci_ct_rootfs_mountpoint "$vmid")"
+  pct mount "$vmid" >/dev/null
+  trap 'pct unmount "$vmid" 2>/dev/null || true' EXIT
+  if ! [[ -d "$mp" ]]; then
+    pct unmount "$vmid" 2>/dev/null || true
+    trap - EXIT
+    return 1
+  fi
+  pve_oci_marker_write_mountpoint "$mp" "$svc" "$ref" || {
+    pct unmount "$vmid" 2>/dev/null || true
+    trap - EXIT
+    return 1
+  }
+  pct unmount "$vmid"
+  trap - EXIT
+}
+
+# Ref from JSON blob (stdin).
+_pve_oci_marker_ref_from_json_blob() {
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    r = d.get("ref")
+    if r is None:
+        raise ValueError()
+    sys.stdout.write(str(r))
+except Exception:
+    sys.exit(1)
+'
+}
+
+# JSON object text → ref field (stdout; failure → exit ≠0).
+pve_oci_marker_ref_from_json_text() {
+  printf '%s' "$1" | _pve_oci_marker_ref_from_json_blob || return 1
+}
+
+# Best-effort: ref from marker file inside guest (pct exec while running else mount).
+pve_oci_marker_read_rootfs_ref() {
+  local vmid="$1" mr mp js r
+  mr="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
+  [[ "$mr" == /* ]] || mr="/$mr"
+  js=""
+  mp="$(pve_oci_ct_rootfs_mountpoint "$vmid")"
+
+  # pct status prints a single-word status line (normally "running" when active).
+  if [[ "$(pct status "$vmid" 2>/dev/null | tr -d '\r')" == running ]]; then
+    js="$(pct exec "$vmid" -- cat "$mr" 2>/dev/null || true)"
+    if [[ -n "$js" ]]; then
+      r="$(pve_oci_marker_ref_from_json_text "$js")" || r=""
+      if [[ -n "$r" ]]; then printf '%s\n' "$r"; return 0; fi
+    fi
+  fi
+
+  if ! pct mount "$vmid" >/dev/null 2>&1; then
+    return 1
+  fi
+  trap 'pct unmount "$vmid" 2>/dev/null || true' EXIT
+  if [[ -r "${mp%/}${mr}" ]]; then js="$(cat -- "${mp%/}${mr}")" || js=""; fi
+  pct unmount "$vmid" >/dev/null 2>&1 || true
+  trap - EXIT
+  [[ -z "$js" ]] && return 1
+  r="$(pve_oci_marker_ref_from_json_text "$js")" || return 1
+  [[ -n "$r" ]] || return 1
+  printf '%s\n' "$r"
+}
+
+# Merge pct tags with a single sentinel (drop duplicate sentinel if present).
+_pve_oci_tags_merge_sentinel_py() {
   python3 - "$@" <<'PY'
-import json, base64, re, sys
+import re, sys
 
 OWNER = "pve-oci-compose"
-PREFIX = "pveocid1"
+
 
 def split_tags(s):
     if not s:
@@ -95,93 +185,58 @@ def split_tags(s):
     return [p.strip() for p in re.split(r"[;,]+", s) if p.strip()]
 
 
-def b64e(svc: str, ref: str) -> str:
-    j = json.dumps({"service": svc, "ref": ref}, separators=(",", ":"))
-    return base64.urlsafe_b64encode(j.encode()).decode().rstrip("=")
-
-
-def b64d(payload: str) -> dict:
-    pad = "=" * (-len(payload) % 4)
-    return json.loads(base64.urlsafe_b64decode(payload + pad))
-
-
-def merge_existing(existing_line: str, svc: str, ref: str) -> str:
-    parts = []
-    for t in split_tags(existing_line):
-        if t == OWNER or t.startswith(PREFIX):
-            continue
-        parts.append(t)
+def merge_sentinel_only(existing_line: str) -> str:
+    parts = [t for t in split_tags(existing_line) if t != OWNER]
     parts.append(OWNER)
-    parts.append(PREFIX + b64e(svc, ref))
     return ";".join(parts)
 
 
-def extract_ref_from_tags(tags_line: str) -> str:
-    for t in split_tags(tags_line):
-        if t.startswith(PREFIX):
-            try:
-                r = b64d(t[len(PREFIX) :]).get("ref") or ""
-                sys.stdout.write(r)
-                return
-            except Exception:
-                return
-
-
-def extract_ref_from_description(desc: str) -> str:
-    d = desc.strip()
-    if not d.startswith("pve-oci-compose"):
-        return
-    m = re.search(r"ref=(.*)$", d, re.DOTALL)
-    sys.stdout.write(m.group(1) if m else "")
-
-
-mode = sys.argv[1]
-
-if mode == "merge":
-    existing, svc, ref = sys.argv[2], sys.argv[3], sys.argv[4]
-    sys.stdout.write(merge_existing(existing, svc, ref))
-elif mode == "extract_ref_tags":
-    extract_ref_from_tags(sys.argv[2] if len(sys.argv) > 2 else "")
-elif mode == "extract_ref_description":
-    extract_ref_from_description(sys.argv[2] if len(sys.argv) > 2 else "")
-else:
+if sys.argv[1] != "merge_sentinel":
     sys.exit(2)
+sys.stdout.write(merge_sentinel_only(sys.argv[2] if len(sys.argv) > 2 else ""))
 PY
 }
 
-# Existing tags semicolon-string + compose service/image → full --tags value (preserves unrelated tags).
-pve_oci_tags_merge_for_pct_set() {
-  local existing="$1" svc="$2" ref="$3"
-  _pve_oci_tags_py merge "${existing:-}" "$svc" "$ref"
+pve_oci_tags_merge_sentinel_only() {
+  local existing="$1"
+  _pve_oci_tags_merge_sentinel_py merge_sentinel "${existing:-}"
 }
 
-# Image ref tracked for drift (prefers encoded tags, else legacy description line).
+# Stored image ref for drift detection: guest JSON marker only (`PVE_OCI_ROOTFS_MARKER`).
 pve_oci_stored_ref() {
-  local vmid="$1" tags desc r
-  tags="$(pve_oci_pct_tags "$vmid")"
-  r="$(_pve_oci_tags_py extract_ref_tags "${tags:-}")"
-  [[ -n "$r" ]] && {
+  local vmid="$1" r
+  if r="$(pve_oci_marker_read_rootfs_ref "$vmid")" && [[ -n "$r" ]]; then
     printf '%s\n' "$r"
     return 0
-  }
-  desc="$(pve_oci_pct_description "$vmid")"
-  r="$(_pve_oci_tags_py extract_ref_description "${desc:-}")"
-  printf '%s\n' "$r"
+  fi
+  printf '%s\n' ""
 }
 
-# pct set merged tags plus optional removal of obsolete description marker.
-pve_oci_set_managed_tags() {
+# Sentinel tag merge + marker file write (creates/refreshes).
+pve_oci_set_managed_marker() {
   local vmid="$1" svc="$2" ref="$3"
   local merged
-  merged="$(pve_oci_tags_merge_for_pct_set "$(pve_oci_pct_tags "$vmid")" "$svc" "$ref")"
+  merged="$(pve_oci_tags_merge_sentinel_only "$(pve_oci_pct_tags "$vmid")")"
   pct set "$vmid" --tags "$merged"
-  pve_oci_clear_legacy_description_marker_if_present "$vmid"
+
+  if [[ "$(pct status "$vmid" 2>/dev/null | tr -d '\r')" == running ]]; then
+    pve_oci_marker_write_via_exec "$vmid" "$svc" "$ref"
+    return 0
+  fi
+  pve_oci_marker_write_after_create_stopped "$vmid" "$svc" "$ref" || {
+    echo "pve-oci-compose: warning: failed to write ${PVE_OCI_ROOTFS_MARKER} on CT ${vmid} (plan/refresh drift may lag until writable)." >&2
+  }
 }
 
-pve_oci_clear_legacy_description_marker_if_present() {
-  local vmid="$1"
-  local d
-  d="$(pve_oci_pct_description "$vmid")"
-  [[ "$d" == pve-oci-compose* ]] || return 0
-  pct set "$vmid" --description '' 2>/dev/null || true
+# Running CT marker — avoids another host pct mount/unmount cycle.
+pve_oci_marker_write_via_exec() {
+  local vmid="$1" svc="$2" ref="$3" mr blob
+  mr="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
+  blob="$(python3 -c '
+import json, sys
+svc, ref = sys.argv[1], sys.argv[2]
+print(json.dumps({"service": svc, "ref": ref}, separators=(",", ":"), ensure_ascii=False))
+' "$svc" "$ref")" || return 1
+  pct exec "$vmid" -- sh -ec 'install -d "$(dirname "$1")"' x "$mr" >/dev/null 2>&1 || true
+  printf '%s\n' "$blob" | pct exec "$vmid" -- sh -ec 'cat >"$1"' x "$mr" || return 1
 }
