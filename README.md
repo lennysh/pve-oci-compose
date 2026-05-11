@@ -1,25 +1,21 @@
 # pve-oci-compose
 
-Declarative **Proxmox VE** LXC workflows driven by a **YAML** compose file: create OCI-based containers from a registry template, pull templates only, and refresh an existing CT’s **rootfs** from a newer image—similar in spirit to `docker compose`, but wired to `pct` / `pvesh` and the two worker shell scripts this tool invokes.
+Declarative **Proxmox VE** LXC workflows driven by a **YAML** compose file: create OCI-based containers from a registry template (`oci-registry-pull` + `pct create`), pull templates only, and refresh an existing CT’s **rootfs** from a newer image (snapshot → temp CT → `rsync`). The implementation lives in this repo (`pve-oci-compose.sh` plus `lib/*.inc.sh`), not in separate helper scripts.
 
 ## What ships in this repository
 
 | Item | Purpose |
 |------|--------|
 | `pve-oci-compose.sh` | CLI: reads `compose.yaml`, runs **plan**, **apply**, **refresh**, or **pull** |
+| `lib/oci-create.inc.sh` | OCI vztmpl pull + `pct create` (same behaviour as the former standalone create script) |
+| `lib/oci-refresh.inc.sh` | Rootfs refresh workflow (same behaviour as the former standalone refresh script) |
 | `compose.example.yaml` | Copy to `compose.yaml` and edit |
-
-Worker scripts under `oci_ct_create/` and `oci_ct_rootfs_refresh/` are **not tracked** in git (see `.gitignore`). You still need them **on the Proxmox node** next to `pve-oci-compose.sh`, with the expected names:
-
-- `oci_ct_create/oci-ct-create-from-registry.sh`
-- `oci_ct_rootfs_refresh/oci-ct-refresh-rootfs.sh`
-
-Copy them from your other repo, a release tarball, or wherever you maintain those scripts. This compose driver only orchestrates them.
+| `bindep.txt` | APT package names for dependencies on Debian-based nodes |
 
 ## Requirements
 
-- **Proxmox VE** node (run as **root**), with the same capabilities those worker scripts expect (`pct`, `pvesh`, OCI template storage, `skopeo` where applicable—see their own docs).
-- **`jq`** (JSON from `pvesh`; same baseline as the create script).
+- **Proxmox VE** node (run as **root**): `pct`, `pvesh`, OCI template storage with **`oci-registry-pull`**, `skopeo`, `rsync`, **`jq`**, **`perl`** with **`PVE::Storage`** (same as a normal PVE node used for OCI templates).
+- **`python3`** and **PyYAML** (`python3-yaml`) to parse the compose file.
 - **`python3`** and **PyYAML** for parsing YAML (not in the Python stdlib). On Debian-based nodes:
 
   `apt install python3-yaml`
@@ -32,13 +28,13 @@ sudo apt-get update && sudo apt-get install -y $(awk '!/^[[:space:]]*#/ && NF {p
 
 ## Quick start
 
-On the node, lay out a directory like:
+On the node, use the repo layout as cloned (the `lib/` directory must sit next to `pve-oci-compose.sh`):
 
 ```text
 ./pve-oci-compose.sh
+./lib/oci-create.inc.sh
+./lib/oci-refresh.inc.sh
 ./compose.yaml
-./oci_ct_create/oci-ct-create-from-registry.sh
-./oci_ct_rootfs_refresh/oci-ct-refresh-rootfs.sh
 ```
 
 Create your compose file (start from the example):

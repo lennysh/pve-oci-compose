@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Declarative OCI LXC compose helper for Proxmox VE: read compose.yaml, drive
-# oci_ct_create and oci_ct_rootfs_refresh. YAML is loaded with Python + PyYAML
-# (stdlib has no YAML); on Debian/PVE: apt install python3-yaml
+# Declarative OCI LXC compose helper for Proxmox VE: read compose.yaml, run OCI
+# vztmpl pull + pct create and rootfs refresh (logic in lib/*.inc.sh). YAML is
+# loaded with Python + PyYAML (on Debian/PVE: apt install python3-yaml).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Worker scripts live beside this script: oci_ct_create/, oci_ct_rootfs_refresh/
-REPO_ROOT="$SCRIPT_DIR"
-CREATE_SH="${REPO_ROOT}/oci_ct_create/oci-ct-create-from-registry.sh"
-REFRESH_SH="${REPO_ROOT}/oci_ct_rootfs_refresh/oci-ct-refresh-rootfs.sh"
+# shellcheck source=lib/oci-create.inc.sh disable=SC1091
+source "${SCRIPT_DIR}/lib/oci-create.inc.sh"
+# shellcheck source=lib/oci-refresh.inc.sh disable=SC1091
+source "${SCRIPT_DIR}/lib/oci-refresh.inc.sh"
 
 COMPOSE_FILE="${COMPOSE_FILE:-${PWD}/compose.yaml}"
 ADOPT=0
@@ -21,10 +21,10 @@ Usage: pve-oci-compose.sh [options] <command>
 
 Commands:
   plan      Show create / refresh intent per service (no changes).
-  apply     Create CTs that are missing (pct create via oci-ct-create-from-registry.sh).
-  refresh   Run oci-ct-refresh-rootfs.sh when the compose image ref differs from the
-            description marker (see below), or with --force.
-  pull      Pull OCI templates only (--pull-only on create script) for each service.
+  apply     Create missing CTs (oci-registry-pull + pct create; see lib/oci-create.inc.sh).
+  refresh   Replace rootfs from a new image when the compose ref differs from the
+            description marker (see below), or with --force (lib/oci-refresh.inc.sh).
+  pull      Pull OCI templates only (--pull-only) for each service.
 
 Options:
   -f, --file PATH   Compose file (default: ./compose.yaml or $COMPOSE_FILE)
@@ -38,7 +38,7 @@ Description marker (pct --description) after create / refresh:
 
 Requirements:
   - Run on a PVE node as root; jq; python3; PyYAML (python3-yaml package).
-  - Same expectations as oci_ct_create / oci_ct_rootfs_refresh (pvesh, pct, skopeo, …).
+  - pvesh, pct, skopeo, rsync, perl (PVE::Storage) as required by the inlined workflows.
 
 Compose schema (per service; shallow merge from top-level "defaults"):
   vmid               (required) CT VMID
@@ -68,8 +68,6 @@ except ImportError:
     sys.stderr.write("pve-oci-compose: cannot import yaml — install PyYAML, e.g. apt install python3-yaml\n")
     sys.exit(1)
 PY
-  [[ -f "$CREATE_SH" ]] || die "missing create script: $CREATE_SH"
-  [[ -f "$REFRESH_SH" ]] || die "missing refresh script: $REFRESH_SH"
   [[ -f "$COMPOSE_FILE" ]] || die "compose file not found: $COMPOSE_FILE"
 }
 
@@ -287,7 +285,7 @@ cmd_apply() {
 
     echo "apply: [$sname] creating vmid $vmid from $image"
     fill_create_args "$svc"
-    run_or_print "$CREATE_SH" "${OCI_CREATE_ARGS[@]}"
+    run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
 
     if [[ "$DRY_RUN" -eq 0 ]]; then
       pct set "$vmid" --description "$(expected_description "$sname" "$image")"
@@ -324,7 +322,7 @@ cmd_refresh() {
     fi
 
     echo "refresh: [$sname] vmid $vmid → $image"
-    run_or_print "$REFRESH_SH" "$vmid" "$image"
+    run_or_print oci_refresh_main -- "$vmid" "$image"
 
     if [[ "$DRY_RUN" -eq 0 ]]; then
       pct set "$vmid" --description "$(expected_description "$sname" "$image")"
@@ -344,7 +342,7 @@ cmd_pull() {
     echo "pull: [$sname] $ref"
     pull_args=(--pull-only --reference "$ref")
     [[ -n "$ts" ]] && pull_args=(--storage "$ts" "${pull_args[@]}")
-    run_or_print "$CREATE_SH" "${pull_args[@]}"
+    run_or_print oci_create_main "${pull_args[@]}"
   done < <(jq -r '.services | keys[]' <<<"$json")
 }
 
