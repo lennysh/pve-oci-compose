@@ -27,14 +27,14 @@ Usage: pve-oci-compose.sh [options] <command>
 Commands:
   plan      Show create / refresh intent per service (no changes).
   apply     Create missing CTs (oci-registry-pull + pct create; see lib/oci-create.inc.sh).
-  refresh   Replace rootfs from a new image when the compose ref differs from the
-            description marker (see below), or with --force (lib/oci-refresh.inc.sh).
+  refresh   Replace rootfs when the compose image ref differs from tags (or legacy
+            description marker; see below), or with --force (lib/oci-refresh.inc.sh).
   pull      Pull OCI templates only (--pull-only) for each service.
 
 Options:
   -f, --file PATH   Compose file (default: ./compose.yaml or $COMPOSE_FILE)
-  --adopt           Allow refresh on CTs whose description is not yet marked by this tool
-                    (sets marker after a successful refresh).
+  --adopt           Allow refresh when the CT has no compose tags (nor legacy marker
+                    description); tags are written after a successful refresh.
   --force           refresh: run refresh even when stored ref matches compose image.
   -n, --dry-run     Print commands only (apply / refresh / pull).
   --no-write-compose After apply with vmid: next (or auto / null), do not rewrite the compose
@@ -46,8 +46,10 @@ vmid in compose:
   After a successful apply, the compose file is rewritten with the numeric vmid (PyYAML
   round-trip: comments/formatting may change — back up the file or pass --no-write-compose).
 
-Description marker (pct --description) after create / refresh:
-  pve-oci-compose service=<name> ref=<image>
+Compose marker after create / refresh (pct tags, merged with existing tags):
+  pve-oci-compose  plus  pveocid1<base64url(json{service,ref})> — see lib/common.inc.sh.
+  Older CTs may still expose the image only as a legacy description line:
+    pve-oci-compose service=<name> ref=<image>
 
 Requirements:
   - Run on a PVE node as root; jq; python3; PyYAML (python3-yaml package).
@@ -136,26 +138,6 @@ for sname, svc in services.items():
 
 print(json.dumps(out))
 PY
-}
-
-pct_description() {
-  local vmid="$1"
-  pct config "$vmid" 2>/dev/null | sed -n 's/^description: //p' | head -1 || true
-}
-
-expected_description() {
-  local svc="$1" ref="$2"
-  printf 'pve-oci-compose service=%s ref=%s\n' "$svc" "$ref"
-}
-
-extract_managed_ref() {
-  local desc="$1"
-  [[ "$desc" == pve-oci-compose* ]] || { printf '%s\n' ""; return 0; }
-  if [[ "$desc" =~ ref=(.*)$ ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
-  else
-    printf '%s\n' ""
-  fi
 }
 
 service_image() {
@@ -247,7 +229,7 @@ run_or_print() {
 }
 
 cmd_plan() {
-  local json sname svc spec vmid image rootfs desc stored exists hint
+  local json sname svc spec vmid image rootfs tags desc stored exists hint
   json="$(compose_json)"
   echo "Compose file: $COMPOSE_FILE"
   jq -r '.project // empty' <<<"$json" | sed '/^$/d' | sed 's/^/Project: /' || true
@@ -272,8 +254,9 @@ cmd_plan() {
     fi
 
     vmid="$spec"
-    desc="$(pct_description "$vmid")"
-    stored="$(extract_managed_ref "$desc")"
+    tags="$(pve_oci_pct_tags "$vmid")"
+    desc="$(pve_oci_pct_description "$vmid")"
+    stored="$(pve_oci_stored_ref "$vmid")"
     if pct config "$vmid" &>/dev/null; then
       exists=yes
     else
@@ -284,11 +267,12 @@ cmd_plan() {
     echo "  exists:        $exists"
     echo "  image (file):  $image"
     echo "  rootfs:        $rootfs"
+    echo "  tags:          ${tags:-<none>}"
     echo "  description:   ${desc:-<none>}"
     if [[ "$exists" == yes ]]; then
       if [[ -z "$stored" ]]; then
         echo "  plan apply:    no-op (already exists)"
-        echo "  plan refresh:  blocked (not managed) — use --adopt on refresh"
+        echo "  plan refresh:  blocked (no compose tags / legacy marker) — use --adopt on refresh"
       else
         echo "  stored ref:    $stored"
         if [[ "$stored" == "$image" ]]; then
@@ -354,7 +338,7 @@ fill_create_args() {
 OCI_CREATE_ARGS=()
 
 cmd_apply() {
-  local json sname svc spec resolved image
+  local json sname svc spec resolved image merged
   json="$(compose_json)"
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
@@ -376,9 +360,14 @@ cmd_apply() {
     fill_create_args "$svc" "$resolved"
     run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
 
-    if [[ "$DRY_RUN" -eq 0 ]]; then
-      pct set "$resolved" --description "$(expected_description "$sname" "$image")"
-      echo "apply: [$sname] set description marker for refresh tracking"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      merged="$(pve_oci_tags_merge_for_pct_set "$(pve_oci_pct_tags "$resolved")" "$sname" "$image")"
+      printf 'DRY-RUN:'
+      printf ' %q' pct set "$resolved" --tags "$merged"
+      printf '\n'
+    else
+      pve_oci_set_managed_tags "$resolved" "$sname" "$image"
+      echo "apply: [$sname] set compose marker tags"
       if [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 1 ]]; then
         compose_write_service_vmid "$COMPOSE_FILE" "$sname" "$resolved"
       elif [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 0 ]]; then
@@ -389,7 +378,7 @@ cmd_apply() {
 }
 
 cmd_refresh() {
-  local json sname svc vmid image desc stored want ts
+  local json sname svc vmid image merged stored ts
   json="$(compose_json)"
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
@@ -402,12 +391,11 @@ cmd_refresh() {
 
     pct config "$vmid" &>/dev/null || die "refresh: [$sname] vmid $vmid does not exist"
 
-    desc="$(pct_description "$vmid")"
-    stored="$(extract_managed_ref "$desc")"
+    stored="$(pve_oci_stored_ref "$vmid")"
 
     if [[ -z "$stored" ]]; then
       if [[ "$ADOPT" -ne 1 ]]; then
-        echo "refresh: [$sname] CT $vmid not managed (no pve-oci-compose description) — skip (use --adopt)"
+        echo "refresh: [$sname] CT $vmid not managed (no compose tags / legacy description) — skip (use --adopt)"
         continue
       fi
       echo "refresh: [$sname] --adopt: treating unmanaged CT $vmid as $sname"
@@ -421,8 +409,13 @@ cmd_refresh() {
     echo "refresh: [$sname] vmid $vmid → $image"
     run_or_print oci_refresh_main "$vmid" "$image"
 
-    if [[ "$DRY_RUN" -eq 0 ]]; then
-      pct set "$vmid" --description "$(expected_description "$sname" "$image")"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      merged="$(pve_oci_tags_merge_for_pct_set "$(pve_oci_pct_tags "$vmid")" "$sname" "$image")"
+      printf 'DRY-RUN:'
+      printf ' %q' pct set "$vmid" --tags "$merged"
+      printf '\n'
+    else
+      pve_oci_set_managed_tags "$vmid" "$sname" "$image"
     fi
   done < <(jq -r '.services | keys[]' <<<"$json")
 }
