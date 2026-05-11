@@ -6,12 +6,17 @@
 
 _OUTW=80
 _PVE_UI_READY=
-_B=_D=_G=_Y=_M=_R=
+_B=''
+_D=''
+_G=''
+_Y=''
+_M=''
+_R=''
 
 _pve_ui_init() {
   [[ -n "$_PVE_UI_READY" ]] && return 0
   _PVE_UI_READY=1
-  _B=$_D=$_G=$_Y=$_M=$_R=
+  _B='' _D='' _G='' _Y='' _M='' _R=''
   _OUTW=$(( ${COLUMNS:-80} - 4 ))
   [[ "$_OUTW" -lt 48 ]] && _OUTW=48
   [[ "$_OUTW" -gt 100 ]] && _OUTW=100
