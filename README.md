@@ -42,7 +42,7 @@ On the node, use the repo layout as cloned (the `lib/` directory must sit next t
 
 You can set **`vmid: next`**, **`vmid: auto`**, **`vmid: null`**, or **omit `vmid`**: **`apply`** asks the cluster for the next free id, creates the CT with that id, then **rewrites your compose file** so `vmid` becomes that number (so **`refresh`** and later runs use a stable id).
 
-- **YAML caveat:** the updater uses PyYAML `safe_dump`; **comments and some formatting may change** — keep the file in git or back it up first.
+- **Compose writeback:** only the **`vmid:`** line under that **`services.<name>`** block is rewritten (**`awk`**-style line edit), so **comments and blank lines stay**. You must already have a **`vmid:`** key under the service (e.g. **`vmid: next`**); the service name must be a plain unquoted key matching **`^[a-zA-Z0-9_-]+$`**. Use **`--no-write-compose`** if you do not want the file touched.
 - Skip rewriting: **`--no-write-compose`** or **`PVE_OCI_COMPOSE_NO_WRITE=1`**.
 - **`refresh`** requires a numeric `vmid` (run **`apply`** once to pin it, or set the id yourself).
 

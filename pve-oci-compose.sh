@@ -44,8 +44,10 @@ Options:
 vmid in compose:
   Use a fixed number, or allocate the cluster next free id with one of:
     vmid: next     vmid: auto     vmid: null   or omit vmid (same as next).
-  After a successful apply, the compose file is rewritten with the numeric vmid (PyYAML
-  round-trip: comments/formatting may change — back up the file or pass --no-write-compose).
+  After a successful apply, the compose file is updated in-place: only the first vmid: line
+  under that service is changed (comments and blank lines are kept). The service key must be
+  a plain name matching ^[a-zA-Z0-9_-]+$ and the file must already contain vmid: under the service.
+  Use --no-write-compose to skip this step.
 
 Compose marker after create / refresh:
   Sentinel tag **pve-oci-compose** (short UI hint) merged with existing tags,
@@ -186,37 +188,106 @@ validate_service_refresh() {
   validate_service "$json" "$svc"
 }
 
+# Rewrite only the first `vmid:` line under services.<svc> (preserves comments, blank lines, order).
+# Requires: a `services:` block, a direct child key matching <svc>, and a `vmid:` line indented deeper than that key.
 compose_write_service_vmid() {
   local path="$1" svc="$2" vmid="$3"
-  python3 - "$path" "$svc" "$vmid" <<'PY'
-import pathlib, sys
-try:
-    import yaml
-except ImportError:
-    sys.stderr.write("pve-oci-compose: PyYAML required to write compose file\n")
-    sys.exit(1)
+  local tmp ec
+  [[ -f "$path" ]] || die "compose file not found: $path"
+  [[ "$vmid" =~ ^[0-9]+$ ]] || die "internal: vmid must be numeric for writeback ($vmid)"
+  [[ "$svc" =~ ^[a-zA-Z0-9_-]+$ ]] \
+    || die "pve-oci-compose: service '$svc' — vmid writeback only supports names matching ^[a-zA-Z0-9_-]+\$ (use an unquoted mapping key under services:)."
 
-path = pathlib.Path(sys.argv[1])
-svc = sys.argv[2]
-vmid = int(sys.argv[3], 10)
-raw = path.read_text(encoding="utf-8")
-data = yaml.safe_load(raw)
-if not isinstance(data, dict):
-    sys.stderr.write("pve-oci-compose: compose root must be a mapping\n")
-    sys.exit(1)
-services = data.get("services")
-if not isinstance(services, dict) or svc not in services:
-    sys.stderr.write(f"pve-oci-compose: no services.{svc!r} in {path}\n")
-    sys.exit(1)
-if not isinstance(services[svc], dict):
-    sys.stderr.write(f"pve-oci-compose: services.{svc!r} must be a mapping\n")
-    sys.exit(1)
-services[svc]["vmid"] = vmid
-path.write_text(
-    yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True),
-    encoding="utf-8",
-)
-PY
+  tmp="$(mktemp "${TMPDIR:-/tmp}/pve-oci-compose.XXXXXX")" || die "mktemp failed"
+  ec=0
+  awk -v svc="$svc" -v newvm="$vmid" '
+    function leadlen(s,    t) {
+      if (match(s, /^[[:space:]]*/))
+        return RLENGTH
+      return 0
+    }
+    BEGIN { in_services = 0; in_target = 0; replaced = 0; found = 0; sind = -1 }
+    /^[[:space:]]*services:[[:space:]]*(#|$)/ {
+      in_services = 1
+      print
+      next
+    }
+    !in_services {
+      print
+      next
+    }
+    {
+      l = leadlen($0)
+      if (in_target) {
+        if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) {
+          print
+          next
+        }
+        if (l > sind && match($0, /^[[:space:]]+vmid[[:space:]]*:/)) {
+          pre = substr($0, 1, RLENGTH)
+          rest = substr($0, RLENGTH + 1)
+          sub(/^[[:space:]]+/, "", rest)
+          nc = index(rest, "#")
+          if (nc > 0) {
+            cmt = substr(rest, nc)
+            print pre " " newvm " " cmt
+          } else {
+            print pre " " newvm
+          }
+          replaced = 1
+          next
+        }
+        if (l == sind) {
+          if (!replaced) {
+            print "pve-oci-compose: services[\"" svc "\"] has no vmid: line under that service; add e.g.  vmid: next" > "/dev/stderr"
+            exit 2
+          }
+          in_target = 0
+          print
+          next
+        }
+        if (l < sind) {
+          if (!replaced) {
+            print "pve-oci-compose: services[\"" svc "\"] has no vmid: line under that service" > "/dev/stderr"
+            exit 2
+          }
+          in_target = 0
+          print
+          next
+        }
+        print
+        next
+      }
+      if ($0 ~ "^[[:space:]]*" svc ":[[:space:]]*($|#)") {
+        found = 1
+        in_target = 1
+        sind = l
+        print
+        next
+      }
+      print
+      next
+    }
+    END {
+      if (!found) {
+        print "pve-oci-compose: no services." svc " in compose (expected a mapping key under services:)" > "/dev/stderr"
+        exit 3
+      }
+      if (in_target && !replaced) {
+        print "pve-oci-compose: services[\"" svc "\"] has no vmid: line to update; add e.g.  vmid: next" > "/dev/stderr"
+        exit 2
+      }
+    }
+  ' "$path" >"$tmp" || ec=$?
+  if [[ "$ec" -ne 0 ]]; then
+    rm -f "$tmp"
+    die "pve-oci-compose: failed to update vmid in $path (awk exit $ec)"
+  fi
+  chmod --reference="$path" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$path" || {
+    rm -f "$tmp"
+    die "pve-oci-compose: mv failed writing $path"
+  }
   echo "pve-oci-compose: updated vmid for service '$svc' → $vmid in $path"
 }
 
