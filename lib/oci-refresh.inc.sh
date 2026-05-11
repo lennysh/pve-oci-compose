@@ -87,6 +87,42 @@ cfg() {
   pct config "$1" | sed -n "s/^$2: //p" | head -1
 }
 
+# Host config is not part of rootfs; OCI template updates can change pct `entrypoint`.
+# After rsync, align OLD with the temp CT (new image) so init matches the replaced tree.
+pct_sync_entrypoint_from_temp() {
+  local old="$1" temp="$2"
+  local new_ep old_ep
+
+  [[ -z "$temp" ]] && return 0
+  pct config "$temp" &>/dev/null || return 0
+
+  new_ep="$(cfg "$temp" entrypoint)"
+  old_ep="$(cfg "$old" entrypoint)"
+
+  if [[ -n "$new_ep" ]]; then
+    [[ "$new_ep" == "$old_ep" ]] && return 0
+    out_sub "Sync pct entrypoint (host config)"
+    out_kv "From new image CT" "${temp}: ${new_ep}"
+    [[ -n "$old_ep" ]] && out_kv "Previous on CT ${old}" "$old_ep"
+    if ! pct set "$old" --entrypoint "$new_ep"; then
+      echo "=== pct set --entrypoint failed for CT ${old} ===" >&2
+      exit 1
+    fi
+    out_ok "entrypoint now matches refreshed template"
+    return 0
+  fi
+
+  if [[ -n "$old_ep" ]]; then
+    out_sub "Clear pct entrypoint override"
+    out_detail "New template CT ${temp} has no entrypoint — removing explicit override on ${old}."
+    if pct set "$old" --delete entrypoint 2>/dev/null; then
+      out_ok "entrypoint override removed"
+    else
+      out_warn "Could not pct set --delete entrypoint (${old}); review manually vs CT ${temp}."
+    fi
+  fi
+}
+
 # True if CT should be stopped (running or frozen). The script only needs CT stopped, not "was running".
 pct_ct_needs_stop() {
   local s
@@ -321,9 +357,11 @@ else
 fi
 
 trap - EXIT
-out_sub "Cleanup: unmount → destroy ${TEMP} → start ${OLD}"
+out_sub "Cleanup: unmount → sync entrypoint → destroy ${TEMP} → start ${OLD}"
 pct unmount "$TEMP"
 pct unmount "$OLD"
+
+pct_sync_entrypoint_from_temp "$OLD" "$TEMP"
 
 pct destroy "$TEMP"
 pct start "$OLD"
