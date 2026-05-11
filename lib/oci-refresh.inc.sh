@@ -60,7 +60,8 @@ out_cmd_line() {
   printf '  %s%s%s\n' "$D" "$*" "$R"
 }
 oci_refresh_usage() {
-  echo "Usage: $0 [options] <old_ctid> <new_oci_ref> [temp_ctid]"
+  echo "Usage: pve-oci-compose.sh refresh   (image + vmid from compose file)"
+  echo "   or: oci_refresh_main [options] [--] <old_ctid> <new_oci_ref> [temp_ctid]"
   echo ""
   echo "Options:"
   echo "  --no-snapshot             Skip pct snapshot entirely"
@@ -72,9 +73,8 @@ oci_refresh_usage() {
   echo "  temp_ctid    Optional; default: next free cluster VMID"
   echo ""
   echo "Example:"
-  echo "  $0 100 oci://docker.io/library/nginx:latest"
-  echo "  $0 --allow-failed-snapshot 100 oci://docker.io/library/nginx:latest"
-  echo "  $0 --no-snapshot 100 oci://docker.io/library/nginx:latest"
+  echo "  ./pve-oci-compose.sh refresh"
+  echo "  oci_refresh_main 100 oci://docker.io/library/nginx:latest"
   exit 1
 }
 
@@ -83,6 +83,7 @@ SKIP_SNAPSHOT=0
 ALLOW_FAILED_SNAPSHOT=0
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
+    --)                        shift; break ;;
     --no-snapshot)             SKIP_SNAPSHOT=1; shift ;;
     --allow-failed-snapshot)   ALLOW_FAILED_SNAPSHOT=1; shift ;;
     -h|--help)                 oci_refresh_usage ;;

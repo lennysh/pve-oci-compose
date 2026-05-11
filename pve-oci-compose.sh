@@ -411,7 +411,7 @@ cmd_refresh() {
     fi
 
     echo "refresh: [$sname] vmid $vmid → $image"
-    run_or_print oci_refresh_main -- "$vmid" "$image"
+    run_or_print oci_refresh_main "$vmid" "$image"
 
     if [[ "$DRY_RUN" -eq 0 ]]; then
       pct set "$vmid" --description "$(expected_description "$sname" "$image")"
