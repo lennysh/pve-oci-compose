@@ -26,6 +26,7 @@ oci_refresh_usage() {
 }
 
 oci_refresh_main() {
+  unset PVE_OCI_LAST_PULL_REFERENCE PVE_OCI_LAST_REFERENCE_INPUT 2>/dev/null || true
 SKIP_SNAPSHOT=0
 ALLOW_FAILED_SNAPSHOT=0
 while [[ "${1:-}" == -* ]]; do

@@ -296,6 +296,8 @@ sname = sstrip(svc.get("_service")) or "?"
 
 img = svc.get("image") or svc.get("reference")
 img = sstrip(img) if img is not None else ""
+eff = sstrip(svc.get("_compose_image_effective"))
+sync_at = sstrip(svc.get("_template_sync_at"))
 
 about_chunks = []
 if sstrip(stack_about):
@@ -348,8 +350,14 @@ lines = [
     f"- **Stack:** {stack}" if stack else "- **Stack:** _(compose file)_",
     f"- **Service:** {sname}",
 ]
-if img:
+if eff:
+    lines.append(f"- **Image (pulled):** `{eff}`")
+    if img and img != eff:
+        lines.append(f"- **Compose file ref:** `{img}`")
+elif img:
     lines.append(f"- **Image:** `{img}`")
+if sync_at:
+    lines.append(f"- **Template sync:** {sync_at}")
 
 if body_user:
     lines.append("")
@@ -385,6 +393,33 @@ if footer_url:
 
 sys.stdout.write("\n".join(lines).rstrip() + "\n")
 ' "$stack" "$sabout" "$repo_json"
+}
+
+# Rich description (guest_ports / about / stack about): after oci_create_main, PVE_OCI_LAST_PULL_REFERENCE
+# holds the ref actually pulled (skopeo-resolved :latest, etc.); pve-oci-compose calls finalize → pct set.
+pve_oci_compose_description_needs_runtime_meta() {
+  local svc="$1" sa="${2:-}"
+  jq -e --arg sa "$sa" '
+    ((.guest_ports // []) | length > 0)
+    or ((.about | type) == "string" and (.about | length > 0))
+    or (($sa | length > 0))
+  ' <<<"$svc" >/dev/null 2>&1
+}
+
+pve_oci_compose_pct_description_finalize() {
+  local vmid="$1" svc="$2" stack="$3" sa="$4" rj="$5"
+  local eff ts merged newd
+  [[ -n "$vmid" ]] || return 0
+  eff="${PVE_OCI_LAST_PULL_REFERENCE:-}"
+  [[ -n "$eff" ]] || eff="$(jq -r '.image // .reference // empty' <<<"$svc")"
+  [[ -n "$eff" ]] || return 0
+  ts="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+  merged="$(jq -c --arg eff "$eff" --arg ts "$ts" \
+    '. + {_compose_image_effective: $eff, _template_sync_at: $ts}' <<<"$svc")"
+  newd="$(printf '%s' "$merged" | pve_oci_compose_pct_description "$stack" "$sa" "$rj")"
+  [[ -n "$newd" ]] || return 0
+  pct set "$vmid" --description "$newd" \
+    || echo "pve-oci-compose: warning: pct set --description failed for CT ${vmid}" >&2
 }
 
 # --- Datacenter resource pool (UI grouping) --------------------------------

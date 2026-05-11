@@ -116,6 +116,8 @@ The file is YAML with a single top-level mapping.
 
 The Proxmox UI may show **`description`** as plain text; Markdown-style headings and bullets still read clearly when copy-pasted. Very long text can hit UI limits—keep secrets out of compose and out of the CT description.
 
+For the **rich** description ( **`guest_ports`** and/or **`about`** / stack **`about`** ), **apply** and **refresh** run a second **`pct set --description`** after the template pull so the CT notes show **Image (pulled):** (the ref **`oci_create_main`** actually used—same skopeo resolution as for floating **`:latest`** ) plus **Template sync:** (UTC time of that pull). If the pulled ref differs from the compose **`image`**, a **Compose file ref:** line is kept for context. **`plan`** previews still reflect the compose file only, not the post-resolve ref.
+
 See **`compose.example.yaml`**: a minimal working service plus **long commented examples** for every optional **`pct create`** field (DNS, **`net1`**, **`env`**, **`startup`** vs **`onboot`**, devices, etc.).
 
 **Create-only fields:** everything in the table above that maps to **`pct create`** (including DNS, **`entrypoint`**, **`env`**, extra **`netN`**, **`lxc_dev`**, …) is applied only when a **new** CT is created. **refresh** does not re-run **`pct create`**; change those settings later with **`pct set`** or the UI (and note that **`password`** in YAML is easy to leak via git — prefer **`pct set`** or secrets after first boot).

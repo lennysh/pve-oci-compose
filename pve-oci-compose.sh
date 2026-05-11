@@ -597,6 +597,7 @@ cmd_apply() {
   rj="$(jq -c '.repo' <<<"$json")"
   while IFS= read -r sname; do
     unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
+    unset PVE_OCI_LAST_PULL_REFERENCE PVE_OCI_LAST_REFERENCE_INPUT 2>/dev/null || true
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service "$svc" "$sname"
     spec="$(vmid_spec_from_json "$svc")"
@@ -637,8 +638,14 @@ cmd_apply() {
       printf ' %q' pct set "$resolved" --tags "$merged"
       printf '\n'
       echo "apply: [$sname] would write guest ${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json} (pct mount briefly)"
+      if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
+        echo "apply: [$sname] DRY-RUN: after real create, would pct set $resolved --description … (resolved pull ref + template sync)"
+      fi
     else
       pve_oci_set_managed_marker "$resolved" "$sname" "$image"
+      if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
+        pve_oci_compose_pct_description_finalize "$resolved" "$svc" "$stack" "$sa" "$rj" || true
+      fi
       echo "apply: [$sname] sentinel tag + guest marker file (${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json})"
       if [[ -n "$effpool" ]]; then
         if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -659,11 +666,14 @@ cmd_apply() {
 }
 
 cmd_refresh() {
-  local json sname svc vmid image merged stored ts stack effpool
+  local json sname svc vmid image merged stored ts stack effpool sa rj
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
+  sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
+  rj="$(jq -c '.repo' <<<"$json")"
   while IFS= read -r sname; do
     unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
+    unset PVE_OCI_LAST_PULL_REFERENCE PVE_OCI_LAST_REFERENCE_INPUT 2>/dev/null || true
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service_refresh "$svc" "$sname"
     vmid="$(vmid_spec_from_json "$svc")"
@@ -704,8 +714,14 @@ cmd_refresh() {
       effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
       [[ -n "$effpool" ]] && echo "refresh: [$sname] DRY-RUN: would ensure pool '${effpool}' for CT ${vmid}"
       echo "refresh: [$sname] DRY-RUN: guest marker JSON not written; tag merge shown above only"
+      if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
+        echo "refresh: [$sname] DRY-RUN: after real refresh, would pct set $vmid --description … (resolved pull ref + template sync)"
+      fi
     else
       pve_oci_set_managed_marker "$vmid" "$sname" "$image"
+      if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
+        pve_oci_compose_pct_description_finalize "$vmid" "$svc" "$stack" "$sa" "$rj" || true
+      fi
       effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
       if [[ -n "$effpool" ]]; then
         pve_oci_pool_ensure_lxc_member "$effpool" "$vmid" \

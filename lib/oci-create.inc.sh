@@ -66,6 +66,10 @@ After create: CT is left stopped unless you run pct start manually.
 Env (optional):
   PVE_OCI_CREATE_QUIET=1   Fewer banners when this worker is reused for a disposable
                            scratch CT (e.g. refresh); normal apply output unchanged if unset.
+
+After a successful pull path, exports PVE_OCI_LAST_PULL_REFERENCE (resolved ref, e.g. digest or
+non-latest tag) and PVE_OCI_LAST_REFERENCE_INPUT (compose/CLI ref) for pve-oci-compose to refresh
+the composed CT description.
 EOF
   exit 1
 }
@@ -99,6 +103,8 @@ oci_create_pct_failure_cleanup() {
 }
 
 oci_create_main() {
+  # Consumed by pve-oci-compose after create/refresh to refresh CT description (resolved ref + time).
+  unset PVE_OCI_LAST_PULL_REFERENCE PVE_OCI_LAST_REFERENCE_INPUT 2>/dev/null || true
 
 node_name() {
   if command -v pvecm &>/dev/null; then
@@ -465,6 +471,8 @@ resolve_floating_latest_ref() {
 }
 
 PULL_REFERENCE="$(resolve_floating_latest_ref "$REFERENCE")"
+export PVE_OCI_LAST_PULL_REFERENCE="${PULL_REFERENCE}"
+export PVE_OCI_LAST_REFERENCE_INPUT="${REFERENCE}"
 
 # Host path under vztmpl exists only for storages with a directory-style layout (e.g. "dir", some NFS).
 # ZFS pools, LVM-thin, RBD, etc. return "storage definition has no path" from get_vztmpl_dir — that is normal.
