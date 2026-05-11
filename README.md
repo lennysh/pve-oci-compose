@@ -95,10 +95,14 @@ The file is YAML with a single top-level mapping.
 | `template_storage` | optional | vztmpl storage id for `oci-registry-pull`; alias `storage`. Empty or omitted lets the create script auto-pick when there is exactly one suitable store. |
 | `pool` | optional | Datacenter **resource pool** id for UI grouping. Defaults to top-level **`name`** / **`project`**. Set to **`""`** or **`null`** in **`defaults`** to disable. If the pool id does not exist, **apply** / **refresh** run **`pvesh create /pools`** (opt out with **`PVE_OCI_POOL_NO_AUTOCREATE=1`**). |
 | `hostname`, `net0`, `node`, `memory`, `cores`, `ostype`, `features` | optional | Passed through to the create script where supported. |
+| `nameserver` | optional | **`pct --nameserver`**: string (IPs separated by commas or whitespace) or YAML list → one flag per address. Omit with `searchdomain` unset to inherit the host’s resolvers (see **`pct`** docs). |
+| `searchdomain` | optional | **`pct --searchdomain`**: string or YAML list (multiple domains are joined with spaces). |
 | `unprivileged`, `onboot` | optional | YAML booleans or integers; mapped to `pct` flags on create. |
 | `mounts` | optional | List of strings `STORAGE:GiB:/absolute/path` → `--mp` on create (extra CT volumes). |
 
 See `compose.example.yaml` for a minimal working shape.
+
+**DNS fields** (`nameserver`, `searchdomain`) are applied only at **`pct create`** (**apply** on a new CT). They do not run on **refresh**; change resolvers on an existing CT with **`pct set`** or the UI.
 
 ## Commands
 

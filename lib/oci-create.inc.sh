@@ -17,6 +17,8 @@ Common options:
   --vmid ID             CT VMID (default: cluster next free)
   --hostname NAME       pct --hostname (default: oci-ct-<vmid>)
   --net0 SPEC           pct --net0 (default: name=eth0,bridge=vmbr0,ip=dhcp or OCI_CT_CREATE_NET0)
+  --nameserver ADDR     pct --nameserver (repeatable; omit with searchdomain to inherit host resolvers)
+  --searchdomain LIST   pct --searchdomain (space-separated domains if multiple)
   --node NAME           PVE node name (default: pvecm nodename / hostname -s)
   --memory MB           pct --memory
   --cores N             pct --cores
@@ -146,6 +148,8 @@ UNPRIV="1"
 FEATURES=""
 ONBOOT="0"
 POOL=""
+NAMESERVERS=()
+SEARCHDOMAIN=""
 SKIP_PULL=0
 REUSE_LOCAL=0
 PULL_ONLY=0
@@ -161,6 +165,8 @@ while [[ $# -gt 0 ]]; do
     --vmid)             VMID="${2:?}"; shift 2 ;;
     --hostname)         HOSTNAME="${2:?}"; shift 2 ;;
     --net0)             NET0="${2:?}"; shift 2 ;;
+    --nameserver)       NAMESERVERS+=("${2:?}"); shift 2 ;;
+    --searchdomain)     SEARCHDOMAIN="${2:?}"; shift 2 ;;
     --node)             NODE="${2:?}"; shift 2 ;;
     --memory)           MEMORY="${2:?}"; shift 2 ;;
     --cores)            CORES="${2:?}"; shift 2 ;;
@@ -643,10 +649,17 @@ else
   out_kv "Ostemplate" "${OSTEMPLATE}"
   out_kv "Rootfs" "${ROOTFS_SPEC}"
   out_kv "Hostname" "${HOSTNAME}"
+  [[ "${#NAMESERVERS[@]}" -gt 0 ]] && out_kv "nameserver" "${NAMESERVERS[*]}"
+  [[ -n "$SEARCHDOMAIN" ]] && out_kv "searchdomain" "${SEARCHDOMAIN}"
   [[ "${#MP_SPECS[@]}" -gt 0 ]] && out_kv "Mounts (mp*)" "${MP_SPECS[*]}"
 fi
 
 cmd=(pct create "$VMID" "$OSTEMPLATE" --rootfs "$ROOTFS_SPEC" --hostname "$HOSTNAME" --net0 "$NET0" --unprivileged "$UNPRIV" --onboot "$ONBOOT")
+
+for ns in "${NAMESERVERS[@]}"; do
+  cmd+=(--nameserver "$ns")
+done
+[[ -n "$SEARCHDOMAIN" ]] && cmd+=(--searchdomain "$SEARCHDOMAIN")
 
 [[ -n "$POOL" ]] && cmd+=(--pool "$POOL")
 [[ -n "$MEMORY" ]] && cmd+=(--memory "$MEMORY")

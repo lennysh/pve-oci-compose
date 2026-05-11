@@ -70,6 +70,8 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   rootfs             (required for apply) e.g. local-zfs:8
   template_storage   vztmpl storage id for oci-registry-pull (optional; see create script)
   hostname, net0, node, memory, cores, ostype, unprivileged, features, onboot
+  nameserver         string or list → pct --nameserver (repeatable); commas/whitespace split a string
+  searchdomain       string or list → pct --searchdomain (lists joined with spaces)
   mounts             list of strings "STORAGE:GiB:/path" passed as --mp to create
   pool               optional; Datacenter resource pool id. Defaults to top-level name/project
                      (stack). Use pool: "" or pool: null in defaults to disable. Missing pools are
@@ -349,6 +351,22 @@ cmd_plan() {
     echo "  exists:        $exists"
     echo "  image (file):  $image"
     echo "  rootfs:        $rootfs"
+    ns_plan="$(jq -r '
+      (.nameserver // empty)
+      | if type == "array" then map(tostring) | join(", ")
+        elif type == "number" then tostring
+        elif type == "string" then .
+        else empty end
+    ' <<<"$svc")"
+    sd_plan="$(jq -r '
+      (.searchdomain // empty)
+      | if type == "array" then map(tostring) | join(" ")
+        elif type == "number" then tostring
+        elif type == "string" then .
+        else empty end
+    ' <<<"$svc")"
+    [[ -n "$ns_plan" ]] && echo "  nameserver:    $ns_plan"
+    [[ -n "$sd_plan" ]] && echo "  searchdomain:  $sd_plan"
     echo "  marker (path): ${mr}"
     echo "  pool (target): ${effpool:-<none>}"
     echo "  tags:          ${tags:-<none>}"
@@ -399,6 +417,25 @@ fill_create_args() {
   [[ -n "$pool" ]] && OCI_CREATE_ARGS+=(--pool "$pool")
   [[ -n "$hostname" ]] && OCI_CREATE_ARGS+=(--hostname "$hostname")
   [[ -n "$net0" ]] && OCI_CREATE_ARGS+=(--net0 "$net0")
+  while IFS= read -r ns; do
+    [[ -z "$ns" ]] && continue
+    OCI_CREATE_ARGS+=(--nameserver "$ns")
+  done < <(jq -r '
+    (.nameserver // empty)
+    | if type == "array" then .[] | tostring
+      elif type == "number" then tostring
+      elif type == "string" then
+        [ splits("[,[:space:]]+") ] | map(select(length > 0)) | .[]
+      else empty end
+    ' <<<"$svcjson")
+  sd="$(jq -r '
+    (.searchdomain // empty)
+    | if type == "array" then map(tostring) | join(" ")
+      elif type == "number" then tostring
+      elif type == "string" then .
+      else empty end
+    ' <<<"$svcjson")"
+  [[ -n "$sd" ]] && OCI_CREATE_ARGS+=(--searchdomain "$sd")
   [[ -n "$node" ]] && OCI_CREATE_ARGS+=(--node "$node")
   [[ -n "$mem" ]] && OCI_CREATE_ARGS+=(--memory "$mem")
   [[ -n "$cores" ]] && OCI_CREATE_ARGS+=(--cores "$cores")

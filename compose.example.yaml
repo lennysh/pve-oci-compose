@@ -23,6 +23,9 @@ services:
     image: docker.io/library/nginx:latest
     rootfs: local-zfs:8
     hostname: nginx-oci-demo
+    # DNS (optional): passed to pct create — same semantics as Datacenter CT options / pct.conf(5)
+    # nameserver: "10.0.0.1, 10.0.0.2"   # or YAML list:  [10.0.0.1, 8.8.8.8]
+    # searchdomain: lan.local            # or list: [lan.local, corp.example.com]
     # Optional pct / pull options:
     # memory: 512
     # cores: 2
