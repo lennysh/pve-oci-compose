@@ -276,10 +276,59 @@ pve_oci_pool_json_ok() {
   [[ -n "${1:-}" ]] && printf '%s\n' "$1" | jq -e . >/dev/null 2>&1
 }
 
+# Create Datacenter resource pool if missing. **pct create --pool** fails with 403 if the pool
+# does not exist yet, so call this before oci_create_main when passing --pool.
+pve_oci_pool_ensure_exists() {
+  local pool="$1"
+  local raw cr_out pool_created
+  [[ -n "$pool" ]] || return 0
+  command -v pvesh >/dev/null 2>&1 || {
+    echo "pve-oci-compose: pvesh not found; cannot ensure pool '${pool}' exists." >&2
+    return 1
+  }
+  command -v jq >/dev/null 2>&1 || {
+    echo "pve-oci-compose: jq is required for pool checks." >&2
+    return 1
+  }
+
+  raw="$(pvesh get "/pools/${pool}" --output-format json 2>/dev/null)" || true
+  if pve_oci_pool_json_ok "$raw"; then
+    return 0
+  fi
+
+  if [[ "${PVE_OCI_POOL_NO_AUTOCREATE:-0}" == 1 ]]; then
+    echo "pve-oci-compose: pool '${pool}' not found; unset PVE_OCI_POOL_NO_AUTOCREATE to auto-create, or create the pool in the UI." >&2
+    printf '%s\n' "$raw" >&2
+    return 1
+  fi
+  pool_created=0
+  if cr_out="$(pvesh create /pools --poolid "$pool" --comment 'pve-oci-compose (auto-created)' 2>&1)"; then
+    pool_created=1
+  elif echo "$cr_out" | grep -qiE 'already exist|already exists|duplicate'; then
+    pool_created=0
+  elif cr_out="$(pvesh create /pools --poolid "$pool" 2>&1)"; then
+    pool_created=1
+  elif echo "$cr_out" | grep -qiE 'already exist|already exists|duplicate'; then
+    pool_created=0
+  else
+    echo "pve-oci-compose: could not create resource pool '${pool}' (need Pool.Allocate / root). pvesh said:" >&2
+    printf '%s\n' "$cr_out" >&2
+    return 1
+  fi
+  raw="$(pvesh get "/pools/${pool}" --output-format json 2>/dev/null)" || true
+  if ! pve_oci_pool_json_ok "$raw"; then
+    echo "pve-oci-compose: pool '${pool}' still not readable after create. pvesh get output:" >&2
+    printf '%s\n' "$raw" >&2
+    return 1
+  fi
+  [[ "$pool_created" -eq 1 ]] && echo "pve-oci-compose: created resource pool '${pool}' (Datacenter → Permissions → Pools)."
+  return 0
+}
+
 # Create pool if missing, then add this node’s LXC (unless PVE_OCI_POOL_NO_AUTOCREATE=1).
 pve_oci_pool_ensure_lxc_member() {
   local pool="$1" vmid="$2"
-  local raw data cr_out pool_created
+  local raw data
   [[ -n "$pool" ]] || return 0
   command -v pvesh >/dev/null 2>&1 || {
     echo "pve-oci-compose: pvesh not found; cannot add CT ${vmid} to pool '${pool}'." >&2
@@ -290,35 +339,12 @@ pve_oci_pool_ensure_lxc_member() {
     return 1
   }
 
+  pve_oci_pool_ensure_exists "$pool" || return 1
   raw="$(pvesh get "/pools/${pool}" --output-format json 2>/dev/null)" || true
-
   if ! pve_oci_pool_json_ok "$raw"; then
-    if [[ "${PVE_OCI_POOL_NO_AUTOCREATE:-0}" == 1 ]]; then
-      echo "pve-oci-compose: pool '${pool}' not found; unset PVE_OCI_POOL_NO_AUTOCREATE to auto-create, or create the pool in the UI." >&2
-      printf '%s\n' "$raw" >&2
-      return 1
-    fi
-    pool_created=0
-    if cr_out="$(pvesh create /pools --poolid "$pool" --comment 'pve-oci-compose (auto-created)' 2>&1)"; then
-      pool_created=1
-    elif echo "$cr_out" | grep -qiE 'already exist|already exists|duplicate'; then
-      pool_created=0
-    elif cr_out="$(pvesh create /pools --poolid "$pool" 2>&1)"; then
-      pool_created=1
-    elif echo "$cr_out" | grep -qiE 'already exist|already exists|duplicate'; then
-      pool_created=0
-    else
-      echo "pve-oci-compose: could not create resource pool '${pool}' (need Pool.Allocate / root). pvesh said:" >&2
-      printf '%s\n' "$cr_out" >&2
-      return 1
-    fi
-    raw="$(pvesh get "/pools/${pool}" --output-format json 2>/dev/null)" || true
-    if ! pve_oci_pool_json_ok "$raw"; then
-      echo "pve-oci-compose: pool '${pool}' still not readable after create. pvesh get output:" >&2
-      printf '%s\n' "$raw" >&2
-      return 1
-    fi
-    [[ "$pool_created" -eq 1 ]] && echo "pve-oci-compose: created resource pool '${pool}' (Datacenter → Permissions → Pools)."
+    echo "pve-oci-compose: pool '${pool}' not readable after ensure_exists." >&2
+    printf '%s\n' "$raw" >&2
+    return 1
   fi
 
   data="$(printf '%s\n' "$raw" | jq -c 'if type == "object" and (.data | type) == "object" then .data else . end')"

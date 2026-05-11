@@ -381,6 +381,13 @@ cmd_apply() {
     fi
 
     echo "apply: [$sname] creating vmid $resolved from $image"
+    effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
+    if [[ -n "$effpool" && "$DRY_RUN" -eq 0 ]]; then
+      pve_oci_pool_ensure_exists "$effpool" \
+        || die "apply: [$sname] could not ensure resource pool '$effpool' exists (required before pct create --pool)"
+    elif [[ -n "$effpool" && "$DRY_RUN" -eq 1 ]]; then
+      echo "apply: [$sname] DRY-RUN: would ensure pool '$effpool' exists before pct create --pool"
+    fi
     fill_create_args "$svc" "$resolved" "$stack"
     run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
 
@@ -393,7 +400,6 @@ cmd_apply() {
     else
       pve_oci_set_managed_marker "$resolved" "$sname" "$image"
       echo "apply: [$sname] sentinel tag + guest marker file (${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json})"
-      effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
       if [[ -n "$effpool" ]]; then
         if [[ "$DRY_RUN" -eq 0 ]]; then
           pve_oci_pool_ensure_lxc_member "$effpool" "$resolved" \
