@@ -7,6 +7,7 @@ Declarative **Proxmox VE** LXC workflows driven by a **YAML** compose file: crea
 | Item | Purpose |
 |------|--------|
 | `pve-oci-compose.sh` | CLI: reads `compose.yaml`, runs **plan**, **apply**, **refresh**, or **pull** |
+| `lib/common.inc.sh` | Shared helpers (e.g. cluster **nextid** for `vmid: next`) |
 | `lib/oci-create.inc.sh` | OCI vztmpl pull + `pct create` (same behaviour as the former standalone create script) |
 | `lib/oci-refresh.inc.sh` | Rootfs refresh workflow (same behaviour as the former standalone refresh script) |
 | `compose.example.yaml` | Copy to `compose.yaml` and edit |
@@ -32,10 +33,19 @@ On the node, use the repo layout as cloned (the `lib/` directory must sit next t
 
 ```text
 ./pve-oci-compose.sh
+./lib/common.inc.sh
 ./lib/oci-create.inc.sh
 ./lib/oci-refresh.inc.sh
 ./compose.yaml
 ```
+
+### Automatic `vmid` (`next` / `auto` / `null`)
+
+You can set **`vmid: next`**, **`vmid: auto`**, **`vmid: null`**, or **omit `vmid`**: **`apply`** asks the cluster for the next free id, creates the CT with that id, then **rewrites your compose file** so `vmid` becomes that number (so **`refresh`** and later runs use a stable id).
+
+- **YAML caveat:** the updater uses PyYAML `safe_dump`; **comments and some formatting may change** — keep the file in git or back it up first.
+- Skip rewriting: **`--no-write-compose`** or **`PVE_OCI_COMPOSE_NO_WRITE=1`**.
+- **`refresh`** requires a numeric `vmid` (run **`apply`** once to pin it, or set the id yourself).
 
 Create your compose file (start from the example):
 
@@ -80,7 +90,7 @@ The file is YAML with a single top-level mapping.
 
 | Field | Required for | Meaning |
 |-------|----------------|--------|
-| `vmid` | all commands that touch a CT | Fixed CT ID (recommended for GitOps-style workflows). |
+| `vmid` | all commands that touch a CT | Fixed number, or **`next`** / **`auto`** / **`null`** / omit = allocate at **apply**; **refresh** needs a number. |
 | `image` or `reference` | all | OCI image reference (same conventions as the worker create/refresh scripts). |
 | `rootfs` | **plan**, **apply**, **refresh** | e.g. `local-zfs:8` — passed to create; **pull** does not require it. |
 | `template_storage` | optional | vztmpl storage id for `oci-registry-pull`; alias `storage`. Empty or omitted lets the create script auto-pick when there is exactly one suitable store. |
@@ -95,7 +105,7 @@ See `compose.example.yaml` for a minimal working shape.
 | Command | Behavior |
 |---------|----------|
 | **plan** | No changes. For each service: CT exists?, description marker?, would **apply** create?, would **refresh**? |
-| **apply** | If `vmid` does not exist, run the **create** worker, then set a **description** marker (below). Existing CTs are left unchanged (no implicit recreate). |
+| **apply** | If the target CT does not exist, run **create** (pull + `pct create`), then set a **description** marker (below). With **`vmid: next`**, writes the allocated id back into the compose file unless disabled. Existing CTs are left unchanged (no implicit recreate). |
 | **refresh** | If the compose image ref differs from the stored ref in the marker (or you pass **`--force`**), run the **refresh** worker, then update the marker. |
 | **pull** | For each service, run the create script with **`--pull-only`** (and your `template_storage` / `image`). |
 
@@ -107,6 +117,7 @@ See `compose.example.yaml` for a minimal working shape.
 | `--adopt` | **refresh** only: allow refreshing a CT that does not yet have a `pve-oci-compose` description (e.g. hand-made CT); marker is written after success. |
 | `--force` | **refresh** only: run refresh even when the stored ref already matches the compose image. |
 | `-n`, `--dry-run` | Print worker invocations; do not run them. |
+| `--no-write-compose` | After **apply** with `vmid: next` / `auto` / `null`, do not rewrite the compose file (same as **`PVE_OCI_COMPOSE_NO_WRITE=1`**). |
 
 ## Description marker (ownership and refresh drift)
 

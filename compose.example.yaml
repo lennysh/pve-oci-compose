@@ -13,7 +13,7 @@ defaults:
 
 services:
   nginx-demo:
-    vmid: 200
+    vmid: 200 # or: next | auto | null | omit key — apply allocates next free id and can write it back
     image: docker.io/library/nginx:latest
     rootfs: local-zfs:8
     hostname: nginx-oci-demo

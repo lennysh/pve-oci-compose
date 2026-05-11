@@ -5,6 +5,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.inc.sh disable=SC1091
+source "${SCRIPT_DIR}/lib/common.inc.sh"
 # shellcheck source=lib/oci-create.inc.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/oci-create.inc.sh"
 # shellcheck source=lib/oci-refresh.inc.sh disable=SC1091
@@ -14,6 +16,7 @@ COMPOSE_FILE="${COMPOSE_FILE:-${PWD}/compose.yaml}"
 ADOPT=0
 FORCE_REFRESH=0
 DRY_RUN=0
+WRITE_COMPOSE_VMID=1
 
 usage() {
   cat <<'EOF'
@@ -32,6 +35,14 @@ Options:
                     (sets marker after a successful refresh).
   --force           refresh: run refresh even when stored ref matches compose image.
   -n, --dry-run     Print commands only (apply / refresh / pull).
+  --no-write-compose After apply with vmid: next (or auto / null), do not rewrite the compose
+                    file with the allocated id (default is to update the YAML).
+
+vmid in compose:
+  Use a fixed number, or allocate the cluster next free id with one of:
+    vmid: next     vmid: auto     vmid: null   or omit vmid (same as next).
+  After a successful apply, the compose file is rewritten with the numeric vmid (PyYAML
+  round-trip: comments/formatting may change — back up the file or pass --no-write-compose).
 
 Description marker (pct --description) after create / refresh:
   pve-oci-compose service=<name> ref=<image>
@@ -41,7 +52,7 @@ Requirements:
   - pvesh, pct, skopeo, rsync, perl (PVE::Storage) as required by the inlined workflows.
 
 Compose schema (per service; shallow merge from top-level "defaults"):
-  vmid               (required) CT VMID
+  vmid               Fixed CT VMID, or next / auto / null / omitted = allocate at apply (refresh needs a number).
   image or reference (required) OCI ref for create / refresh (same as existing scripts)
   rootfs             (required for apply) e.g. local-zfs:8
   template_storage   vztmpl storage id for oci-registry-pull (optional; see create script)
@@ -148,16 +159,71 @@ service_image() {
   jq -r '.image // .reference // empty' <<<"$1"
 }
 
+# Echo "next" or a numeric vmid string (YAML null / missing vmid → next).
+vmid_spec_from_json() {
+  jq -r '
+    .vmid as $v
+    | if $v == null then "next"
+      elif ($v | type) == "number" then ($v | tostring)
+      elif ($v | type) == "string" then
+        if (($v | ascii_downcase) == "next" or ($v | ascii_downcase) == "auto") then "next"
+        elif ($v | test("^[0-9]+$")) then $v
+        else "invalid:\($v)" end
+      else "next" end
+  ' <<<"$1"
+}
+
 validate_service() {
   local json="$1" svc="$2"
-  local vmid image rootfs
-  vmid="$(jq -r '.vmid // empty' <<<"$json")"
+  local spec image rootfs
+  spec="$(vmid_spec_from_json "$json")"
   image="$(service_image "$json")"
   rootfs="$(jq -r '.rootfs // empty' <<<"$json")"
-  [[ -n "$vmid" ]] || die "service $svc: missing vmid"
-  [[ "$vmid" =~ ^[0-9]+$ ]] || die "service $svc: vmid must be an integer"
+  [[ "$spec" != invalid:* ]] || die "service $svc: vmid must be a number, next, auto, or null (got ${spec#invalid:})"
   [[ -n "$image" ]] || die "service $svc: missing image (or reference)"
   [[ -n "$rootfs" ]] || die "service $svc: missing rootfs"
+}
+
+validate_service_refresh() {
+  local json="$1" svc="$2"
+  local spec
+  spec="$(vmid_spec_from_json "$json")"
+  [[ "$spec" != next ]] || die "service $svc: refresh needs a numeric vmid (still 'next' — run apply first or set vmid)"
+  validate_service "$json" "$svc"
+}
+
+compose_write_service_vmid() {
+  local path="$1" svc="$2" vmid="$3"
+  python3 - "$path" "$svc" "$vmid" <<'PY'
+import pathlib, sys
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write("pve-oci-compose: PyYAML required to write compose file\n")
+    sys.exit(1)
+
+path = pathlib.Path(sys.argv[1])
+svc = sys.argv[2]
+vmid = int(sys.argv[3], 10)
+raw = path.read_text(encoding="utf-8")
+data = yaml.safe_load(raw)
+if not isinstance(data, dict):
+    sys.stderr.write("pve-oci-compose: compose root must be a mapping\n")
+    sys.exit(1)
+services = data.get("services")
+if not isinstance(services, dict) or svc not in services:
+    sys.stderr.write(f"pve-oci-compose: no services.{svc!r} in {path}\n")
+    sys.exit(1)
+if not isinstance(services[svc], dict):
+    sys.stderr.write(f"pve-oci-compose: services.{svc!r} must be a mapping\n")
+    sys.exit(1)
+services[svc]["vmid"] = vmid
+path.write_text(
+    yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True),
+    encoding="utf-8",
+)
+PY
+  echo "pve-oci-compose: updated vmid for service '$svc' → $vmid in $path"
 }
 
 validate_service_pull() {
@@ -178,7 +244,7 @@ run_or_print() {
 }
 
 cmd_plan() {
-  local json sname svc vmid image rootfs desc stored exists
+  local json sname svc spec vmid image rootfs desc stored exists hint
   json="$(compose_json)"
   echo "Compose file: $COMPOSE_FILE"
   jq -r '.project // empty' <<<"$json" | sed '/^$/d' | sed 's/^/Project: /' || true
@@ -187,12 +253,24 @@ cmd_plan() {
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service "$svc" "$sname"
-    vmid="$(jq -r '.vmid' <<<"$svc")"
+    spec="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
     rootfs="$(jq -r '.rootfs' <<<"$svc")"
+    if [[ "$spec" == next ]]; then
+      hint="$(pve_oci_next_cluster_id 2>/dev/null)" || hint="(query failed — need pvesh on a PVE node)"
+      vmid="next (next free now: $hint)"
+      echo "=== service: $sname (vmid $vmid) ==="
+      echo "  image (file):  $image"
+      echo "  rootfs:        $rootfs"
+      echo "  plan apply:    would allocate next free vmid and create from $image"
+      echo "  plan refresh:  n/a until vmid is fixed in the file (run apply to write it)"
+      echo
+      continue
+    fi
+
+    vmid="$spec"
     desc="$(pct_description "$vmid")"
     stored="$(extract_managed_ref "$desc")"
-
     if pct config "$vmid" &>/dev/null; then
       exists=yes
     else
@@ -227,12 +305,13 @@ cmd_plan() {
 
 fill_create_args() {
   local svcjson="$1"
+  local resolved_vmid="$2"
   local ts ref vmid hostname net0 node mem cores ostype feats v
 
   OCI_CREATE_ARGS=()
   ts="$(jq -r '.template_storage // .storage // empty' <<<"$svcjson")"
   ref="$(service_image "$svcjson")"
-  vmid="$(jq -r '.vmid' <<<"$svcjson")"
+  vmid="$resolved_vmid"
   hostname="$(jq -r '.hostname // empty' <<<"$svcjson")"
   net0="$(jq -r '.net0 // empty' <<<"$svcjson")"
   node="$(jq -r '.node // empty' <<<"$svcjson")"
@@ -270,26 +349,36 @@ fill_create_args() {
 OCI_CREATE_ARGS=()
 
 cmd_apply() {
-  local json sname svc vmid image
+  local json sname svc spec resolved image
   json="$(compose_json)"
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service "$svc" "$sname"
-    vmid="$(jq -r '.vmid' <<<"$svc")"
+    spec="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
+    if [[ "$spec" == next ]]; then
+      resolved="$(pve_oci_next_cluster_id)" || die "apply: [$sname] could not read cluster nextid (pvesh / jq?)"
+    else
+      resolved="$spec"
+    fi
 
-    if pct config "$vmid" &>/dev/null; then
-      echo "apply: [$sname] vmid $vmid already exists — skip create"
+    if pct config "$resolved" &>/dev/null; then
+      echo "apply: [$sname] vmid $resolved already exists — skip create"
       continue
     fi
 
-    echo "apply: [$sname] creating vmid $vmid from $image"
-    fill_create_args "$svc"
+    echo "apply: [$sname] creating vmid $resolved from $image"
+    fill_create_args "$svc" "$resolved"
     run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
 
     if [[ "$DRY_RUN" -eq 0 ]]; then
-      pct set "$vmid" --description "$(expected_description "$sname" "$image")"
+      pct set "$resolved" --description "$(expected_description "$sname" "$image")"
       echo "apply: [$sname] set description marker for refresh tracking"
+      if [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 1 ]]; then
+        compose_write_service_vmid "$COMPOSE_FILE" "$sname" "$resolved"
+      elif [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 0 ]]; then
+        echo "apply: [$sname] vmid was 'next' — set vmid: $resolved in $COMPOSE_FILE (or re-run apply without --no-write-compose)"
+      fi
     fi
   done < <(jq -r '.services | keys[]' <<<"$json")
 }
@@ -299,8 +388,8 @@ cmd_refresh() {
   json="$(compose_json)"
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
-    validate_service "$svc" "$sname"
-    vmid="$(jq -r '.vmid' <<<"$svc")"
+    validate_service_refresh "$svc" "$sname"
+    vmid="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
 
     pct config "$vmid" &>/dev/null || die "refresh: [$sname] vmid $vmid does not exist"
@@ -347,12 +436,15 @@ cmd_pull() {
 }
 
 CMD=""
+[[ "${PVE_OCI_COMPOSE_NO_WRITE:-}" == 1 ]] && WRITE_COMPOSE_VMID=0
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -f|--file)       COMPOSE_FILE="${2:?}"; shift 2 ;;
     --adopt)         ADOPT=1; shift ;;
     --force)         FORCE_REFRESH=1; shift ;;
     -n|--dry-run)    DRY_RUN=1; shift ;;
+    --no-write-compose) WRITE_COMPOSE_VMID=0; shift ;;
     -h|--help)       usage ;;
     -*)
       die "unknown option: $1"
