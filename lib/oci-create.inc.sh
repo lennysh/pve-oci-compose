@@ -416,19 +416,34 @@ parse_upid_from_create_response() {
 }
 
 wait_for_task() {
-  local upid="$1" max="${2:-7200}" waited=0
-  local status exitstatus line
+  local upid="$1" max="${2:-7200}" waited=0 poll_empty=0
+  local status exitstatus line upid_esc
+
+  upid_esc="$(pve_api_quote_path_segment "$upid")"
 
   while [[ "$waited" -lt "$max" ]]; do
-    line=$(pvesh get "/nodes/${NODE}/tasks/${upid}/status" --output-format json 2>/dev/null) || true
+    line=$(pvesh get "/nodes/${NODE}/tasks/${upid_esc}/status" --output-format json 2>/dev/null) || true
+    [[ -z "$line" ]] && line=$(pvesh get "/nodes/${NODE}/tasks/${upid}/status" --output-format json 2>/dev/null) || true
+
+    if [[ -n "${PVE_OCI_COMPOSE_TASK_DEBUG:-}" ]]; then
+      printf '[task-debug] waited=%ds len=%s first=%s\n' "$waited" "${#line}" "${line:0:120}" >&2
+    fi
+
     if [[ -n "$line" ]]; then
-      status=$(printf '%s\n' "$line" | jq -r '.data.status // empty' 2>/dev/null || true)
+      poll_empty=0
+      IFS=$'\t' read -r status exitstatus <<<"$(pve_task_status_from_json "$line")"
+      status="${status//$'\r'/}"
+      exitstatus="${exitstatus//$'\r'/}"
       if [[ "$status" == "stopped" ]]; then
-        exitstatus=$(printf '%s\n' "$line" | jq -r '.data.exitstatus // empty' 2>/dev/null || true)
-        if [[ "$exitstatus" == "OK" ]]; then
+        if [[ "${exitstatus^^}" == "OK" ]]; then
           return 0
         fi
         die "Task finished with exitstatus=${exitstatus:-unknown}. UPID=${upid}"
+      fi
+    else
+      poll_empty=$((poll_empty + 2))
+      if [[ "$poll_empty" -eq 30 ]]; then
+        printf '%s\n' "Still waiting on task UPID=${upid} … (no JSON from pvesh get …/tasks/…/status — check node name and API; try PVE_OCI_COMPOSE_TASK_DEBUG=1)" >&2
       fi
     fi
     sleep 2

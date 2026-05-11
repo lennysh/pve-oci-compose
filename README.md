@@ -131,6 +131,7 @@ Use **pinned tags or digests** in compose when you care about exactly when a ref
 
 ## Operational notes
 
+- **OCI pull “Waiting for pull to finish…”** polls `pvesh get /nodes/<node>/tasks/<UPID>/status`. UPIDs contain colons—the tool **URL-encodes** the UPID for that path (Proxmox-style) and **retries** with the raw UPID if the first response is empty. If a pull still hangs after the task logged OK in the UI, verify **`jq`** and run with **`PVE_OCI_COMPOSE_TASK_DEBUG=1`** so each poll prints a short JSON preview on stderr.
 - **Stateful data**: keep long-lived data on **`mp`** volumes or bind mounts, not only on rootfs—the refresh worker replaces the root tree (see the refresh script README for details).
 - **Snapshots / backups**: refresh uses the worker’s snapshot behaviour; production DR is still **vzdump** / PBS / your policy—not replaced by this tool.
 - **Clusters**: run on the node that owns the CT; remote placement is out of scope for this driver.
