@@ -93,6 +93,7 @@ The file is YAML with a single top-level mapping.
 | `image` or `reference` | all | OCI image reference (same conventions as the worker create/refresh scripts). |
 | `rootfs` | **plan**, **apply**, **refresh** | e.g. `local-zfs:8` — passed to create; **pull** does not require it. |
 | `template_storage` | optional | vztmpl storage id for `oci-registry-pull`; alias `storage`. Empty or omitted lets the create script auto-pick when there is exactly one suitable store. |
+| `pool` | optional | Datacenter **resource pool** id for UI grouping. Defaults to top-level **`name`** / **`project`** (same as **Project:** in **plan**). Set to **`""`** or **`null`** in **`defaults`** to disable. The pool must exist (**Datacenter → Permissions → Pools**). |
 | `hostname`, `net0`, `node`, `memory`, `cores`, `ostype`, `features` | optional | Passed through to the create script where supported. |
 | `unprivileged`, `onboot` | optional | YAML booleans or integers; mapped to `pct` flags on create. |
 | `mounts` | optional | List of strings `STORAGE:GiB:/absolute/path` → `--mp` on create (extra CT volumes). |

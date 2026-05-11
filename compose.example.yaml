@@ -3,10 +3,13 @@
 #
 # Top-level "defaults" are shallow-merged into each service (service keys win).
 
+# Used as the default Datacenter → Permissions → **resource pool** id (pct --pool) unless you set
+# `defaults.pool` / per-service `pool` (use `pool: ""` to opt out). The pool must already exist in PVE.
 name: example-stack
 
 defaults:
   template_storage: "" # vztmpl storage id for oci-registry-pull; omit or "" to auto-pick when unique
+  # pool: ""        # optional: disable default pool (= stack name) for all services in this file
   # net0 is passed to pct --net0. Add tag=VLAN for 802.1Q on a VLAN-aware bridge (see PVE wiki: VLAN on bridge).
   # Example VLAN 42:  'name=eth0,bridge=vmbr0,tag=42,ip=dhcp'
   net0: "name=eth0,bridge=vmbr0,ip=dhcp"

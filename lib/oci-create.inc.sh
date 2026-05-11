@@ -25,6 +25,7 @@ Common options:
   --features SPEC       pct --features
   --onboot 0|1          pct --onboot (default: 0)
   --arch ARCH           pct --arch (optional; e.g. amd64)
+  --pool ID             pct --pool (Datacenter resource pool; must exist)
   --mp SPEC             Repeatable: STORAGE:GiB:/path
 
 Pull behaviour:
@@ -116,6 +117,7 @@ ARCH=""
 UNPRIV="1"
 FEATURES=""
 ONBOOT="0"
+POOL=""
 SKIP_PULL=0
 REUSE_LOCAL=0
 PULL_ONLY=0
@@ -139,6 +141,7 @@ while [[ $# -gt 0 ]]; do
     --unprivileged)     UNPRIV="${2:?}"; shift 2 ;;
     --features)         FEATURES="${2:?}"; shift 2 ;;
     --onboot)           ONBOOT="${2:?}"; shift 2 ;;
+    --pool)             POOL="${2:?}"; shift 2 ;;
     --mp)               MP_SPECS+=("${2:?}"); shift 2 ;;
     --skip-pull)        SKIP_PULL=1; shift ;;
     --reuse-local-template) REUSE_LOCAL=1; shift ;;
@@ -617,6 +620,7 @@ fi
 
 cmd=(pct create "$VMID" "$OSTEMPLATE" --rootfs "$ROOTFS_SPEC" --hostname "$HOSTNAME" --net0 "$NET0" --unprivileged "$UNPRIV" --onboot "$ONBOOT")
 
+[[ -n "$POOL" ]] && cmd+=(--pool "$POOL")
 [[ -n "$MEMORY" ]] && cmd+=(--memory "$MEMORY")
 [[ -n "$CORES" ]] && cmd+=(--cores "$CORES")
 [[ -n "$OSTYPE" ]] && cmd+=(--ostype "$OSTYPE")

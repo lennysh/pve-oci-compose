@@ -240,3 +240,82 @@ print(json.dumps({"service": svc, "ref": ref}, separators=(",", ":"), ensure_asc
   pct exec "$vmid" -- sh -ec 'install -d "$(dirname "$1")"' x "$mr" >/dev/null 2>&1 || true
   printf '%s\n' "$blob" | pct exec "$vmid" -- sh -ec 'cat >"$1"' x "$mr" || return 1
 }
+
+# --- Datacenter resource pool (UI grouping) --------------------------------
+# Compose `name` / `project` → default pool id unless service sets `pool` (empty/null opts out).
+
+pve_oci_effective_pool_for_service() {
+  local svcjson="$1"
+  local stack="${2:-}"
+  jq -r --arg d "$stack" '
+    if has("pool") then
+      if .pool == null or .pool == false then ""
+      elif (.pool | type) == "string" then .pool
+      else (.pool | tostring)
+      end
+    else
+      $d
+    end
+  ' <<<"$svcjson"
+}
+
+# Current node name for pool member objects (run on the node that hosts the CT).
+pve_oci_local_nodename() {
+  if command -v pvecm &>/dev/null; then
+    local n
+    n="$(pvecm nodename 2>/dev/null)" || true
+    [[ -n "$n" ]] && {
+      printf '%s\n' "$n"
+      return
+    }
+  fi
+  hostname -s
+}
+
+# Add this node’s LXC to pool if missing (pool must already exist in Datacenter).
+pve_oci_pool_ensure_lxc_member() {
+  local pool="$1" vmid="$2"
+  local node raw data members_json comment
+  [[ -n "$pool" ]] || return 0
+  command -v pvesh >/dev/null 2>&1 || {
+    echo "pve-oci-compose: pvesh not found; cannot add CT ${vmid} to pool '${pool}'." >&2
+    return 1
+  }
+  command -v jq >/dev/null 2>&1 || {
+    echo "pve-oci-compose: jq is required for pool membership updates." >&2
+    return 1
+  }
+
+  node="$(pve_oci_local_nodename)"
+  raw="$(pvesh get "/pools/${pool}" --output-format json 2>/dev/null)" || true
+  if [[ -z "$raw" ]] || ! printf '%s\n' "$raw" | jq -e . >/dev/null 2>&1; then
+    echo "pve-oci-compose: resource pool '${pool}' not found (Datacenter → Permissions → Pools). pvesh output was:" >&2
+    printf '%s\n' "$raw" >&2
+    return 1
+  fi
+
+  data="$(printf '%s\n' "$raw" | jq -c 'if type == "object" and (.data | type) == "object" then .data else . end')"
+  if printf '%s\n' "$data" | jq -e --arg v "$vmid" '
+    (.members // []) | map(select(.type == "lxc" and .vmid == ($v|tonumber))) | length > 0
+  ' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  members_json="$(printf '%s\n' "$data" | jq -c --arg v "$vmid" --arg n "$node" '
+    (.members // []) + [{"type": "lxc", "vmid": ($v | tonumber), "node": $n}]
+  ')"
+  comment="$(printf '%s\n' "$data" | jq -r '.comment // empty')"
+  if [[ -n "$comment" ]]; then
+    pvesh set "/pools/${pool}" --members "$members_json" --comment "$comment" \
+      || {
+        echo "pve-oci-compose: pvesh set /pools/${pool} failed (--members + --comment)." >&2
+        return 1
+      }
+  else
+    pvesh set "/pools/${pool}" --members "$members_json" \
+      || {
+        echo "pve-oci-compose: pvesh set /pools/${pool} failed (--members)." >&2
+        return 1
+      }
+  fi
+}

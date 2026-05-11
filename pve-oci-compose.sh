@@ -52,6 +52,11 @@ Compose marker after create / refresh:
   JSON file inside the CT rootfs (**/etc/pve-oci-compose.json** by default — **PVE_OCI_ROOTFS_MARKER**)
   holds canonical **service** + **ref** for plan/refresh; it is part of pct snapshots.
 
+Resource pools (UI grouping):
+  If compose has **name:** or **project:** (same value surfaced as **Project:** in plan), that string
+  is used as the default **pct --pool** id and to add the CT via **pvesh** when the guest already exists.
+  Create the pool once under Datacenter → Permissions → Pools (id must match the stack name).
+
 Requirements:
   - Run on a PVE node as root; jq; python3; PyYAML (python3-yaml package).
   - pvesh, pct, skopeo, rsync, perl (PVE::Storage) as required by the inlined workflows.
@@ -64,6 +69,8 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   template_storage   vztmpl storage id for oci-registry-pull (optional; see create script)
   hostname, net0, node, memory, cores, ostype, unprivileged, features, onboot
   mounts             list of strings "STORAGE:GiB:/path" passed as --mp to create
+  pool               optional; Datacenter resource pool id. Defaults to top-level name/project
+                     (stack). Use pool: "" or pool: null in defaults to disable. Pool must exist.
 EOF
   exit 1
 }
@@ -230,8 +237,9 @@ run_or_print() {
 }
 
 cmd_plan() {
-  local json sname svc spec vmid image rootfs tags stored exists hint mr
+  local json sname svc spec vmid image rootfs tags stored exists hint mr stack effpool
   json="$(compose_json)"
+  stack="$(jq -r '.project // empty' <<<"$json")"
   echo "Compose file: $COMPOSE_FILE"
   jq -r '.project // empty' <<<"$json" | sed '/^$/d' | sed 's/^/Project: /' || true
   echo
@@ -256,6 +264,7 @@ cmd_plan() {
 
     vmid="$spec"
     mr="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
+    effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
     tags="$(pve_oci_pct_tags "$vmid")"
     stored="$(pve_oci_stored_ref "$vmid")"
     if pct config "$vmid" &>/dev/null; then
@@ -269,6 +278,7 @@ cmd_plan() {
     echo "  image (file):  $image"
     echo "  rootfs:        $rootfs"
     echo "  marker (path): ${mr}"
+    echo "  pool (target): ${effpool:-<none>}"
     echo "  tags:          ${tags:-<none>}"
     if [[ "$exists" == yes ]]; then
       if [[ -z "$stored" ]]; then
@@ -294,7 +304,8 @@ cmd_plan() {
 fill_create_args() {
   local svcjson="$1"
   local resolved_vmid="$2"
-  local ts ref vmid hostname net0 node mem cores ostype arch feats v
+  local stack_default="${3:-}"
+  local ts ref vmid hostname net0 node mem cores ostype arch feats v pool
 
   OCI_CREATE_ARGS=()
   ts="$(jq -r '.template_storage // .storage // empty' <<<"$svcjson")"
@@ -310,8 +321,10 @@ fill_create_args() {
   feats="$(jq -r '.features // empty' <<<"$svcjson")"
 
   [[ -n "$ref" ]] || die "internal: empty image"
+  pool="$(pve_oci_effective_pool_for_service "$svcjson" "$stack_default")"
   OCI_CREATE_ARGS+=(--reference "$ref" --rootfs "$(jq -r '.rootfs' <<<"$svcjson")" --vmid "$vmid")
   [[ -n "$ts" ]] && OCI_CREATE_ARGS+=(--storage "$ts")
+  [[ -n "$pool" ]] && OCI_CREATE_ARGS+=(--pool "$pool")
   [[ -n "$hostname" ]] && OCI_CREATE_ARGS+=(--hostname "$hostname")
   [[ -n "$net0" ]] && OCI_CREATE_ARGS+=(--net0 "$net0")
   [[ -n "$node" ]] && OCI_CREATE_ARGS+=(--node "$node")
@@ -339,8 +352,9 @@ fill_create_args() {
 OCI_CREATE_ARGS=()
 
 cmd_apply() {
-  local json sname svc spec resolved image merged
+  local json sname svc spec resolved image merged stack effpool
   json="$(compose_json)"
+  stack="$(jq -r '.project // empty' <<<"$json")"
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service "$svc" "$sname"
@@ -354,11 +368,19 @@ cmd_apply() {
 
     if pct config "$resolved" &>/dev/null; then
       echo "apply: [$sname] vmid $resolved already exists — skip create"
+      effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
+      if [[ -n "$effpool" && "$DRY_RUN" -eq 0 ]]; then
+        pve_oci_pool_ensure_lxc_member "$effpool" "$resolved" \
+          || die "apply: [$sname] could not add CT $resolved to pool '$effpool'"
+        echo "apply: [$sname] pool membership → ${effpool}"
+      elif [[ -n "$effpool" && "$DRY_RUN" -eq 1 ]]; then
+        echo "apply: [$sname] DRY-RUN: would ensure CT $resolved in pool '${effpool}' (pvesh set /pools/…)"
+      fi
       continue
     fi
 
     echo "apply: [$sname] creating vmid $resolved from $image"
-    fill_create_args "$svc" "$resolved"
+    fill_create_args "$svc" "$resolved" "$stack"
     run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -370,6 +392,16 @@ cmd_apply() {
     else
       pve_oci_set_managed_marker "$resolved" "$sname" "$image"
       echo "apply: [$sname] sentinel tag + guest marker file (${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json})"
+      effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
+      if [[ -n "$effpool" ]]; then
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+          pve_oci_pool_ensure_lxc_member "$effpool" "$resolved" \
+            || die "apply: [$sname] could not add CT $resolved to pool '$effpool'"
+          echo "apply: [$sname] pool membership → ${effpool}"
+        else
+          echo "apply: [$sname] DRY-RUN: would pass --pool '${effpool}' to pct create (and pvesh would no-op if already a member)"
+        fi
+      fi
       if [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 1 ]]; then
         compose_write_service_vmid "$COMPOSE_FILE" "$sname" "$resolved"
       elif [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 0 ]]; then
@@ -380,8 +412,9 @@ cmd_apply() {
 }
 
 cmd_refresh() {
-  local json sname svc vmid image merged stored ts
+  local json sname svc vmid image merged stored ts stack effpool
   json="$(compose_json)"
+  stack="$(jq -r '.project // empty' <<<"$json")"
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service_refresh "$svc" "$sname"
@@ -420,9 +453,17 @@ cmd_refresh() {
       printf 'DRY-RUN:'
       printf ' %q' pct set "$vmid" --tags "$merged"
       printf '\n'
+      effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
+      [[ -n "$effpool" ]] && echo "refresh: [$sname] DRY-RUN: would ensure pool '${effpool}' for CT ${vmid}"
       echo "refresh: [$sname] DRY-RUN: guest marker JSON not written; tag merge shown above only"
     else
       pve_oci_set_managed_marker "$vmid" "$sname" "$image"
+      effpool="$(pve_oci_effective_pool_for_service "$svc" "$stack")"
+      if [[ -n "$effpool" ]]; then
+        pve_oci_pool_ensure_lxc_member "$effpool" "$vmid" \
+          || die "refresh: [$sname] could not add CT $vmid to pool '$effpool'"
+        echo "refresh: [$sname] pool membership → ${effpool}"
+      fi
     fi
   done < <(jq -r '.services | keys[]' <<<"$json")
 }
