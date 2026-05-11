@@ -36,6 +36,10 @@ Pull behaviour:
 Floating :latest: resolved via skopeo unless OCI_CT_CREATE_NO_RESOLVE_LATEST=1
 
 After create: CT is left stopped unless you run pct start manually.
+
+Env (optional):
+  PVE_OCI_CREATE_QUIET=1   Fewer banners when this worker is reused for a disposable
+                           scratch CT (e.g. refresh); normal apply output unchanged if unset.
 EOF
   exit 1
 }
@@ -171,6 +175,10 @@ if [[ "$PULL_ONLY" -eq 0 ]]; then
 fi
 
 [[ -n "$NODE" ]] || NODE="$(node_name)"
+
+# Set by refresh when reusing this worker for a disposable temp CT (omit apply-style banners).
+_PVE_OCI_CREATE_QUIET=0
+case "${PVE_OCI_CREATE_QUIET:-}" in 1|yes|true|TRUE|Y) _PVE_OCI_CREATE_QUIET=1 ;; esac
 
 load_node_storage_json() {
   STORAGE_JSON_CACHED=$(pvesh get "/nodes/${NODE}/storage" --output-format json 2>/dev/null) \
@@ -470,24 +478,32 @@ skopeo_copy_digest_ref_to_local_tar() {
 
 oci_registry_pull() {
   local ref="$1" out upid
-  out_title "Registry pull (vztmpl · oci-registry-pull)"
-  out_kv "Node" "${NODE}"
-  out_kv "Storage" "${STORAGE}"
-  if [[ "${REFERENCE}" != "${PULL_REFERENCE}" ]]; then
-    out_kv "Compose / CLI ref" "${REFERENCE}"
-    out_kv "Resolved pull ref" "${ref}"
+  if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+    out_muted "Scratch CT: template pull / reuse on ${STORAGE} (${ref})"
   else
-    out_kv "Image ref" "${ref}"
+    out_title "Registry pull (vztmpl · oci-registry-pull)"
+    out_kv "Node" "${NODE}"
+    out_kv "Storage" "${STORAGE}"
+    if [[ "${REFERENCE}" != "${PULL_REFERENCE}" ]]; then
+      out_kv "Compose / CLI ref" "${REFERENCE}"
+      out_kv "Resolved pull ref" "${ref}"
+    else
+      out_kv "Image ref" "${ref}"
+    fi
   fi
 
   out=$(pvesh create "/nodes/${NODE}/storage/${STORAGE}/oci-registry-pull" \
     --reference "$ref" --output-format json 2>&1) && {
     upid="$(parse_upid_from_create_response "$out" || true)"
     [[ -n "$upid" ]] || die "Could not parse UPID from pvesh output (expected JSON with .data or a UPID: line): $out"
-    out_kv "Task UPID" "${upid}"
-    out_sub "Waiting for pull task …"
+    if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+      out_muted "Waiting on registry pull task …"
+    else
+      out_kv "Task UPID" "${upid}"
+      out_sub "Waiting for pull task …"
+    fi
     wait_for_task "$upid"
-    out_ok "Template on storage"
+    [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]] && out_muted "Template on storage" || out_ok "Template on storage"
     return 0
   }
 
@@ -542,8 +558,12 @@ else
 fi
 
 if [[ "$SKIP_PULL" -eq 1 ]]; then
-  out_sub "Pull skipped (--skip-pull)"
-  out_kv "Ostemplate" "${OSTEMPLATE}"
+  if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+    out_muted "Pull skipped (--skip-pull) · ${OSTEMPLATE}"
+  else
+    out_sub "Pull skipped (--skip-pull)"
+    out_kv "Ostemplate" "${OSTEMPLATE}"
+  fi
 elif [[ "$REUSE_LOCAL" -eq 1 ]]; then
   if [[ -n "$LOCAL_TAR" && -f "$LOCAL_TAR" ]]; then
     if declare -f out_muted &>/dev/null; then out_muted "Reusing template on host: ${LOCAL_TAR}"
@@ -559,11 +579,15 @@ else
 fi
 
 if [[ -n "$LOCAL_TAR" && -f "$LOCAL_TAR" ]]; then
-  out_kv "Template file" "${LOCAL_TAR}"
-  tpl_one="$(ls -lh "$LOCAL_TAR" 2>/dev/null | head -1)"
-  [[ -n "$tpl_one" ]] && out_detail "${tpl_one}"
+  if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+    out_muted "Template file: ${LOCAL_TAR}"
+  else
+    out_kv "Template file" "${LOCAL_TAR}"
+    tpl_one="$(ls -lh "$LOCAL_TAR" 2>/dev/null | head -1)"
+    [[ -n "$tpl_one" ]] && out_detail "${tpl_one}"
+  fi
 elif wait_until_ostemplate_visible; then
-  out_kv "Template" "${OSTEMPLATE} (listed on storage)"
+  [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]] && out_muted "Template: ${OSTEMPLATE}" || out_kv "Template" "${OSTEMPLATE} (listed on storage)"
 else
   die "Template not found as ${OSTEMPLATE} (no file at ${LOCAL_TAR:-<no host path>} and storage content listing did not show it)."
 fi
@@ -580,12 +604,16 @@ fi
 
 [[ -n "$HOSTNAME" ]] || HOSTNAME="oci-ct-${VMID}"
 
-out_title "pct create · from vztmpl OCI tarball"
-out_kv "VMID" "${VMID}"
-out_kv "Ostemplate" "${OSTEMPLATE}"
-out_kv "Rootfs" "${ROOTFS_SPEC}"
-out_kv "Hostname" "${HOSTNAME}"
-[[ "${#MP_SPECS[@]}" -gt 0 ]] && out_kv "Mounts (mp*)" "${MP_SPECS[*]}"
+if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+  out_muted "Unpacking vztmpl into scratch VMID ${VMID} (disposable — not your compose CT)"
+else
+  out_title "pct create · from vztmpl OCI tarball"
+  out_kv "VMID" "${VMID}"
+  out_kv "Ostemplate" "${OSTEMPLATE}"
+  out_kv "Rootfs" "${ROOTFS_SPEC}"
+  out_kv "Hostname" "${HOSTNAME}"
+  [[ "${#MP_SPECS[@]}" -gt 0 ]] && out_kv "Mounts (mp*)" "${MP_SPECS[*]}"
+fi
 
 cmd=(pct create "$VMID" "$OSTEMPLATE" --rootfs "$ROOTFS_SPEC" --hostname "$HOSTNAME" --net0 "$NET0" --unprivileged "$UNPRIV" --onboot "$ONBOOT")
 
@@ -609,9 +637,17 @@ for mp_spec in "${MP_SPECS[@]}"; do
 done
 unset mp_st mp_sz mp_path mp_spec 2>/dev/null || true
 
-out_step "run" "" "pct create"
-out_cmd "$(printf '%q ' "${cmd[@]}")"
+if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+  out_cmd "$(printf '%q ' "${cmd[@]}")"
+else
+  out_step "run" "" "pct create"
+  out_cmd "$(printf '%q ' "${cmd[@]}")"
+fi
 "${cmd[@]}" || die "pct create failed"
 
-out_ok "CT ${VMID} created (stopped) — pct start ${VMID} when ready"
+if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+  out_muted "Scratch CT ${VMID} ready (stopped) — used only as rsync source; will be destroyed."
+else
+  out_ok "CT ${VMID} created (stopped) — pct start ${VMID} when ready"
+fi
 }

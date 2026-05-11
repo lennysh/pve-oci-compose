@@ -182,9 +182,10 @@ create_temp_ct() {
     [[ -n "${ARCH:-}" ]] && oci_args+=(--arch "$ARCH")
     [[ -n "${FEATURES:-}" ]] && oci_args+=(--features "$FEATURES")
 
-    out_cmd "$(printf '%q ' oci_create_main "${oci_args[@]}")"
-    oci_create_main "${oci_args[@]}"
-    out_ok "Temp CT ${TEMP} ready (stopped) — same template path as create/apply"
+    out_cmd "$(printf 'PVE_OCI_CREATE_QUIET=1 %q ' oci_create_main)$(printf '%q ' "${oci_args[@]}")"
+    PVE_OCI_CREATE_QUIET=1 oci_create_main "${oci_args[@]}"
+    unset PVE_OCI_CREATE_QUIET 2>/dev/null || true
+    out_ok "Temp CT ${TEMP} ready — disposable source for rsync (will be destroyed)"
   else
     out_title "Temp CT ${TEMP} (local template / vztmpl)"
     cmd=(
