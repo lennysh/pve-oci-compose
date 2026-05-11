@@ -228,7 +228,8 @@ pick_template_storage_or_exit() {
     mapfile -t cands < <(oci_pull_template_storage_ids)
     if [[ "${#cands[@]}" -eq 1 ]]; then
       STORAGE="${cands[0]}"
-      echo "Note: auto-selected --storage '${STORAGE}' (only vztmpl+oci-registry-pull candidate on node '${NODE}')." >&2
+      if declare -f out_muted &>/dev/null; then out_muted "Auto-selected template storage '${STORAGE}' (only vztmpl+OCI candidate on '${NODE}')."
+      else echo "Note: auto-selected --storage '${STORAGE}' …" >&2; fi
     elif [[ "${#cands[@]}" -eq 0 ]]; then
       echo "No storage on node '${NODE}' is usable for oci-registry-pull (need vztmpl + type dir, nfs, or cifs)." >&2
       echo >&2
@@ -466,24 +467,24 @@ skopeo_copy_digest_ref_to_local_tar() {
 
 oci_registry_pull() {
   local ref="$1" out upid
-  echo "--- oci-registry-pull (same API as Proxmox UI) ---"
-  echo "Node:     ${NODE}"
-  echo "Storage:  ${STORAGE}"
+  out_title "Registry pull (vztmpl · oci-registry-pull)"
+  out_kv "Node" "${NODE}"
+  out_kv "Storage" "${STORAGE}"
   if [[ "${REFERENCE}" != "${PULL_REFERENCE}" ]]; then
-    echo "User reference: ${REFERENCE}"
+    out_kv "Compose / CLI ref" "${REFERENCE}"
+    out_kv "Resolved pull ref" "${ref}"
+  else
+    out_kv "Image ref" "${ref}"
   fi
-  echo "Pull reference: ${ref}"
-  echo
 
   out=$(pvesh create "/nodes/${NODE}/storage/${STORAGE}/oci-registry-pull" \
     --reference "$ref" --output-format json 2>&1) && {
     upid="$(parse_upid_from_create_response "$out" || true)"
     [[ -n "$upid" ]] || die "Could not parse UPID from pvesh output (expected JSON with .data or a UPID: line): $out"
-    echo "Worker UPID: ${upid}"
-    echo "Waiting for pull to finish..."
+    out_kv "Task UPID" "${upid}"
+    out_sub "Waiting for pull task …"
     wait_for_task "$upid"
-    echo "Pull completed OK."
-    echo
+    out_ok "Template on storage"
     return 0
   }
 
@@ -529,18 +530,24 @@ VZTDIR=""
 if VZTDIR="$(vztmpl_host_dir_for_storage "$STORAGE")"; then
   LOCAL_TAR="${VZTDIR}/${NORM}.tar"
 else
-  echo "Note: storage '${STORAGE}' has no resolvable host vztmpl path (typical for ZFS/LVM/RBD pools)." >&2
-  echo "      Using storage API to detect ${OSTEMPLATE}; pct create still uses that volid." >&2
-  echo >&2
+  if declare -f out_detail &>/dev/null; then
+    out_detail "No host vztmpl directory for storage '${STORAGE}' (normal for some backends)."
+    out_detail "Polling API until volume ${OSTEMPLATE} appears …"
+  else
+    echo "Note: no host vztmpl path for '${STORAGE}'; polling API for ${OSTEMPLATE}" >&2
+  fi
 fi
 
 if [[ "$SKIP_PULL" -eq 1 ]]; then
-  echo "Skipping pull (--skip-pull). Using ostemplate: ${OSTEMPLATE}"
+  out_sub "Pull skipped (--skip-pull)"
+  out_kv "Ostemplate" "${OSTEMPLATE}"
 elif [[ "$REUSE_LOCAL" -eq 1 ]]; then
   if [[ -n "$LOCAL_TAR" && -f "$LOCAL_TAR" ]]; then
-    echo "Reusing existing template file: ${LOCAL_TAR}"
+    if declare -f out_muted &>/dev/null; then out_muted "Reusing template on host: ${LOCAL_TAR}"
+    else echo "Reusing existing template file: ${LOCAL_TAR}" >&2; fi
   elif storage_has_ostemplate_volid; then
-    echo "Reusing existing template on storage (volid ${OSTEMPLATE})."
+    if declare -f out_muted &>/dev/null; then out_muted "Reusing template on storage (${OSTEMPLATE})"
+    else echo "Reusing existing template on storage (${OSTEMPLATE})." >&2; fi
   else
     oci_registry_pull "$PULL_REFERENCE"
   fi
@@ -549,17 +556,17 @@ else
 fi
 
 if [[ -n "$LOCAL_TAR" && -f "$LOCAL_TAR" ]]; then
-  echo "Template on disk: ${LOCAL_TAR}"
-  ls -lh "$LOCAL_TAR" 2>/dev/null || stat "$LOCAL_TAR" 2>/dev/null || true
+  out_kv "Template file" "${LOCAL_TAR}"
+  tpl_one="$(ls -lh "$LOCAL_TAR" 2>/dev/null | head -1)"
+  [[ -n "$tpl_one" ]] && out_detail "${tpl_one}"
 elif wait_until_ostemplate_visible; then
-  echo "Template visible on storage: ${OSTEMPLATE}"
+  out_kv "Template" "${OSTEMPLATE} (listed on storage)"
 else
   die "Template not found as ${OSTEMPLATE} (no file at ${LOCAL_TAR:-<no host path>} and storage content listing did not show it)."
 fi
-echo
 
 if [[ "$PULL_ONLY" -eq 1 ]]; then
-  echo "Pull-only mode: done."
+  out_ok "Pull-only done"
   return 0
 fi
 [[ -n "$VMID" ]] || VMID="$(pve_oci_next_cluster_id)" || die "Could not get next cluster VMID (install jq or pass --vmid)"
@@ -570,15 +577,12 @@ fi
 
 [[ -n "$HOSTNAME" ]] || HOSTNAME="oci-ct-${VMID}"
 
-echo "--- pct create (from downloaded vztmpl template) ---"
-echo "VMID:       ${VMID}"
-echo "Ostemplate: ${OSTEMPLATE}"
-echo "Rootfs:     ${ROOTFS_SPEC}"
-echo "Hostname:   ${HOSTNAME}"
-if [[ "${#MP_SPECS[@]}" -gt 0 ]]; then
-  echo "Extra mp:   ${MP_SPECS[*]}"
-fi
-echo
+out_title "pct create · from vztmpl OCI tarball"
+out_kv "VMID" "${VMID}"
+out_kv "Ostemplate" "${OSTEMPLATE}"
+out_kv "Rootfs" "${ROOTFS_SPEC}"
+out_kv "Hostname" "${HOSTNAME}"
+[[ "${#MP_SPECS[@]}" -gt 0 ]] && out_kv "Mounts (mp*)" "${MP_SPECS[*]}"
 
 cmd=(pct create "$VMID" "$OSTEMPLATE" --rootfs "$ROOTFS_SPEC" --hostname "$HOSTNAME" --net0 "$NET0" --unprivileged "$UNPRIV" --onboot "$ONBOOT")
 
@@ -601,10 +605,9 @@ for mp_spec in "${MP_SPECS[@]}"; do
 done
 unset mp_st mp_sz mp_path mp_spec 2>/dev/null || true
 
-echo "Running:"
-printf ' '; printf '%q ' "${cmd[@]}"; echo; echo
+out_step "run" "" "pct create"
+out_cmd "$(printf '%q ' "${cmd[@]}")"
 "${cmd[@]}" || die "pct create failed"
 
-echo
-echo "pct create OK. Start with: pct start ${VMID}"
+out_ok "CT ${VMID} created · pct start ${VMID}"
 }

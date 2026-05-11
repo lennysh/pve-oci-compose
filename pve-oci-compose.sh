@@ -7,6 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.inc.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/common.inc.sh"
+# shellcheck source=lib/ui.inc.sh disable=SC1091
+source "${SCRIPT_DIR}/lib/ui.inc.sh"
 # shellcheck source=lib/oci-create.inc.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/oci-create.inc.sh"
 # shellcheck source=lib/oci-refresh.inc.sh disable=SC1091
@@ -50,6 +52,7 @@ Description marker (pct --description) after create / refresh:
 Requirements:
   - Run on a PVE node as root; jq; python3; PyYAML (python3-yaml package).
   - pvesh, pct, skopeo, rsync, perl (PVE::Storage) as required by the inlined workflows.
+  - Optional: env PVE_OCI_VERBOSE=1 — print extra hints and full pct/skopeo command lines during apply/pull/refresh.
 
 Compose schema (per service; shallow merge from top-level "defaults"):
   vmid               Fixed CT VMID, or next / auto / null / omitted = allocate at apply (refresh needs a number).

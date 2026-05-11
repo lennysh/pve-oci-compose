@@ -7,7 +7,8 @@ Declarative **Proxmox VE** LXC workflows driven by a **YAML** compose file: crea
 | Item | Purpose |
 |------|--------|
 | `pve-oci-compose.sh` | CLI: reads `compose.yaml`, runs **plan**, **apply**, **refresh**, or **pull** |
-| `lib/common.inc.sh` | Shared helpers (e.g. cluster **nextid** for `vmid: next`) |
+| `lib/common.inc.sh` | Shared helpers (e.g. cluster **nextid** for `vmid: next`, task JSON parsing) |
+| `lib/ui.inc.sh` | Shared terminal output (`out_title`, `out_kv`, `out_ok`, …) for create + refresh |
 | `lib/oci-create.inc.sh` | OCI vztmpl pull + `pct create` (same behaviour as the former standalone create script) |
 | `lib/oci-refresh.inc.sh` | Rootfs refresh workflow (same behaviour as the former standalone refresh script) |
 | `compose.example.yaml` | Copy to `compose.yaml` and edit |
@@ -16,10 +17,7 @@ Declarative **Proxmox VE** LXC workflows driven by a **YAML** compose file: crea
 ## Requirements
 
 - **Proxmox VE** node (run as **root**): `pct`, `pvesh`, OCI template storage with **`oci-registry-pull`**, `skopeo`, `rsync`, **`jq`**, **`perl`** with **`PVE::Storage`** (same as a normal PVE node used for OCI templates).
-- **`python3`** and **PyYAML** (`python3-yaml`) to parse the compose file.
-- **`python3`** and **PyYAML** for parsing YAML (not in the Python stdlib). On Debian-based nodes:
-
-  `apt install python3-yaml`
+- **`python3`** and **PyYAML** (`python3-yaml`) to parse the compose file (`apt install python3-yaml`).
 
 APT packages used by this stack are listed in **`bindep.txt`**. Install them in one shot (from the directory that contains `bindep.txt`):
 
@@ -34,6 +32,7 @@ On the node, use the repo layout as cloned (the `lib/` directory must sit next t
 ```text
 ./pve-oci-compose.sh
 ./lib/common.inc.sh
+./lib/ui.inc.sh
 ./lib/oci-create.inc.sh
 ./lib/oci-refresh.inc.sh
 ./compose.yaml
@@ -131,7 +130,8 @@ Use **pinned tags or digests** in compose when you care about exactly when a ref
 
 ## Operational notes
 
-- **OCI pull “Waiting for pull to finish…”** polls `pvesh get /nodes/<node>/tasks/<UPID>/status`. UPIDs contain colons—the tool **URL-encodes** the UPID for that path (Proxmox-style) and **retries** with the raw UPID if the first response is empty. If a pull still hangs after the task logged OK in the UI, verify **`jq`** and run with **`PVE_OCI_COMPOSE_TASK_DEBUG=1`** so each poll prints a short JSON preview on stderr.
+- **Log style:** **apply** / **pull** (create path) and **refresh** use the same helpers in **`lib/ui.inc.sh`**: phase **title** + horizontal rule, **key/value** lines, **steps**, and **✓** completion. Long explanations and full `pct` / `skopeo` command lines are **hidden by default**; set **`PVE_OCI_VERBOSE=1`** to show them (`out_detail` / `out_cmd`).
+- **OCI pull “Waiting for pull task …”** polls `pvesh get /nodes/<node>/tasks/<UPID>/status`. UPIDs contain colons—the tool **URL-encodes** the UPID for that path and **retries** with the raw UPID if the first response is empty. If a pull still hangs after the task logged OK in the UI, verify **`jq`** and run with **`PVE_OCI_COMPOSE_TASK_DEBUG=1`** so each poll prints a short JSON preview on stderr.
 - **Stateful data**: keep long-lived data on **`mp`** volumes or bind mounts, not only on rootfs—the refresh worker replaces the root tree (see the refresh script README for details).
 - **Snapshots / backups**: refresh uses the worker’s snapshot behaviour; production DR is still **vzdump** / PBS / your policy—not replaced by this tool.
 - **Clusters**: run on the node that owns the CT; remote placement is out of scope for this driver.
