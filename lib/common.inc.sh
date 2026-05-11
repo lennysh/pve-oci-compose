@@ -272,10 +272,14 @@ pve_oci_local_nodename() {
   hostname -s
 }
 
-# Add this node’s LXC to pool if missing (pool must already exist in Datacenter).
+pve_oci_pool_json_ok() {
+  [[ -n "${1:-}" ]] && printf '%s\n' "$1" | jq -e . >/dev/null 2>&1
+}
+
+# Create pool if missing, then add this node’s LXC (unless PVE_OCI_POOL_NO_AUTOCREATE=1).
 pve_oci_pool_ensure_lxc_member() {
   local pool="$1" vmid="$2"
-  local node raw data members_json comment
+  local node raw data members_json comment cr_out pool_created
   [[ -n "$pool" ]] || return 0
   command -v pvesh >/dev/null 2>&1 || {
     echo "pve-oci-compose: pvesh not found; cannot add CT ${vmid} to pool '${pool}'." >&2
@@ -288,10 +292,34 @@ pve_oci_pool_ensure_lxc_member() {
 
   node="$(pve_oci_local_nodename)"
   raw="$(pvesh get "/pools/${pool}" --output-format json 2>/dev/null)" || true
-  if [[ -z "$raw" ]] || ! printf '%s\n' "$raw" | jq -e . >/dev/null 2>&1; then
-    echo "pve-oci-compose: resource pool '${pool}' not found (Datacenter → Permissions → Pools). pvesh output was:" >&2
-    printf '%s\n' "$raw" >&2
-    return 1
+
+  if ! pve_oci_pool_json_ok "$raw"; then
+    if [[ "${PVE_OCI_POOL_NO_AUTOCREATE:-0}" == 1 ]]; then
+      echo "pve-oci-compose: pool '${pool}' not found; unset PVE_OCI_POOL_NO_AUTOCREATE to auto-create, or create the pool in the UI." >&2
+      printf '%s\n' "$raw" >&2
+      return 1
+    fi
+    pool_created=0
+    if cr_out="$(pvesh create /pools --poolid "$pool" --comment 'pve-oci-compose (auto-created)' 2>&1)"; then
+      pool_created=1
+    elif echo "$cr_out" | grep -qiE 'already exist|already exists|duplicate'; then
+      pool_created=0
+    elif cr_out="$(pvesh create /pools --poolid "$pool" 2>&1)"; then
+      pool_created=1
+    elif echo "$cr_out" | grep -qiE 'already exist|already exists|duplicate'; then
+      pool_created=0
+    else
+      echo "pve-oci-compose: could not create resource pool '${pool}' (need Pool.Allocate / root). pvesh said:" >&2
+      printf '%s\n' "$cr_out" >&2
+      return 1
+    fi
+    raw="$(pvesh get "/pools/${pool}" --output-format json 2>/dev/null)" || true
+    if ! pve_oci_pool_json_ok "$raw"; then
+      echo "pve-oci-compose: pool '${pool}' still not readable after create. pvesh get output:" >&2
+      printf '%s\n' "$raw" >&2
+      return 1
+    fi
+    [[ "$pool_created" -eq 1 ]] && echo "pve-oci-compose: created resource pool '${pool}' (Datacenter → Permissions → Pools)."
   fi
 
   data="$(printf '%s\n' "$raw" | jq -c 'if type == "object" and (.data | type) == "object" then .data else . end')"

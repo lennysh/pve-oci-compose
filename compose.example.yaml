@@ -4,7 +4,8 @@
 # Top-level "defaults" are shallow-merged into each service (service keys win).
 
 # Used as the default Datacenter → Permissions → **resource pool** id (pct --pool) unless you set
-# `defaults.pool` / per-service `pool` (use `pool: ""` to opt out). The pool must already exist in PVE.
+# `defaults.pool` / per-service `pool` (use `pool: ""` to opt out). Missing pools are auto-created
+# (set PVE_OCI_POOL_NO_AUTOCREATE=1 on the host to disable).
 name: example-stack
 
 defaults:

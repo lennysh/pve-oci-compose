@@ -54,8 +54,8 @@ Compose marker after create / refresh:
 
 Resource pools (UI grouping):
   If compose has **name:** or **project:** (same value surfaced as **Project:** in plan), that string
-  is used as the default **pct --pool** id and to add the CT via **pvesh** when the guest already exists.
-  Create the pool once under Datacenter → Permissions → Pools (id must match the stack name).
+  is the default **pct --pool** id. Missing pools are **auto-created** via **pvesh create /pools**
+  (comment *pve-oci-compose (auto-created)*). Set **PVE_OCI_POOL_NO_AUTOCREATE=1** to require pre-created pools only.
 
 Requirements:
   - Run on a PVE node as root; jq; python3; PyYAML (python3-yaml package).
@@ -70,7 +70,8 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   hostname, net0, node, memory, cores, ostype, unprivileged, features, onboot
   mounts             list of strings "STORAGE:GiB:/path" passed as --mp to create
   pool               optional; Datacenter resource pool id. Defaults to top-level name/project
-                     (stack). Use pool: "" or pool: null in defaults to disable. Pool must exist.
+                     (stack). Use pool: "" or pool: null in defaults to disable. Missing pools are
+                     auto-created unless PVE_OCI_POOL_NO_AUTOCREATE=1.
 EOF
   exit 1
 }
