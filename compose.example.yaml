@@ -2,6 +2,10 @@
 # Requires: python3 + PyYAML (on PVE: apt install python3-yaml)
 #
 # Top-level "defaults" are shallow-merged into each service (service keys win).
+#
+# Optional top-level **about:** (multiline string) is merged into the Proxmox **Notes** section of
+# the composed CT **description** for every service that opts into the rich description (see
+# **guest_ports** / per-service **about** below). Omit it if you prefer no stack-wide blurb.
 
 # Used as the default Datacenter → Permissions → **resource pool** id (pct --pool) unless you set
 # `defaults.pool` / per-service `pool` (use `pool: ""` to opt out). Missing pools are auto-created
@@ -79,7 +83,22 @@ services:
     # features: "nesting=1"
 
     # --- UI metadata (pct --description / --tags) ---
-    # description: "Edge nginx from pve-oci-compose"
+    # **description** alone → passed through as a plain pct description (no extra header).
+    #
+    # If you set **guest_ports** and/or **about** (here or top-level **about:**), **apply** builds a
+    # richer Markdown-style description: stack, service, image, your text, a **Listener ports**
+    # section (what listens *inside* the CT — not Docker `ports:` maps), and **Notes** from
+    # stack + service **about**. Use this to remember which ports to allow on a firewall or proxy.
+    #
+    # description: |
+    #   Demo nginx from OCI; static site only.
+    # guest_ports:
+    #   - port: 80
+    #     proto: tcp
+    #     description: HTTP (default server)
+    #   - "443/tcp — HTTPS (uncomment if you terminate TLS in the guest)"
+    # about: |
+    #   Docs: https://nginx.org/en/docs/
     # tags: "env=prod;team=netops"
     # apply still merges the short sentinel tag `pve-oci-compose` after create.
 

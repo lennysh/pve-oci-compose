@@ -241,6 +241,110 @@ print(json.dumps({"service": svc, "ref": ref}, separators=(",", ":"), ensure_asc
   printf '%s\n' "$blob" | pct exec "$vmid" -- sh -ec 'cat >"$1"' x "$mr" || return 1
 }
 
+# --- Proxmox CT description (Markdown from compose) -------------------------
+# stdin: one merged service object (JSON). argv1: stack label; argv2: optional stack-level about.
+# stdout: text for pct --description, or empty to omit the flag (nothing to document).
+pve_oci_compose_pct_description() {
+  local stack="${1:-}" sabout="${2:-}"
+  python3 -c '
+import json, sys
+
+stack = sys.argv[1]
+stack_about = sys.argv[2]
+svc = json.load(sys.stdin)
+
+def sstrip(x):
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x.strip()
+    return ""
+
+body_user = sstrip(svc.get("description"))
+sname = sstrip(svc.get("_service")) or "?"
+
+img = svc.get("image") or svc.get("reference")
+img = sstrip(img) if img is not None else ""
+
+about_chunks = []
+if sstrip(stack_about):
+    about_chunks.append(sstrip(stack_about))
+if sstrip(svc.get("about")):
+    about_chunks.append(sstrip(svc.get("about")))
+about_text = "\n\n".join(about_chunks)
+
+
+def format_guest_ports(gp):
+    out = []
+    if gp is None:
+        return out
+    if not isinstance(gp, list):
+        return out
+    for item in gp:
+        if isinstance(item, str):
+            t = item.strip()
+            if t:
+                out.append(f"- {t}")
+        elif isinstance(item, dict):
+            p = item.get("port")
+            if p is None:
+                p = item.get("port_number")
+            if p is None:
+                continue
+            pr = item.get("proto") or item.get("protocol") or "tcp"
+            pr = str(pr).strip().lower() or "tcp"
+            desc = sstrip(item.get("description") or item.get("desc"))
+            if desc:
+                out.append(f"- **{p}/{pr}** — {desc}")
+            else:
+                out.append(f"- **{p}/{pr}**")
+    return out
+
+
+port_lines = format_guest_ports(svc.get("guest_ports"))
+compose_triggers = bool(port_lines or about_text)
+
+if not body_user and not compose_triggers:
+    sys.exit(0)
+
+if not compose_triggers:
+    sys.stdout.write(body_user.rstrip() + "\n")
+    sys.exit(0)
+
+lines = [
+    "# pve-oci-compose",
+    "",
+    f"**Stack:** {stack}" if stack else "**Stack:** _(compose file)_",
+    f"**Service:** {sname}",
+]
+if img:
+    lines.append(f"**Image:** `{img}`")
+
+if body_user:
+    lines.append("")
+    lines.extend(body_user.splitlines())
+
+if port_lines:
+    lines.append("")
+    lines.extend(
+        [
+            "## Listener ports (inside the CT)",
+            "",
+            "These are sockets that listen **in the guest** (not Docker Compose `ports:` publish maps). "
+            "Reach them via the CT IP, host firewall, or a reverse proxy.",
+            "",
+        ]
+    )
+    lines.extend(port_lines)
+
+if about_text:
+    lines.append("")
+    lines.extend(["## Notes", "", about_text])
+
+sys.stdout.write("\n".join(lines).rstrip() + "\n")
+' "$stack" "$sabout"
+}
+
 # --- Datacenter resource pool (UI grouping) --------------------------------
 # Compose `name` / `project` → default pool id unless service sets `pool` (empty/null opts out).
 

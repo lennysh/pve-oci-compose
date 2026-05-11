@@ -82,6 +82,7 @@ Dry-run (print the underlying commands, do not execute):
 The file is YAML with a single top-level mapping.
 
 - **`name`** or **`project`** (optional): informational label for humans; surfaced in **plan** output.
+- **`about`** (optional): multiline string appended under **Notes** in the **composed** Proxmox CT description (see below) for services that use **`guest_ports`** or **`about`**; combined with each service’s own **`about`** (stack text first).
 - **`defaults`** (optional): mapping shallow-merged into **each** service; any key on a service overrides `defaults`.
 - **`services`** (required): mapping of **service name** → **service spec** (use stable names; stored inside the CT marker JSON plus the **`pve-oci-compose`** tag).
 
@@ -101,6 +102,8 @@ The file is YAML with a single top-level mapping.
 | `entrypoint` | optional | **`pct --entrypoint`** (OCI / init command). |
 | `env` | optional | **`pct --env`**, repeatable: YAML **mapping** (`KEY: value`) or **list** of `KEY=value` strings (or one string). |
 | `description`, `tags` | optional | **`pct --description`** and **`pct --tags`** (UI tags string). **apply** still merges the **`pve-oci-compose`** sentinel tag afterward. |
+| `guest_ports` | optional | YAML **list** documenting listener ports **inside the CT** (not Docker Compose publish maps). Each entry is either a **string** (free-form line, e.g. ``5678/tcp — n8n UI``) or a **mapping** with **`port`** (or **`port_number`**), optional **`proto`** / **`protocol`** (default **`tcp`**), and optional **`description`** / **`desc`**. If **`guest_ports`** and/or **`about`** (service or top-level) is set, **`description`** is embedded in a **composed** Markdown-style block (stack, service, image, ports section, notes). If you only set **`description`** and omit **`guest_ports`** / **`about`**, the text is passed **verbatim** (same as before). |
+| `about` | optional | Per-service multiline string merged into the **Notes** section when the rich composed description is used (after top-level **`about`**). |
 | `timezone`, `password`, `ssh_public_keys` | optional | **`pct --timezone`**, **`--password`**, **`--ssh-public-keys`** (path to a **host** file; must exist when **apply** validates the service). |
 | `start`, `startup`, `hookscript` | optional | **`pct --start`**, **`--startup`**, **`--hookscript`** (e.g. `local:snippets/hook.sh`). Booleans/ints follow the same rules as **`onboot`**. |
 | `protection`, `ha_managed`, `ignore_unpack_errors`, `pct_debug` | optional | **`pct --protection`**, **`--ha-managed`**, **`--ignore-unpack-errors`**, **`--debug`** (`pct_debug` in YAML to avoid a generic `debug` key). |
@@ -109,6 +112,8 @@ The file is YAML with a single top-level mapping.
 | `unused_disks` | optional | List of volume specs → **`--unused0`**, … (advanced; see Proxmox docs). |
 | `unprivileged`, `onboot` | optional | YAML booleans or integers; mapped to `pct` flags on create. |
 | `mounts` | optional | List of strings `STORAGE:GiB:/absolute/path` → `--mp` on create (extra CT volumes). |
+
+The Proxmox UI may show **`description`** as plain text; Markdown-style headings and bullets still read clearly when copy-pasted. Very long text can hit UI limits—keep secrets out of compose and out of the CT description.
 
 See **`compose.example.yaml`**: a minimal working service plus **long commented examples** for every optional **`pct create`** field (DNS, **`net1`**, **`env`**, **`startup`** vs **`onboot`**, devices, etc.).
 

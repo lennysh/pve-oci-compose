@@ -71,7 +71,8 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   template_storage   vztmpl storage id for oci-registry-pull (optional; see create script)
   hostname, net0 … net7   pct --netN (any net keys net0, net1, …); default net0 if none set
   node, memory, swap, cores, cpulimit, cpuunits, ostype, arch, unprivileged, features, onboot
-  nameserver, searchdomain, entrypoint, env (map or list of KEY=val), description, tags (pct UI tags)
+  nameserver, searchdomain, entrypoint, env (map or list of KEY=val), description, guest_ports, about
+  tags (pct UI tags). Top-level about (string) is optional stack notes merged into the built description.
   timezone, password, ssh_public_keys (host file path), start, startup, hookscript, protection
   ha_managed, cmode, console, tty, ignore_unpack_errors, pct_debug, bwlimit
   lxc_dev            list of pct --dev0 … device specs (order = list order)
@@ -139,8 +140,14 @@ if not isinstance(services, dict):
     sys.stderr.write("pve-oci-compose: 'services' must be a mapping\n")
     sys.exit(1)
 
+stack_about = doc.get("about")
+if stack_about is not None and not isinstance(stack_about, str):
+    sys.stderr.write("pve-oci-compose: top-level 'about' must be a string (multiline text) if set\n")
+    sys.exit(1)
+
 out = {
     "project": doc.get("name") or doc.get("project"),
+    "stack_about": stack_about,
     "services": {},
 }
 for sname, svc in services.items():
@@ -186,6 +193,12 @@ validate_service() {
   [[ -n "$rootfs" ]] || die "service $svc: missing rootfs"
   sk="$(jq -r '.ssh_public_keys // empty | if type == "string" then . else empty end' <<<"$json")"
   [[ -z "$sk" ]] || [[ -f "$sk" ]] || die "service $svc: ssh_public_keys must be a readable host file (got: $sk)"
+  case "$(jq -r '.guest_ports | if . == null then "ok" elif type == "array" then "ok" else "bad" end' <<<"$json")" in
+    bad) die "service $svc: guest_ports must be a YAML list" ;;
+  esac
+  case "$(jq -r '.about | if . == null then "ok" elif type == "string" then "ok" else "bad" end' <<<"$json")" in
+    bad) die "service $svc: about must be a string if set" ;;
+  esac
 }
 
 validate_service_refresh() {
@@ -317,9 +330,10 @@ run_or_print() {
 }
 
 cmd_plan() {
-  local json sname svc spec vmid image rootfs tags stored exists hint mr stack effpool
+  local json sname svc spec vmid image rootfs tags stored exists hint mr stack effpool sa desc_preview
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
+  sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
   echo "Compose file: $COMPOSE_FILE"
   jq -r '.project // empty' <<<"$json" | sed '/^$/d' | sed 's/^/Project: /' || true
   echo
@@ -338,6 +352,11 @@ cmd_plan() {
       echo "  rootfs:        $rootfs"
       echo "  plan apply:    would allocate next free vmid and create from $image"
       echo "  plan refresh:  n/a until vmid is fixed in the file (run apply to write it)"
+      desc_preview="$(printf '%s' "$svc" | pve_oci_compose_pct_description "$stack" "$sa" 2>/dev/null || true)"
+      if [[ -n "$desc_preview" ]]; then
+        echo "  pct description (preview):"
+        printf '%s\n' "$desc_preview" | sed 's/^/    /'
+      fi
       echo
       continue
     fi
@@ -380,6 +399,11 @@ cmd_plan() {
     echo "  marker (path): ${mr}"
     echo "  pool (target): ${effpool:-<none>}"
     echo "  tags:          ${tags:-<none>}"
+    desc_preview="$(printf '%s' "$svc" | pve_oci_compose_pct_description "$stack" "$sa" 2>/dev/null || true)"
+    if [[ -n "$desc_preview" ]]; then
+      echo "  pct description (preview):"
+      printf '%s\n' "$desc_preview" | sed 's/^/    /'
+    fi
     if [[ "$exists" == yes ]]; then
       if [[ -z "$stored" ]]; then
         echo "  plan apply:    no-op (already exists)"
@@ -405,7 +429,8 @@ fill_create_args() {
   local svcjson="$1"
   local resolved_vmid="$2"
   local stack_default="${3:-}"
-  local ts ref vmid hostname node mem cores ostype arch feats v pool nk nv j
+  local stack_about="${4:-}"
+  local ts ref vmid hostname node mem cores ostype arch feats v pool nk nv j desc_built
 
   OCI_CREATE_ARGS=()
   ts="$(jq -r '.template_storage // .storage // empty' <<<"$svcjson")"
@@ -482,8 +507,8 @@ fill_create_args() {
   [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--cpulimit "$v")
   v="$(jq -r '.cpuunits // empty | if type == "number" then tostring elif type == "string" then . else empty end' <<<"$svcjson")"
   [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--cpuunits "$v")
-  v="$(jq -r '.description // empty | if type == "string" then . else empty end' <<<"$svcjson")"
-  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--description "$v")
+  desc_built="$(printf '%s' "$svcjson" | pve_oci_compose_pct_description "${stack_default:-}" "${stack_about:-}")"
+  [[ -n "$desc_built" ]] && OCI_CREATE_ARGS+=(--description "$desc_built")
   v="$(jq -r '.tags // empty | if type == "string" then . else empty end' <<<"$svcjson")"
   [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--tags "$v")
   v="$(jq -r '.timezone // empty | if type == "string" then . else empty end' <<<"$svcjson")"
@@ -556,9 +581,10 @@ fill_create_args() {
 OCI_CREATE_ARGS=()
 
 cmd_apply() {
-  local json sname svc spec resolved image merged stack effpool
+  local json sname svc spec resolved image merged stack effpool sa
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
+  sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
   while IFS= read -r sname; do
     unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
@@ -592,7 +618,7 @@ cmd_apply() {
     elif [[ -n "$effpool" && "$DRY_RUN" -eq 1 ]]; then
       echo "apply: [$sname] DRY-RUN: would ensure pool '$effpool' exists before pct create --pool"
     fi
-    fill_create_args "$svc" "$resolved" "$stack"
+    fill_create_args "$svc" "$resolved" "$stack" "$sa"
     run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
