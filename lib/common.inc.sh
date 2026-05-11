@@ -279,7 +279,7 @@ pve_oci_pool_json_ok() {
 # Create pool if missing, then add this node’s LXC (unless PVE_OCI_POOL_NO_AUTOCREATE=1).
 pve_oci_pool_ensure_lxc_member() {
   local pool="$1" vmid="$2"
-  local node raw data members_json comment cr_out pool_created
+  local raw data cr_out pool_created
   [[ -n "$pool" ]] || return 0
   command -v pvesh >/dev/null 2>&1 || {
     echo "pve-oci-compose: pvesh not found; cannot add CT ${vmid} to pool '${pool}'." >&2
@@ -290,7 +290,6 @@ pve_oci_pool_ensure_lxc_member() {
     return 1
   }
 
-  node="$(pve_oci_local_nodename)"
   raw="$(pvesh get "/pools/${pool}" --output-format json 2>/dev/null)" || true
 
   if ! pve_oci_pool_json_ok "$raw"; then
@@ -329,21 +328,9 @@ pve_oci_pool_ensure_lxc_member() {
     return 0
   fi
 
-  members_json="$(printf '%s\n' "$data" | jq -c --arg v "$vmid" --arg n "$node" '
-    (.members // []) + [{"type": "lxc", "vmid": ($v | tonumber), "node": $n}]
-  ')"
-  comment="$(printf '%s\n' "$data" | jq -r '.comment // empty')"
-  if [[ -n "$comment" ]]; then
-    pvesh set "/pools/${pool}" --members "$members_json" --comment "$comment" \
-      || {
-        echo "pve-oci-compose: pvesh set /pools/${pool} failed (--members + --comment)." >&2
-        return 1
-      }
-  else
-    pvesh set "/pools/${pool}" --members "$members_json" \
-      || {
-        echo "pve-oci-compose: pvesh set /pools/${pool} failed (--members)." >&2
-        return 1
-      }
+  # PUT /pools/<id> takes vms (pve-vmid-list), not members (members is GET-only).
+  if ! pvesh set "/pools/${pool}" --vms "$vmid" --allow-move 1; then
+    echo "pve-oci-compose: pvesh set /pools/${pool} failed (--vms, --allow-move)." >&2
+    return 1
   fi
 }
