@@ -321,7 +321,11 @@ pve_oci_pool_ensure_exists() {
     printf '%s\n' "$raw" >&2
     return 1
   fi
-  [[ "$pool_created" -eq 1 ]] && echo "pve-oci-compose: created resource pool '${pool}' (Datacenter → Permissions → Pools)."
+  if [[ "$pool_created" -eq 1 ]]; then
+    echo "pve-oci-compose: created resource pool '${pool}' (Datacenter → Permissions → Pools)."
+    # Consumed by oci_create_pct_failure_cleanup if pct create fails in the same apply iteration.
+    PVE_OCI_POOL_JUST_AUTOCREATED="$pool"
+  fi
   return 0
 }
 

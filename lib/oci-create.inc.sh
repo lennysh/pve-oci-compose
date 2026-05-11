@@ -45,6 +45,34 @@ EOF
   exit 1
 }
 
+# After a failed pct create: drop partial CT, remove empty pool only if this run auto-created it
+# (see PVE_OCI_POOL_JUST_AUTOCREATED in lib/common.inc.sh), and hint on unsupported OCI media types.
+oci_create_pct_failure_cleanup() {
+  local vmid="${1:?}" pool="${2:-}" errfile="${3:-}"
+  local blob
+  [[ -f "$errfile" ]] && blob="$(cat "$errfile" 2>/dev/null)" || blob=""
+
+  if pct config "$vmid" &>/dev/null; then
+    echo "pve-oci-compose: removing partial CT ${vmid} after failed pct create …" >&2
+    pct destroy "$vmid" --purge 2>/dev/null || pct destroy "$vmid" 2>/dev/null || true
+  fi
+
+  if [[ -n "${PVE_OCI_POOL_JUST_AUTOCREATED:-}" && -n "$pool" \
+    && "${PVE_OCI_POOL_JUST_AUTOCREATED}" == "$pool" ]]; then
+    if pvesh delete /pools --poolid "$pool" 2>/dev/null || pvesh delete "/pools/${pool}" 2>/dev/null; then
+      echo "pve-oci-compose: removed auto-created empty resource pool '${pool}' (pct create failed)." >&2
+    else
+      echo "pve-oci-compose: auto-created pool '${pool}' was left in place (not empty or delete denied)." >&2
+    fi
+  fi
+  unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
+
+  if [[ "$blob" == *'Wrong media type'* || "$blob" == *'Error while parsing OCI image'* ]]; then
+    echo "pve-oci-compose: Proxmox rejected this OCI archive (unsupported manifest/layer media types for LXC vztmpl)." >&2
+    echo "pve-oci-compose: Use an image format Proxmox supports as an OCI template, or a classic vztmpl tarball — not every container registry image is compatible." >&2
+  fi
+}
+
 oci_create_main() {
 
 node_name() {
@@ -641,13 +669,24 @@ for mp_spec in "${MP_SPECS[@]}"; do
 done
 unset mp_st mp_sz mp_path mp_spec 2>/dev/null || true
 
+local _pct_log _pct_ec
+_pct_log="$(mktemp "${TMPDIR:-/tmp}/pve-oci-pct.XXXXXX")" || die "mktemp failed for pct log"
+_pct_ec=0
 if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
   out_cmd "$(printf '%q ' "${cmd[@]}")"
+  "${cmd[@]}" >"$_pct_log" 2>&1 || _pct_ec=$?
 else
   out_step "run" "" "pct create"
   out_cmd "$(printf '%q ' "${cmd[@]}")"
+  "${cmd[@]}" >"$_pct_log" 2>&1 || _pct_ec=$?
 fi
-"${cmd[@]}" || die "pct create failed"
+if [[ "$_pct_ec" -ne 0 ]]; then
+  cat "$_pct_log" >&2
+  oci_create_pct_failure_cleanup "$VMID" "$POOL" "$_pct_log"
+  rm -f "$_pct_log"
+  die "pct create failed"
+fi
+rm -f "$_pct_log"
 
 if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
   out_muted "Scratch CT ${VMID} ready (stopped) — used only as rsync source; will be destroyed."

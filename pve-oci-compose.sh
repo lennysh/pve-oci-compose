@@ -357,6 +357,7 @@ cmd_apply() {
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   while IFS= read -r sname; do
+    unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service "$svc" "$sname"
     spec="$(vmid_spec_from_json "$svc")"
@@ -423,6 +424,7 @@ cmd_refresh() {
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   while IFS= read -r sname; do
+    unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service_refresh "$svc" "$sname"
     vmid="$(vmid_spec_from_json "$svc")"
