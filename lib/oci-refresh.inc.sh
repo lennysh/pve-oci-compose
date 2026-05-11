@@ -18,6 +18,10 @@ oci_refresh_usage() {
   echo "Example:"
   echo "  ./pve-oci-compose.sh refresh"
   echo "  oci_refresh_main 100 oci://docker.io/library/nginx:latest"
+  echo ""
+  echo "OCI temp CTs use the same vztmpl path as apply (oci-registry-pull). For multiple template"
+  echo "storages on a node, set OCI_REFRESH_TEMPLATE_STORAGE to the vztmpl storage id (compose refresh"
+  echo "also exports this from template_storage / storage)."
   exit 1
 }
 
@@ -107,82 +111,43 @@ rootfs_alloc_for_pct_create() {
   fi
 }
 
-# Proxmox treats <ostemplate> like "STORAGE:volume" and splits on the first ':' (pct, pvesh, API).
-# So `oci://registry/...` becomes storage id `oci` → "storage 'oci' does not exist".
-# Workaround: skopeo copy docker://REF oci-archive:FILE.tar then pct create VMID /path/file.tar
+# Registry refs (oci://…) use the same path as **apply**: oci-registry-pull into vztmpl,
+# then pct create VMID STORAGE:vztmpl/<norm>.tar (see lib/oci-create.inc.sh).
+# Optional: OCI_REFRESH_TEMPLATE_STORAGE (set by compose from template_storage / storage).
 create_temp_ct() {
-  local -a cmd skopeo_args
+  local -a cmd oci_args
   local net0="${OCI_REFRESH_TEMP_NET0:-name=eth0,bridge=vmbr0,ip=dhcp}"
-  local archive ref tmpdir
+  local ref_bare
 
   if [[ "$NEW_OCI" == oci://* ]]; then
-    ref="${NEW_OCI#oci://}"
-    tmpdir="${OCI_REFRESH_TMPDIR:-/var/tmp}"
-
-    out_title "Temp CT ${TEMP} — OCI (skopeo → tar → pct create)"
-    out_detail "Colon in oci:// breaks direct pct ostemplate — this path pulls to a local .tar then pct create PATH."
+    ref_bare="${NEW_OCI#oci://}"
+    out_title "Temp CT ${TEMP} — OCI (oci-registry-pull + vztmpl, same as apply)"
     out_kv "Image" "${NEW_OCI}"
-    out_kv "Temp dir" "${tmpdir}"
-    out_detail "~2× image size needed under temp dir — set OCI_REFRESH_TMPDIR to move it."
+    out_kv "Reference" "${ref_bare}"
+    [[ -n "${OCI_REFRESH_TEMPLATE_STORAGE:-}" ]] && out_kv "Template storage" "${OCI_REFRESH_TEMPLATE_STORAGE}"
     out_kv "Temp rootfs" "${ROOTFS_NEWVOL}  ← from size=${SIZE} on CT ${OLD}"
     out_kv "Hostname" "${HOST:-oci-refresh-temp}"
     [[ -n "$MEMORY" ]] && out_kv "Memory (MB)" "${MEMORY}"
     out_kv "net0" "${net0}"
-    out_detail "Verbose skopeo: OCI_REFRESH_SKOPEO_VERBOSE=1"
 
-    if ! command -v skopeo >/dev/null 2>&1; then
-      echo "skopeo is required for oci:// temp CTs on current Proxmox (colon parsing bug)." >&2
-      echo "Install on the PVE node, e.g.: apt install skopeo" >&2
-      exit 1
-    fi
-    if [[ ! -d "$tmpdir" || ! -w "$tmpdir" ]]; then
-      echo "Temp dir not writable: ${tmpdir}" >&2
-      exit 1
-    fi
-
-    archive="${tmpdir}/oci-refresh-${TEMP}-$$-${RANDOM}.tar"
-    skopeo_args=()
-    [[ "${OCI_REFRESH_SKOPEO_VERBOSE:-0}" != 1 ]] && skopeo_args+=(--quiet)
-
-    out_step "1 / 2" "" "skopeo copy → oci-archive"
-    out_cmd "skopeo copy${skopeo_args[*]:+ ${skopeo_args[*]}} docker://${ref} oci-archive:${archive}"
-    if ! skopeo copy "${skopeo_args[@]}" "docker://${ref}" "oci-archive:${archive}"; then
-      echo "=== skopeo copy failed ===" >&2
-      echo "Hints: outbound HTTPS; auth for ghcr.io → skopeo login ghcr.io (or /root/.config/containers/auth.json)" >&2
-      rm -f "$archive"
-      exit 1
-    fi
-    _arc_ls="$(ls -lh "$archive" 2>/dev/null | head -1)"
-    [[ -n "${_arc_ls// }" ]] && out_detail "${_arc_ls}"
-
-    cleanup_oci_tar() { rm -f "$archive"; }
-    trap 'cleanup_oci_tar' EXIT
-
-    out_step "2 / 2" "" "pct create (local OCI archive)"
-    cmd=(
-      pct create "$TEMP" "$archive"
+    oci_args=(
+      --vmid "$TEMP"
+      --reference "$ref_bare"
+      --rootfs "$ROOTFS_NEWVOL"
       --hostname "${HOST:-oci-refresh-temp}"
-      --rootfs "${ROOTFS_NEWVOL}"
-      --onboot 0
       --net0 "$net0"
+      --unprivileged "${UNPRIV:-1}"
+      --onboot 0
     )
-    [[ -n "$OSTYPE" ]] && cmd+=( --ostype "$OSTYPE" )
-    [[ -n "$UNPRIV" ]] && cmd+=( --unprivileged "$UNPRIV" )
-    [[ -n "$ARCH" ]] && cmd+=( --arch "$ARCH" )
-    [[ -n "$FEATURES" ]] && cmd+=( --features "$FEATURES" )
-    [[ -n "$MEMORY" ]] && cmd+=( --memory "$MEMORY" )
+    [[ -n "${OCI_REFRESH_TEMPLATE_STORAGE:-}" ]] && oci_args+=(--storage "$OCI_REFRESH_TEMPLATE_STORAGE")
+    [[ -n "${MEMORY:-}" ]] && oci_args+=(--memory "$MEMORY")
+    [[ -n "${OSTYPE:-}" ]] && oci_args+=(--ostype "$OSTYPE")
+    [[ -n "${ARCH:-}" ]] && oci_args+=(--arch "$ARCH")
+    [[ -n "${FEATURES:-}" ]] && oci_args+=(--features "$FEATURES")
 
-    out_cmd "$(printf '%q ' "${cmd[@]}")"
-
-    if ! "${cmd[@]}"; then
-      echo "=== pct create from OCI archive failed ===" >&2
-      echo "Check: storage '${STORAGE}' rootdir-capable, VMID ${TEMP} free, archive still at ${archive}" >&2
-      exit 1
-    fi
-
-    out_ok "pct create finished — temp CT ${TEMP} (typically stopped). Removing tarball…"
-    rm -f "$archive"
-    trap - EXIT
+    out_cmd "$(printf '%q ' oci_create_main "${oci_args[@]}")"
+    oci_create_main "${oci_args[@]}"
+    out_ok "Temp CT ${TEMP} ready (stopped) — same template path as create/apply"
   else
     out_title "Temp CT ${TEMP} (local template / vztmpl)"
     cmd=(
@@ -218,7 +183,7 @@ fi
 # Actually format is: STORAGE:VOLREF,size=8G  e.g. local-zfs:vm-100-disk-0,size=32G
 # Storage id is everything before the first ':' that starts the volume part - tricky.
 # Proxmox storage is first segment before ':' only for simple case local-zfs:subvol
-STORAGE="${ROOTFS_LINE%%:*}"
+CT_DISK_STORAGE="${ROOTFS_LINE%%:*}"
 VOL_AND_REST="${ROOTFS_LINE#*:}"
 SIZE="${VOL_AND_REST##*,size=}"
 SIZE="${SIZE%%,*}"
@@ -228,14 +193,14 @@ if [[ -z "$SIZE" || "$SIZE" == "$VOL_AND_REST" ]]; then
   exit 1
 fi
 
-if [[ "$STORAGE" == "oci" ]]; then
+if [[ "$CT_DISK_STORAGE" == "oci" ]]; then
   echo "Parsed storage id is 'oci' from rootfs line — that is almost certainly wrong." >&2
   echo "  rootfs line was: ${ROOTFS_LINE}" >&2
   echo "  Expected form:   <STORAGE_ID>:<volume>,size=<N>G  (e.g. local-zfs:vm-100-disk-0,size=8G)" >&2
   exit 1
 fi
 
-ROOTFS_NEWVOL="$(rootfs_alloc_for_pct_create "$STORAGE" "$SIZE")"
+ROOTFS_NEWVOL="$(rootfs_alloc_for_pct_create "$CT_DISK_STORAGE" "$SIZE")"
 
 HOST="$(cfg "$OLD" hostname)"
 OSTYPE="$(cfg "$OLD" ostype)"

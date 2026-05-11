@@ -309,7 +309,7 @@ cmd_plan() {
 fill_create_args() {
   local svcjson="$1"
   local resolved_vmid="$2"
-  local ts ref vmid hostname net0 node mem cores ostype feats v
+  local ts ref vmid hostname net0 node mem cores ostype arch feats v
 
   OCI_CREATE_ARGS=()
   ts="$(jq -r '.template_storage // .storage // empty' <<<"$svcjson")"
@@ -321,6 +321,7 @@ fill_create_args() {
   mem="$(jq -r '.memory // empty' <<<"$svcjson")"
   cores="$(jq -r '.cores // empty' <<<"$svcjson")"
   ostype="$(jq -r '.ostype // empty' <<<"$svcjson")"
+  arch="$(jq -r '.arch // empty' <<<"$svcjson")"
   feats="$(jq -r '.features // empty' <<<"$svcjson")"
 
   [[ -n "$ref" ]] || die "internal: empty image"
@@ -332,6 +333,7 @@ fill_create_args() {
   [[ -n "$mem" ]] && OCI_CREATE_ARGS+=(--memory "$mem")
   [[ -n "$cores" ]] && OCI_CREATE_ARGS+=(--cores "$cores")
   [[ -n "$ostype" ]] && OCI_CREATE_ARGS+=(--ostype "$ostype")
+  [[ -n "$arch" ]] && OCI_CREATE_ARGS+=(--arch "$arch")
   [[ -n "$feats" ]] && OCI_CREATE_ARGS+=(--features "$feats")
 
   if jq -e '.onboot != null' <<<"$svcjson" >/dev/null 2>&1; then
@@ -387,13 +389,16 @@ cmd_apply() {
 }
 
 cmd_refresh() {
-  local json sname svc vmid image desc stored want
+  local json sname svc vmid image desc stored want ts
   json="$(compose_json)"
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
     validate_service_refresh "$svc" "$sname"
     vmid="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
+    unset OCI_REFRESH_TEMPLATE_STORAGE || true
+    ts="$(jq -r '.template_storage // .storage // empty' <<<"$svc")"
+    [[ -n "$ts" ]] && export OCI_REFRESH_TEMPLATE_STORAGE="$ts"
 
     pct config "$vmid" &>/dev/null || die "refresh: [$sname] vmid $vmid does not exist"
 

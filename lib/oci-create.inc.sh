@@ -21,20 +21,21 @@ Common options:
   --memory MB           pct --memory
   --cores N             pct --cores
   --ostype TYPE         pct --ostype
-  --unprivileged 0|1   pct --unprivileged (default: 1)
+  --unprivileged 0|1    pct --unprivileged (default: 1)
   --features SPEC       pct --features
   --onboot 0|1          pct --onboot (default: 0)
+  --arch ARCH           pct --arch (optional; e.g. amd64)
   --mp SPEC             Repeatable: STORAGE:GiB:/path
 
 Pull behaviour:
-  --skip-pull           Do not call oci-registry-pull
-  --reuse-local-template Reuse existing normalized .tar if present
+  --skip-pull               Do not call oci-registry-pull
+  --reuse-local-template    Reuse existing normalized .tar if present
   --list-template-storages  List vztmpl storages; exits 0.
-  --pull-only           Download template only (no pct create)
+  --pull-only               Download template only (no pct create)
 
 Floating :latest: resolved via skopeo unless OCI_CT_CREATE_NO_RESOLVE_LATEST=1
 
-After create: pct start <vmid>
+After create: CT is left stopped unless you run pct start manually.
 EOF
   exit 1
 }
@@ -107,6 +108,7 @@ NODE=""
 MEMORY=""
 CORES=""
 OSTYPE=""
+ARCH=""
 UNPRIV="1"
 FEATURES=""
 ONBOOT="0"
@@ -119,8 +121,8 @@ MP_SPECS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --storage)            STORAGE="${2:?}"; shift 2 ;;
-    --reference)         REFERENCE="${2:?}"; shift 2 ;;
+    --storage)          STORAGE="${2:?}"; shift 2 ;;
+    --reference)        REFERENCE="${2:?}"; shift 2 ;;
     --rootfs)           ROOTFS_SPEC="${2:?}"; shift 2 ;;
     --vmid)             VMID="${2:?}"; shift 2 ;;
     --hostname)         HOSTNAME="${2:?}"; shift 2 ;;
@@ -129,6 +131,7 @@ while [[ $# -gt 0 ]]; do
     --memory)           MEMORY="${2:?}"; shift 2 ;;
     --cores)            CORES="${2:?}"; shift 2 ;;
     --ostype)           OSTYPE="${2:?}"; shift 2 ;;
+    --arch)             ARCH="${2:?}"; shift 2 ;;
     --unprivileged)     UNPRIV="${2:?}"; shift 2 ;;
     --features)         FEATURES="${2:?}"; shift 2 ;;
     --onboot)           ONBOOT="${2:?}"; shift 2 ;;
@@ -589,6 +592,7 @@ cmd=(pct create "$VMID" "$OSTEMPLATE" --rootfs "$ROOTFS_SPEC" --hostname "$HOSTN
 [[ -n "$MEMORY" ]] && cmd+=(--memory "$MEMORY")
 [[ -n "$CORES" ]] && cmd+=(--cores "$CORES")
 [[ -n "$OSTYPE" ]] && cmd+=(--ostype "$OSTYPE")
+[[ -n "$ARCH" ]] && cmd+=(--arch "$ARCH")
 [[ -n "$FEATURES" ]] && cmd+=(--features "$FEATURES")
 
 mp_idx=0
@@ -609,5 +613,5 @@ out_step "run" "" "pct create"
 out_cmd "$(printf '%q ' "${cmd[@]}")"
 "${cmd[@]}" || die "pct create failed"
 
-out_ok "CT ${VMID} created · pct start ${VMID}"
+out_ok "CT ${VMID} created (stopped) — pct start ${VMID} when ready"
 }
