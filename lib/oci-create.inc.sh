@@ -16,12 +16,15 @@ Required (omit when using --list-template-storages):
 Common options:
   --vmid ID             CT VMID (default: cluster next free)
   --hostname NAME       pct --hostname (default: oci-ct-<vmid>)
-  --net0 SPEC           pct --net0 (default: name=eth0,bridge=vmbr0,ip=dhcp or OCI_CT_CREATE_NET0)
+  --netN SPEC           pct --netN for N=0.. (default net0: OCI_CT_CREATE_NET0 or name=eth0,bridge=vmbr0,ip=dhcp)
   --nameserver ADDR     pct --nameserver (repeatable; omit with searchdomain to inherit host resolvers)
   --searchdomain LIST   pct --searchdomain (space-separated domains if multiple)
   --node NAME           PVE node name (default: pvecm nodename / hostname -s)
   --memory MB           pct --memory
+  --swap MB             pct --swap
   --cores N             pct --cores
+  --cpulimit N          pct --cpulimit (0 = unlimited)
+  --cpuunits N          pct --cpuunits
   --ostype TYPE         pct --ostype
   --unprivileged 0|1    pct --unprivileged (default: 1)
   --features SPEC       pct --features
@@ -29,6 +32,26 @@ Common options:
   --arch ARCH           pct --arch (optional; e.g. amd64)
   --pool ID             pct --pool (Datacenter resource pool; must exist)
   --mp SPEC             Repeatable: STORAGE:GiB:/path
+  --entrypoint CMD      pct --entrypoint (OCI / init override)
+  --env KEY=val         pct --env (repeatable; same form as pct(1))
+  --description TEXT    pct --description
+  --tags TAGS           pct --tags (semicolon-separated; apply still merges pve-oci-compose sentinel after create)
+  --timezone SPEC       pct --timezone (e.g. host or Europe/Berlin)
+  --password PASS       pct --password (avoid secrets in shell history; prefer pct set later)
+  --ssh-public-keys PATH  pct --ssh-public-keys (host path to authorized_keys file)
+  --start 0|1           pct --start (start CT when create finishes)
+  --startup SPEC        pct --startup (order=,up=,down=)
+  --hookscript PATH     pct --hookscript (e.g. local:snippets/hook.sh)
+  --protection 0|1      pct --protection
+  --ha-managed 0|1      pct --ha-managed
+  --cmode MODE          pct --cmode (tty|console|shell)
+  --console 0|1         pct --console
+  --tty N               pct --tty
+  --ignore-unpack-errors 0|1  pct --ignore-unpack-errors
+  --debug 0|1           pct --debug
+  --bwlimit N           pct --bwlimit (KiB/s)
+  --devN SPEC           pct --devN (host device pass-through; see pct(1))
+  --unusedN SPEC        pct --unusedN (advanced; see pct(1))
 
 Pull behaviour:
   --skip-pull               Do not call oci-registry-pull
@@ -138,10 +161,12 @@ REFERENCE=""
 ROOTFS_SPEC=""
 VMID=""
 HOSTNAME=""
-NET0="${OCI_CT_CREATE_NET0:-name=eth0,bridge=vmbr0,ip=dhcp}"
 NODE=""
 MEMORY=""
+SWAP=""
 CORES=""
+CPULIMIT=""
+CPUUNITS=""
 OSTYPE=""
 ARCH=""
 UNPRIV="1"
@@ -150,12 +175,34 @@ ONBOOT="0"
 POOL=""
 NAMESERVERS=()
 SEARCHDOMAIN=""
+ENTRYPOINT=""
+ENVS=()
+DESCRIPTION=""
+TAGS_CREATE=""
+TIMEZONE=""
+PASSWORD=""
+SSH_PUBLIC_KEYS=""
+START=""
+STARTUP=""
+HOOKSCRIPT=""
+PROTECTION=""
+HA_MANAGED=""
+CMODE=""
+CONSOLE=""
+TTY=""
+IGNORE_UNPACK=""
+DEBUG_CREATE=""
+BWLIMIT=""
 SKIP_PULL=0
 REUSE_LOCAL=0
 PULL_ONLY=0
 LIST_TEMPLATE_STORAGES=0
 STORAGE_JSON_CACHED=""
 MP_SPECS=()
+
+declare -A NET_IFACE=()
+declare -A DEV_MAP=()
+declare -A UNUSED_MAP=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -164,12 +211,22 @@ while [[ $# -gt 0 ]]; do
     --rootfs)           ROOTFS_SPEC="${2:?}"; shift 2 ;;
     --vmid)             VMID="${2:?}"; shift 2 ;;
     --hostname)         HOSTNAME="${2:?}"; shift 2 ;;
-    --net0)             NET0="${2:?}"; shift 2 ;;
+    --net*)
+      if [[ "$1" =~ ^--net([0-9]+)$ ]]; then
+        NET_IFACE["${BASH_REMATCH[1]}"]="${2:?}"
+        shift 2
+      else
+        die "Unknown option: $1 (expected --net0, --net1, …)"
+      fi
+      ;;
     --nameserver)       NAMESERVERS+=("${2:?}"); shift 2 ;;
     --searchdomain)     SEARCHDOMAIN="${2:?}"; shift 2 ;;
     --node)             NODE="${2:?}"; shift 2 ;;
     --memory)           MEMORY="${2:?}"; shift 2 ;;
+    --swap)             SWAP="${2:?}"; shift 2 ;;
     --cores)            CORES="${2:?}"; shift 2 ;;
+    --cpulimit)         CPULIMIT="${2:?}"; shift 2 ;;
+    --cpuunits)         CPUUNITS="${2:?}"; shift 2 ;;
     --ostype)           OSTYPE="${2:?}"; shift 2 ;;
     --arch)             ARCH="${2:?}"; shift 2 ;;
     --unprivileged)     UNPRIV="${2:?}"; shift 2 ;;
@@ -177,6 +234,40 @@ while [[ $# -gt 0 ]]; do
     --onboot)           ONBOOT="${2:?}"; shift 2 ;;
     --pool)             POOL="${2:?}"; shift 2 ;;
     --mp)               MP_SPECS+=("${2:?}"); shift 2 ;;
+    --entrypoint)       ENTRYPOINT="${2:?}"; shift 2 ;;
+    --env)              ENVS+=("${2:?}"); shift 2 ;;
+    --description)      DESCRIPTION="${2:?}"; shift 2 ;;
+    --tags)             TAGS_CREATE="${2:?}"; shift 2 ;;
+    --timezone)         TIMEZONE="${2:?}"; shift 2 ;;
+    --password)         PASSWORD="${2:?}"; shift 2 ;;
+    --ssh-public-keys)  SSH_PUBLIC_KEYS="${2:?}"; shift 2 ;;
+    --start)            START="${2:?}"; shift 2 ;;
+    --startup)          STARTUP="${2:?}"; shift 2 ;;
+    --hookscript)       HOOKSCRIPT="${2:?}"; shift 2 ;;
+    --protection)       PROTECTION="${2:?}"; shift 2 ;;
+    --ha-managed)       HA_MANAGED="${2:?}"; shift 2 ;;
+    --cmode)            CMODE="${2:?}"; shift 2 ;;
+    --console)          CONSOLE="${2:?}"; shift 2 ;;
+    --tty)              TTY="${2:?}"; shift 2 ;;
+    --ignore-unpack-errors) IGNORE_UNPACK="${2:?}"; shift 2 ;;
+    --debug)            DEBUG_CREATE="${2:?}"; shift 2 ;;
+    --bwlimit)          BWLIMIT="${2:?}"; shift 2 ;;
+    --dev*)
+      if [[ "$1" =~ ^--dev([0-9]+)$ ]]; then
+        DEV_MAP["${BASH_REMATCH[1]}"]="${2:?}"
+        shift 2
+      else
+        die "Unknown option: $1 (expected --dev0, --dev1, …)"
+      fi
+      ;;
+    --unused*)
+      if [[ "$1" =~ ^--unused([0-9]+)$ ]]; then
+        UNUSED_MAP["${BASH_REMATCH[1]}"]="${2:?}"
+        shift 2
+      else
+        die "Unknown option: $1 (expected --unused0, …)"
+      fi
+      ;;
     --skip-pull)        SKIP_PULL=1; shift ;;
     --reuse-local-template) REUSE_LOCAL=1; shift ;;
     --pull-only)        PULL_ONLY=1; shift ;;
@@ -187,6 +278,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -z "${NET_IFACE[0]-}" ]]; then
+  NET_IFACE[0]="${OCI_CT_CREATE_NET0:-name=eth0,bridge=vmbr0,ip=dhcp}"
+fi
 
 if [[ "$LIST_TEMPLATE_STORAGES" -eq 1 ]]; then
   command -v jq >/dev/null 2>&1 || die "jq is required for --list-template-storages."
@@ -649,12 +744,51 @@ else
   out_kv "Ostemplate" "${OSTEMPLATE}"
   out_kv "Rootfs" "${ROOTFS_SPEC}"
   out_kv "Hostname" "${HOSTNAME}"
+  for _n in $(printf '%s\n' "${!NET_IFACE[@]}" | sort -n); do
+    out_kv "net${_n}" "${NET_IFACE[$_n]}"
+  done
   [[ "${#NAMESERVERS[@]}" -gt 0 ]] && out_kv "nameserver" "${NAMESERVERS[*]}"
   [[ -n "$SEARCHDOMAIN" ]] && out_kv "searchdomain" "${SEARCHDOMAIN}"
+  [[ -n "$ENTRYPOINT" ]] && out_kv "entrypoint" "${ENTRYPOINT}"
+  [[ "${#ENVS[@]}" -gt 0 ]] && out_kv "env" "${ENVS[*]}"
+  [[ -n "$SWAP" ]] && out_kv "swap (MB)" "${SWAP}"
+  [[ -n "$CPULIMIT" ]] && out_kv "cpulimit" "${CPULIMIT}"
+  [[ -n "$CPUUNITS" ]] && out_kv "cpuunits" "${CPUUNITS}"
+  [[ -n "$DESCRIPTION" ]] && out_kv "description" "${DESCRIPTION}"
+  [[ -n "$TAGS_CREATE" ]] && out_kv "tags" "${TAGS_CREATE}"
+  [[ -n "$TIMEZONE" ]] && out_kv "timezone" "${TIMEZONE}"
+  [[ -n "$SSH_PUBLIC_KEYS" ]] && out_kv "ssh-public-keys" "${SSH_PUBLIC_KEYS}"
+  [[ -n "$STARTUP" ]] && out_kv "startup" "${STARTUP}"
+  [[ -n "$HOOKSCRIPT" ]] && out_kv "hookscript" "${HOOKSCRIPT}"
   [[ "${#MP_SPECS[@]}" -gt 0 ]] && out_kv "Mounts (mp*)" "${MP_SPECS[*]}"
 fi
 
-cmd=(pct create "$VMID" "$OSTEMPLATE" --rootfs "$ROOTFS_SPEC" --hostname "$HOSTNAME" --net0 "$NET0" --unprivileged "$UNPRIV" --onboot "$ONBOOT")
+cmd=(pct create "$VMID" "$OSTEMPLATE" --rootfs "$ROOTFS_SPEC" --hostname "$HOSTNAME")
+
+for net_if in $(printf '%s\n' "${!NET_IFACE[@]}" | sort -n); do
+  cmd+=(--"net${net_if}" "${NET_IFACE[$net_if]}")
+done
+cmd+=(--unprivileged "$UNPRIV" --onboot "$ONBOOT")
+
+[[ -n "$ENTRYPOINT" ]] && cmd+=(--entrypoint "$ENTRYPOINT")
+for _ev in "${ENVS[@]}"; do
+  cmd+=(--env "$_ev")
+done
+
+[[ -n "$MEMORY" ]] && cmd+=(--memory "$MEMORY")
+[[ -n "$SWAP" ]] && cmd+=(--swap "$SWAP")
+[[ -n "$CORES" ]] && cmd+=(--cores "$CORES")
+[[ -n "$CPULIMIT" ]] && cmd+=(--cpulimit "$CPULIMIT")
+[[ -n "$CPUUNITS" ]] && cmd+=(--cpuunits "$CPUUNITS")
+[[ -n "$OSTYPE" ]] && cmd+=(--ostype "$OSTYPE")
+[[ -n "$ARCH" ]] && cmd+=(--arch "$ARCH")
+[[ -n "$FEATURES" ]] && cmd+=(--features "$FEATURES")
+
+[[ -n "$DESCRIPTION" ]] && cmd+=(--description "$DESCRIPTION")
+[[ -n "$TAGS_CREATE" ]] && cmd+=(--tags "$TAGS_CREATE")
+[[ -n "$TIMEZONE" ]] && cmd+=(--timezone "$TIMEZONE")
+[[ -n "$PASSWORD" ]] && cmd+=(--password "$PASSWORD")
+[[ -n "$SSH_PUBLIC_KEYS" ]] && cmd+=(--ssh-public-keys "$SSH_PUBLIC_KEYS")
 
 for ns in "${NAMESERVERS[@]}"; do
   cmd+=(--nameserver "$ns")
@@ -662,11 +796,6 @@ done
 [[ -n "$SEARCHDOMAIN" ]] && cmd+=(--searchdomain "$SEARCHDOMAIN")
 
 [[ -n "$POOL" ]] && cmd+=(--pool "$POOL")
-[[ -n "$MEMORY" ]] && cmd+=(--memory "$MEMORY")
-[[ -n "$CORES" ]] && cmd+=(--cores "$CORES")
-[[ -n "$OSTYPE" ]] && cmd+=(--ostype "$OSTYPE")
-[[ -n "$ARCH" ]] && cmd+=(--arch "$ARCH")
-[[ -n "$FEATURES" ]] && cmd+=(--features "$FEATURES")
 
 mp_idx=0
 for mp_spec in "${MP_SPECS[@]}"; do
@@ -681,6 +810,25 @@ for mp_spec in "${MP_SPECS[@]}"; do
   mp_idx=$((mp_idx + 1))
 done
 unset mp_st mp_sz mp_path mp_spec 2>/dev/null || true
+
+for dev_if in $(printf '%s\n' "${!DEV_MAP[@]}" | sort -n); do
+  cmd+=(--"dev${dev_if}" "${DEV_MAP[$dev_if]}")
+done
+for un_if in $(printf '%s\n' "${!UNUSED_MAP[@]}" | sort -n); do
+  cmd+=(--"unused${un_if}" "${UNUSED_MAP[$un_if]}")
+done
+
+[[ -n "$STARTUP" ]] && cmd+=(--startup "$STARTUP")
+[[ -n "$HOOKSCRIPT" ]] && cmd+=(--hookscript "$HOOKSCRIPT")
+[[ -n "$CMODE" ]] && cmd+=(--cmode "$CMODE")
+[[ -n "$CONSOLE" ]] && cmd+=(--console "$CONSOLE")
+[[ -n "$TTY" ]] && cmd+=(--tty "$TTY")
+[[ -n "$PROTECTION" ]] && cmd+=(--protection "$PROTECTION")
+[[ -n "$HA_MANAGED" ]] && cmd+=(--ha-managed "$HA_MANAGED")
+[[ -n "$IGNORE_UNPACK" ]] && cmd+=(--ignore-unpack-errors "$IGNORE_UNPACK")
+[[ -n "$DEBUG_CREATE" ]] && cmd+=(--debug "$DEBUG_CREATE")
+[[ -n "$BWLIMIT" ]] && cmd+=(--bwlimit "$BWLIMIT")
+[[ -n "$START" ]] && cmd+=(--start "$START")
 
 local _pct_log _pct_ec
 _pct_log="$(mktemp "${TMPDIR:-/tmp}/pve-oci-pct.XXXXXX")" || die "mktemp failed for pct log"

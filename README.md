@@ -94,15 +94,25 @@ The file is YAML with a single top-level mapping.
 | `rootfs` | **plan**, **apply**, **refresh** | e.g. `local-zfs:8` — passed to create; **pull** does not require it. |
 | `template_storage` | optional | vztmpl storage id for `oci-registry-pull`; alias `storage`. Empty or omitted lets the create script auto-pick when there is exactly one suitable store. |
 | `pool` | optional | Datacenter **resource pool** id for UI grouping. Defaults to top-level **`name`** / **`project`**. Set to **`""`** or **`null`** in **`defaults`** to disable. If the pool id does not exist, **apply** / **refresh** run **`pvesh create /pools`** (opt out with **`PVE_OCI_POOL_NO_AUTOCREATE=1`**). |
-| `hostname`, `net0`, `node`, `memory`, `cores`, `ostype`, `features` | optional | Passed through to the create script where supported. |
-| `nameserver` | optional | **`pct --nameserver`**: string (IPs separated by commas or whitespace) or YAML list → one flag per address. Omit with `searchdomain` unset to inherit the host’s resolvers (see **`pct`** docs). |
-| `searchdomain` | optional | **`pct --searchdomain`**: string or YAML list (multiple domains are joined with spaces). |
+| `hostname`, `net0`, `net1`, … | optional | **`pct --netN`**: any keys matching `net[0-9]+` are passed in numeric order. If none are set, **`net0`** defaults to `name=eth0,bridge=vmbr0,ip=dhcp` (or **`OCI_CT_CREATE_NET0`**). |
+| `node`, `memory`, `swap`, `cores`, `cpulimit`, `cpuunits`, `ostype`, `arch`, `features` | optional | Passed to **`pct create`** as the matching flags (`--memory`, `--swap`, …). |
+| `nameserver` | optional | **`pct --nameserver`**: string (IPs separated by commas or whitespace) or YAML list → one flag per address. |
+| `searchdomain` | optional | **`pct --searchdomain`**: string or YAML list (domains joined with spaces). |
+| `entrypoint` | optional | **`pct --entrypoint`** (OCI / init command). |
+| `env` | optional | **`pct --env`**, repeatable: YAML **mapping** (`KEY: value`) or **list** of `KEY=value` strings (or one string). |
+| `description`, `tags` | optional | **`pct --description`** and **`pct --tags`** (UI tags string). **apply** still merges the **`pve-oci-compose`** sentinel tag afterward. |
+| `timezone`, `password`, `ssh_public_keys` | optional | **`pct --timezone`**, **`--password`**, **`--ssh-public-keys`** (path to a **host** file; must exist when **apply** validates the service). |
+| `start`, `startup`, `hookscript` | optional | **`pct --start`**, **`--startup`**, **`--hookscript`** (e.g. `local:snippets/hook.sh`). Booleans/ints follow the same rules as **`onboot`**. |
+| `protection`, `ha_managed`, `ignore_unpack_errors`, `pct_debug` | optional | **`pct --protection`**, **`--ha-managed`**, **`--ignore-unpack-errors`**, **`--debug`** (`pct_debug` in YAML to avoid a generic `debug` key). |
+| `cmode`, `console`, `tty`, `bwlimit` | optional | **`pct --cmode`**, **`--console`**, **`--tty`**, **`--bwlimit`**. |
+| `lxc_dev` | optional | List of device specs → **`--dev0`**, **`--dev1`**, … in list order (see **`pct(1)`** / **`--dev[n]`**). |
+| `unused_disks` | optional | List of volume specs → **`--unused0`**, … (advanced; see Proxmox docs). |
 | `unprivileged`, `onboot` | optional | YAML booleans or integers; mapped to `pct` flags on create. |
 | `mounts` | optional | List of strings `STORAGE:GiB:/absolute/path` → `--mp` on create (extra CT volumes). |
 
-See `compose.example.yaml` for a minimal working shape.
+See **`compose.example.yaml`**: a minimal working service plus **long commented examples** for every optional **`pct create`** field (DNS, **`net1`**, **`env`**, **`startup`** vs **`onboot`**, devices, etc.).
 
-**DNS fields** (`nameserver`, `searchdomain`) are applied only at **`pct create`** (**apply** on a new CT). They do not run on **refresh**; change resolvers on an existing CT with **`pct set`** or the UI.
+**Create-only fields:** everything in the table above that maps to **`pct create`** (including DNS, **`entrypoint`**, **`env`**, extra **`netN`**, **`lxc_dev`**, …) is applied only when a **new** CT is created. **refresh** does not re-run **`pct create`**; change those settings later with **`pct set`** or the UI (and note that **`password`** in YAML is easy to leak via git — prefer **`pct set`** or secrets after first boot).
 
 ## Commands
 

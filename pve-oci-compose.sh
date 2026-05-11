@@ -69,9 +69,13 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   image or reference (required) OCI ref for create / refresh (same as existing scripts)
   rootfs             (required for apply) e.g. local-zfs:8
   template_storage   vztmpl storage id for oci-registry-pull (optional; see create script)
-  hostname, net0, node, memory, cores, ostype, unprivileged, features, onboot
-  nameserver         string or list → pct --nameserver (repeatable); commas/whitespace split a string
-  searchdomain       string or list → pct --searchdomain (lists joined with spaces)
+  hostname, net0 … net7   pct --netN (any net keys net0, net1, …); default net0 if none set
+  node, memory, swap, cores, cpulimit, cpuunits, ostype, arch, unprivileged, features, onboot
+  nameserver, searchdomain, entrypoint, env (map or list of KEY=val), description, tags (pct UI tags)
+  timezone, password, ssh_public_keys (host file path), start, startup, hookscript, protection
+  ha_managed, cmode, console, tty, ignore_unpack_errors, pct_debug, bwlimit
+  lxc_dev            list of pct --dev0 … device specs (order = list order)
+  unused_disks       list of pct --unused0 … volume specs (advanced)
   mounts             list of strings "STORAGE:GiB:/path" passed as --mp to create
   pool               optional; Datacenter resource pool id. Defaults to top-level name/project
                      (stack). Use pool: "" or pool: null in defaults to disable. Missing pools are
@@ -173,13 +177,15 @@ vmid_spec_from_json() {
 
 validate_service() {
   local json="$1" svc="$2"
-  local spec image rootfs
+  local spec image rootfs sk
   spec="$(vmid_spec_from_json "$json")"
   image="$(service_image "$json")"
   rootfs="$(jq -r '.rootfs // empty' <<<"$json")"
   [[ "$spec" != invalid:* ]] || die "service $svc: vmid must be a number, next, auto, or null (got ${spec#invalid:})"
   [[ -n "$image" ]] || die "service $svc: missing image (or reference)"
   [[ -n "$rootfs" ]] || die "service $svc: missing rootfs"
+  sk="$(jq -r '.ssh_public_keys // empty | if type == "string" then . else empty end' <<<"$json")"
+  [[ -z "$sk" ]] || [[ -f "$sk" ]] || die "service $svc: ssh_public_keys must be a readable host file (got: $sk)"
 }
 
 validate_service_refresh() {
@@ -367,6 +373,10 @@ cmd_plan() {
     ' <<<"$svc")"
     [[ -n "$ns_plan" ]] && echo "  nameserver:    $ns_plan"
     [[ -n "$sd_plan" ]] && echo "  searchdomain:  $sd_plan"
+    ep_plan="$(jq -r 'if (.entrypoint | type) == "string" then .entrypoint else empty end' <<<"$svc")"
+    [[ -n "$ep_plan" ]] && echo "  entrypoint:    $ep_plan"
+    sw_plan="$(jq -r '.swap // empty | if type == "number" then tostring elif type == "string" then . else empty end' <<<"$svc")"
+    [[ -n "$sw_plan" ]] && echo "  swap (MB):     $sw_plan"
     echo "  marker (path): ${mr}"
     echo "  pool (target): ${effpool:-<none>}"
     echo "  tags:          ${tags:-<none>}"
@@ -395,14 +405,13 @@ fill_create_args() {
   local svcjson="$1"
   local resolved_vmid="$2"
   local stack_default="${3:-}"
-  local ts ref vmid hostname net0 node mem cores ostype arch feats v pool
+  local ts ref vmid hostname node mem cores ostype arch feats v pool nk nv j
 
   OCI_CREATE_ARGS=()
   ts="$(jq -r '.template_storage // .storage // empty' <<<"$svcjson")"
   ref="$(service_image "$svcjson")"
   vmid="$resolved_vmid"
   hostname="$(jq -r '.hostname // empty' <<<"$svcjson")"
-  net0="$(jq -r '.net0 // empty' <<<"$svcjson")"
   node="$(jq -r '.node // empty' <<<"$svcjson")"
   mem="$(jq -r '.memory // empty' <<<"$svcjson")"
   cores="$(jq -r '.cores // empty' <<<"$svcjson")"
@@ -416,7 +425,31 @@ fill_create_args() {
   [[ -n "$ts" ]] && OCI_CREATE_ARGS+=(--storage "$ts")
   [[ -n "$pool" ]] && OCI_CREATE_ARGS+=(--pool "$pool")
   [[ -n "$hostname" ]] && OCI_CREATE_ARGS+=(--hostname "$hostname")
-  [[ -n "$net0" ]] && OCI_CREATE_ARGS+=(--net0 "$net0")
+
+  while IFS= read -r nk; do
+    [[ -z "$nk" ]] && continue
+    nv="$(jq -r --arg k "$nk" '.[$k] | tostring' <<<"$svcjson")"
+    OCI_CREATE_ARGS+=(--"$nk" "$nv")
+  done < <(jq -r '
+    to_entries
+    | map(select(.key | test("^net[0-9]+$")))
+    | sort_by(.key | ltrimstr("net") | tonumber)
+    | .[].key
+  ' <<<"$svcjson")
+
+  v="$(jq -r '.entrypoint // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--entrypoint "$v")
+  while IFS= read -r ev; do
+    [[ -z "$ev" ]] && continue
+    OCI_CREATE_ARGS+=(--env "$ev")
+  done < <(jq -r '
+    (.env // empty)
+    | if type == "object" then to_entries[] | "\(.key)=\(.value | tostring)"
+      elif type == "array" then .[] | tostring
+      elif type == "string" then .
+      else empty end
+    ' <<<"$svcjson")
+
   while IFS= read -r ns; do
     [[ -z "$ns" ]] && continue
     OCI_CREATE_ARGS+=(--nameserver "$ns")
@@ -443,6 +476,48 @@ fill_create_args() {
   [[ -n "$arch" ]] && OCI_CREATE_ARGS+=(--arch "$arch")
   [[ -n "$feats" ]] && OCI_CREATE_ARGS+=(--features "$feats")
 
+  v="$(jq -r '.swap // empty | if type == "number" then tostring elif type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--swap "$v")
+  v="$(jq -r '.cpulimit // empty | if type == "number" then tostring elif type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--cpulimit "$v")
+  v="$(jq -r '.cpuunits // empty | if type == "number" then tostring elif type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--cpuunits "$v")
+  v="$(jq -r '.description // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--description "$v")
+  v="$(jq -r '.tags // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--tags "$v")
+  v="$(jq -r '.timezone // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--timezone "$v")
+  v="$(jq -r '.password // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--password "$v")
+  v="$(jq -r '.ssh_public_keys // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--ssh-public-keys "$v")
+  v="$(jq -r '.startup // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--startup "$v")
+  v="$(jq -r '.hookscript // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--hookscript "$v")
+  v="$(jq -r '.cmode // empty | if type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--cmode "$v")
+  v="$(jq -r '.console // empty | if type == "boolean" then (if . then "1" else "0" end) elif type == "number" then tostring elif type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--console "$v")
+  v="$(jq -r '.tty // empty | if type == "number" then tostring elif type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--tty "$v")
+  v="$(jq -r '.bwlimit // empty | if type == "number" then tostring elif type == "string" then . else empty end' <<<"$svcjson")"
+  [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--bwlimit "$v")
+
+  j=0
+  while IFS= read -r ds; do
+    [[ -z "$ds" ]] && continue
+    OCI_CREATE_ARGS+=(--"dev${j}" "$ds")
+    j=$((j + 1))
+  done < <(jq -r '.lxc_dev[]? | strings' <<<"$svcjson")
+  j=0
+  while IFS= read -r us; do
+    [[ -z "$us" ]] && continue
+    OCI_CREATE_ARGS+=(--"unused${j}" "$us")
+    j=$((j + 1))
+  done < <(jq -r '.unused_disks[]? | strings' <<<"$svcjson")
+
   if jq -e '.onboot != null' <<<"$svcjson" >/dev/null 2>&1; then
     v="$(jq -r 'if (.onboot | type) == "boolean" then (if .onboot then "1" else "0" end) else "\(.onboot)" end' <<<"$svcjson")"
     OCI_CREATE_ARGS+=(--onboot "$v")
@@ -450,6 +525,26 @@ fill_create_args() {
   if jq -e '.unprivileged != null' <<<"$svcjson" >/dev/null 2>&1; then
     v="$(jq -r 'if (.unprivileged | type) == "boolean" then (if .unprivileged then "1" else "0" end) else "\(.unprivileged)" end' <<<"$svcjson")"
     OCI_CREATE_ARGS+=(--unprivileged "$v")
+  fi
+  if jq -e '.start != null' <<<"$svcjson" >/dev/null 2>&1; then
+    v="$(jq -r 'if (.start | type) == "boolean" then (if .start then "1" else "0" end) else "\(.start)" end' <<<"$svcjson")"
+    OCI_CREATE_ARGS+=(--start "$v")
+  fi
+  if jq -e '.protection != null' <<<"$svcjson" >/dev/null 2>&1; then
+    v="$(jq -r 'if (.protection | type) == "boolean" then (if .protection then "1" else "0" end) else "\(.protection)" end' <<<"$svcjson")"
+    OCI_CREATE_ARGS+=(--protection "$v")
+  fi
+  if jq -e '.ha_managed != null' <<<"$svcjson" >/dev/null 2>&1; then
+    v="$(jq -r 'if (.ha_managed | type) == "boolean" then (if .ha_managed then "1" else "0" end) else "\(.ha_managed)" end' <<<"$svcjson")"
+    OCI_CREATE_ARGS+=(--ha-managed "$v")
+  fi
+  if jq -e '.ignore_unpack_errors != null' <<<"$svcjson" >/dev/null 2>&1; then
+    v="$(jq -r 'if (.ignore_unpack_errors | type) == "boolean" then (if .ignore_unpack_errors then "1" else "0" end) else "\(.ignore_unpack_errors)" end' <<<"$svcjson")"
+    OCI_CREATE_ARGS+=(--ignore-unpack-errors "$v")
+  fi
+  if jq -e '.pct_debug != null' <<<"$svcjson" >/dev/null 2>&1; then
+    v="$(jq -r 'if (.pct_debug | type) == "boolean" then (if .pct_debug then "1" else "0" end) else "\(.pct_debug)" end' <<<"$svcjson")"
+    OCI_CREATE_ARGS+=(--debug "$v")
   fi
 
   while IFS= read -r mp; do

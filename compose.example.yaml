@@ -10,10 +10,16 @@ name: example-stack
 
 defaults:
   template_storage: "" # vztmpl storage id for oci-registry-pull; omit or "" to auto-pick when unique
-  # pool: ""        # optional: disable default pool (= stack name) for all services in this file
-  # net0 is passed to pct --net0. Add tag=VLAN for 802.1Q on a VLAN-aware bridge (see PVE wiki: VLAN on bridge).
-  # Example VLAN 42:  'name=eth0,bridge=vmbr0,tag=42,ip=dhcp'
+
+  # --- pool (optional) ---
+  # pool: ""                    # disable default pool id (= stack name) for every service
+  # pool: "oci-example-stack"  # explicit pool id (must exist or be auto-created)
+
+  # --- net0 (default for every service unless overridden) ---
+  # Same string pct(1) expects for --net0. VLAN example on a VLAN-aware bridge:
+  # net0: "name=eth0,bridge=vmbr0,tag=42,ip=dhcp"
   net0: "name=eth0,bridge=vmbr0,ip=dhcp"
+
   unprivileged: 1
   onboot: 0
 
@@ -23,14 +29,96 @@ services:
     image: docker.io/library/nginx:latest
     rootfs: local-zfs:8
     hostname: nginx-oci-demo
-    # DNS (optional): passed to pct create — same semantics as Datacenter CT options / pct.conf(5)
-    # nameserver: "10.0.0.1, 10.0.0.2"   # or YAML list:  [10.0.0.1, 8.8.8.8]
-    # searchdomain: lan.local            # or list: [lan.local, corp.example.com]
-    # Optional pct / pull options:
+
+    # =============================================================================
+    # Optional pct create fields — examples (uncomment / copy into this service)
+    # All of these map 1:1 to `pct create` flags; see README + `pct(1)` on your PVE version.
+    # They apply only when a *new* CT is created (apply), not on refresh.
+    # =============================================================================
+
+    # --- Extra NICs: net1, net2, … (keys must match ^net[0-9]+$) ---
+    # Second interface, same bridge, DHCP:
+    # net1: "name=eth1,bridge=vmbr0,ip=dhcp"
+    # Static IPv4 on eth0 (adjust to your LAN); gateway often on net0 only:
+    # net0: "name=eth0,bridge=vmbr0,ip=192.168.1.50/24,gw=192.168.1.1"
+
+    # --- DNS (pct --nameserver / --searchdomain) ---
+    # One string with commas or spaces → multiple --nameserver flags:
+    # nameserver: "10.0.0.1, 10.0.0.2"
+    # Or a YAML list → one --nameserver per element:
+    # nameserver: [10.0.0.1, 8.8.8.8]
+    # searchdomain: "lan.local"
+    # searchdomain: [lan.local, corp.example.com]
+
+    # --- OCI-style process (pct --entrypoint) ---
+    # entrypoint: "/sbin/init"
+    # entrypoint: '/usr/sbin/nginx -g "daemon off;"'
+
+    # --- Environment (pct --env, repeatable) ---
+    # As a mapping (recommended):
+    # env:
+    #   NGINX_ENTRYPOINT_QUIET_LOGS: "1"
+    #   TZ: "UTC"
+    # As a list of KEY=value strings:
+    # env:
+    #   - "FOO=bar"
+    #   - "BAZ=qux"
+    # Single string (passed through as one --env if you need a custom format):
+    # env: "MYVAR=value"
+
+    # --- CPU / RAM tuning ---
     # memory: 512
     # cores: 2
+    # swap: 512
+    # cpulimit: 4
+    # cpuunits: 2048
+
+    # --- OS / features (unchanged from before; shown for context) ---
     # ostype: debian
+    # arch: amd64
     # features: "nesting=1"
+
+    # --- UI metadata (pct --description / --tags) ---
+    # description: "Edge nginx from pve-oci-compose"
+    # tags: "env=prod;team=netops"
+    # apply still merges the short sentinel tag `pve-oci-compose` after create.
+
+    # --- Timezone / access (pct --timezone / --password / --ssh-public-keys) ---
+    # timezone: host
+    # timezone: "Europe/Berlin"
+    # Avoid committing real passwords — prefer `pct set` after first boot:
+    # password: "CHANGE_ME"
+    # Path on the *Proxmox host* to a file (one OpenSSH public key per line):
+    # ssh_public_keys: "/root/.ssh/authorized_keys"
+
+    # --- Boot / ordering (different from each other) ---
+    # onboot: 1              # start this CT when the *node* boots (pct --onboot)
+    # startup: "order=10,up=30,down=30"   # order + delays vs other guests (pct --startup)
+    # start: 1               # start the CT immediately when `pct create` finishes (pct --start)
+
+    # --- Hooks / HA / safety (pct --hookscript / --ha-managed / --protection / …) ---
+    # hookscript: "local:snippets/lxc-hook.sh"
+    # protection: 1
+    # ha_managed: 0
+    # ignore_unpack_errors: 0
+    # pct_debug: 0
+
+    # --- Console / I/O (pct --cmode / --console / --tty / --bwlimit) ---
+    # cmode: tty
+    # console: 1
+    # tty: 2
+    # bwlimit: 12500
+
+    # --- Host devices into the CT (pct --dev0, --dev1, … list order) ---
+    # lxc_dev:
+    #   - "path=/dev/net/tun,mp=/dev/net/tun"
+    #   - "path=/dev/kvm,mp=/dev/kvm"
+
+    # --- Advanced: unused volume refs (pct --unused0, …) — rarely needed ---
+    # unused_disks:
+    #   - "local-zfs:vm-999-disk-0"
+
+    # --- Node override & extra disks ---
     # node: pve
     # mounts:
     #   - "local-zfs:0.25:/var/cache/nginx"
