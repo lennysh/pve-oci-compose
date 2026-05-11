@@ -314,11 +314,11 @@ if not compose_triggers:
 lines = [
     "# pve-oci-compose",
     "",
-    f"**Stack:** {stack}" if stack else "**Stack:** _(compose file)_",
-    f"**Service:** {sname}",
+    f"- **Stack:** {stack}" if stack else "- **Stack:** _(compose file)_",
+    f"- **Service:** {sname}",
 ]
 if img:
-    lines.append(f"**Image:** `{img}`")
+    lines.append(f"- **Image:** `{img}`")
 
 if body_user:
     lines.append("")
