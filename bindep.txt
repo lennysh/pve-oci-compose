@@ -1,0 +1,17 @@
+# Binary / runtime package dependencies for pve-oci-compose and the oci_ct_* worker
+# scripts on Debian-based hosts (dpkg), including Proxmox VE.
+#
+# Format follows openstack/bindep: <packagename> [platform:dpkg ...]
+# https://docs.opendev.org/opendev/bindep/latest/
+#
+# Install every listed package with apt (from the repo root):
+#
+#   sudo apt-get update && sudo apt-get install -y $(awk '!/^[[:space:]]*#/ && NF {print $1}' bindep.txt)
+#
+# If you use the bindep tool itself:  bindep -f bindep.txt --brief --platform dpkg
+
+jq [platform:dpkg]
+python3 [platform:dpkg]
+python3-yaml [platform:dpkg]
+skopeo [platform:dpkg]
+rsync [platform:dpkg]

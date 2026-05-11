@@ -1,0 +1,27 @@
+# Example compose file for pve-oci-compose (YAML).
+# Requires: python3 + PyYAML (on PVE: apt install python3-yaml)
+#
+# Top-level "defaults" are shallow-merged into each service (service keys win).
+
+name: example-stack
+
+defaults:
+  template_storage: "" # vztmpl storage id for oci-registry-pull; omit or "" to auto-pick when unique
+  net0: "name=eth0,bridge=vmbr0,ip=dhcp"
+  unprivileged: 1
+  onboot: 0
+
+services:
+  nginx-demo:
+    vmid: 200
+    image: docker.io/library/nginx:latest
+    rootfs: local-zfs:8
+    hostname: nginx-oci-demo
+    # Optional pct / pull options:
+    # memory: 512
+    # cores: 2
+    # ostype: debian
+    # features: "nesting=1"
+    # node: pve
+    # mounts:
+    #   - "local-zfs:0.25:/var/cache/nginx"
