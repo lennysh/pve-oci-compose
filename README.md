@@ -114,6 +114,7 @@ The file is YAML with a single top-level mapping.
 | `unprivileged`, `onboot` | optional | YAML booleans or integers; mapped to `pct` flags on create. |
 | `mounts` | optional | List of strings `STORAGE:GiB:/absolute/path-in-CT` → `--mp` on create (sized volumes). |
 | `bind_mounts` | optional | List of strings for host bind mounts: each entry is the full **`pct`** `mp` value (absolute **host** path, comma-separated options including **`mp=`** guest path), e.g. `/mnt/pve/nfs-media,mp=/mnt/Media01,shared=1,replicate=0,size=0T`. Passed as **`--mp-bind`** after **`mounts`** (indexes continue as **`mp0`**, **`mp1`**, …). Compose checks for `/` + `,mp=`; Proxmox still validates at **`pct create`**. |
+| `lxc_config_lines` | optional | List of strings appended **after** a successful **`pct create`** into **`/etc/pve/lxc/<vmid>.conf`** (low-level **`lxc.*`** / **`lxc.mount.entry`** style lines, **`KEY: value`** or **`KEY = value`**). Only runs when **apply** actually creates the CT (not when the vmid already exists). A marked block is replaced if you destroy the CT and re-**apply** with the same compose. |
 
 The Proxmox UI may show **`description`** as plain text; Markdown-style headings and bullets still read clearly when copy-pasted. Very long text can hit UI limits—keep secrets out of compose and out of the CT description.
 
@@ -121,7 +122,7 @@ For the **rich** description ( **`guest_ports`** and/or **`about`** / stack **`a
 
 See **`compose.example.yaml`**: a minimal working service plus **long commented examples** for every optional **`pct create`** field (DNS, **`net1`**, **`env`**, **`startup`** vs **`onboot`**, devices, etc.).
 
-**Create-only fields:** everything in the table above that maps to **`pct create`** (including DNS, **`entrypoint`**, **`env`**, extra **`netN`**, **`lxc_dev`**, …) is applied only when a **new** CT is created. **refresh** does not re-run **`pct create`**; change those settings later with **`pct set`** or the UI (and note that **`password`** in YAML is easy to leak via git — prefer **`pct set`** or secrets after first boot).
+**Create-only fields:** everything in the table above that maps to **`pct create`** or post-create **`/etc/pve/lxc/<vmid>.conf`** edits (**`mounts`**, **`bind_mounts`**, **`lxc_config_lines`**, DNS, **`entrypoint`**, **`env`**, extra **`netN`**, **`lxc_dev`**, …) is applied only when a **new** CT is created. **refresh** does not re-run **`pct create`**; change those settings later with **`pct set`** or the UI (and note that **`password`** in YAML is easy to leak via git — prefer **`pct set`** or secrets after first boot).
 
 ## Commands
 

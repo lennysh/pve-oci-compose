@@ -34,6 +34,8 @@ Common options:
   --mp SPEC             Repeatable: STORAGE:GiB:/path
   --mp-bind SPEC        Repeatable: bind mount value for pct --mpN (host path + options), e.g.
                         /mnt/pve/nfs,mp=/mnt/Media,shared=1,replicate=0,size=0T
+  --lxc-line LINE       Repeatable: raw PVE/LXC config line appended after pct create (key: value
+                        or key = value), e.g. lxc.cgroup2.devices.allow: c 188:* rwm
   --entrypoint CMD      pct --entrypoint (OCI / init override)
   --env KEY=val         pct --env (repeatable; same form as pct(1))
   --description TEXT    pct --description
@@ -102,6 +104,59 @@ oci_create_pct_failure_cleanup() {
     echo "pve-oci-compose: Proxmox rejected this OCI archive (unsupported manifest/layer media types for LXC vztmpl)." >&2
     echo "pve-oci-compose: Use an image format Proxmox supports as an OCI template, or a classic vztmpl tarball — not every container registry image is compatible." >&2
   fi
+}
+
+# Raw PVE CT config lines (lxc.*, etc.): strip/replace a marked block in /etc/pve/lxc/<vmid>.conf.
+pve_oci_append_lxc_config_lines() {
+  local vmid="$1" cfg tmp newf line
+  shift
+  [[ "$#" -eq 0 ]] && return 0
+  cfg="/etc/pve/lxc/${vmid}.conf"
+  [[ -f "$cfg" ]] || die "internal: CT config missing after create: ${cfg}"
+  for line in "$@"; do
+    _oci_validate_lxc_config_line "$line" \
+      || die "invalid --lxc-line (expected KEY: value or KEY = value; no snapshot [section] lines): ${line:0:120}"
+  done
+  tmp="$(mktemp "${TMPDIR:-/tmp}/pve-oci-lxc-lines.XXXXXX")" || die "mktemp failed"
+  awk '
+    /^# BEGIN pve-oci-compose lxc_config_lines$/ { skip=1; next }
+    /^# END pve-oci-compose lxc_config_lines$/ { skip=0; next }
+    !skip { print }
+  ' "$cfg" >"$tmp" || {
+    rm -f "$tmp"
+    die "failed to read ${cfg}"
+  }
+  newf="$(mktemp "${TMPDIR:-/tmp}/pve-oci-lxc-lines-new.XXXXXX")" || {
+    rm -f "$tmp"
+    die "mktemp failed"
+  }
+  {
+    cat "$tmp"
+    echo "# BEGIN pve-oci-compose lxc_config_lines"
+    for line in "$@"; do
+      printf '%s\n' "$line"
+    done
+    echo "# END pve-oci-compose lxc_config_lines"
+  } >"$newf" || {
+    rm -f "$tmp" "$newf"
+    die "write failed (${cfg})"
+  }
+  mv -f "$newf" "$cfg" || {
+    rm -f "$tmp" "$newf"
+    die "mv to ${cfg} failed"
+  }
+  rm -f "$tmp"
+}
+
+_oci_validate_lxc_config_line() {
+  local s="$1"
+  [[ -n "${s//[[:space:]]/}" ]] || return 1
+  case "$s" in
+    \[*) return 1 ;;
+  esac
+  [[ "$s" =~ ^[[:space:]]*# ]] && return 1
+  [[ "$s" =~ ^[[:space:]]*[a-zA-Z][a-zA-Z0-9_.-]*[[:space:]]*[:=] ]] || return 1
+  return 0
 }
 
 oci_create_main() {
@@ -208,6 +263,7 @@ LIST_TEMPLATE_STORAGES=0
 STORAGE_JSON_CACHED=""
 MP_SPECS=()
 MP_BIND_SPECS=()
+LXC_LINE_SPECS=()
 
 declare -A NET_IFACE=()
 declare -A DEV_MAP=()
@@ -244,6 +300,7 @@ while [[ $# -gt 0 ]]; do
     --pool)             POOL="${2:?}"; shift 2 ;;
     --mp)               MP_SPECS+=("${2:?}"); shift 2 ;;
     --mp-bind)          MP_BIND_SPECS+=("${2:?}"); shift 2 ;;
+    --lxc-line)         LXC_LINE_SPECS+=("${2:?}"); shift 2 ;;
     --entrypoint)       ENTRYPOINT="${2:?}"; shift 2 ;;
     --env)              ENVS+=("${2:?}"); shift 2 ;;
     --description)      DESCRIPTION="${2:?}"; shift 2 ;;
@@ -773,6 +830,8 @@ else
   [[ -n "$STARTUP" ]] && out_kv "startup" "${STARTUP}"
   [[ -n "$HOOKSCRIPT" ]] && out_kv "hookscript" "${HOOKSCRIPT}"
   [[ "${#MP_SPECS[@]}" -gt 0 ]] && out_kv "Mounts (mp*)" "${MP_SPECS[*]}"
+  [[ "${#MP_BIND_SPECS[@]}" -gt 0 ]] && out_kv "bind_mounts (mp*)" "${MP_BIND_SPECS[*]}"
+  [[ "${#LXC_LINE_SPECS[@]}" -gt 0 ]] && out_kv "lxc_config_lines" "${#LXC_LINE_SPECS[@]} line(s)"
 fi
 
 cmd=(pct create "$VMID" "$OSTEMPLATE" --rootfs "$ROOTFS_SPEC" --hostname "$HOSTNAME")
@@ -867,6 +926,15 @@ if [[ "$_pct_ec" -ne 0 ]]; then
   die "pct create failed"
 fi
 rm -f "$_pct_log"
+
+if [[ "${#LXC_LINE_SPECS[@]}" -gt 0 ]]; then
+  pve_oci_append_lxc_config_lines "$VMID" "${LXC_LINE_SPECS[@]}"
+  if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+    out_muted "Wrote ${#LXC_LINE_SPECS[@]} lxc_config_lines to /etc/pve/lxc/${VMID}.conf"
+  else
+    out_sub "Appended ${#LXC_LINE_SPECS[@]} low-level line(s) to CT config (lxc_config_lines)"
+  fi
+fi
 
 if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
   out_muted "Scratch CT ${VMID} ready (stopped) — used only as rsync source; will be destroyed."
