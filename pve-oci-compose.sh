@@ -79,7 +79,7 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   ha_managed, cmode, console, tty, ignore_unpack_errors, pct_debug, bwlimit
   lxc_dev            list of pct --dev0 … device specs (order = list order)
   unused_disks       list of pct --unused0 … volume specs (advanced)
-  mounts             list of strings "STORAGE:GiB:/path" passed as --mp to create
+  mounts             list of strings "STORAGE:GiB:/path" or "STORAGE:GiB:/path:opt1,opt2" → --mp (default backup=1 unless you set backup= in the optional tail)
   bind_mounts        optional list of strings: full pct mp value (host path + options), e.g.
                      /mnt/pve/nfs-media,mp=/mnt/Media01,shared=1,replicate=0,size=0T → --mp-bind
   lxc_config_lines   optional list of raw PVE/LXC lines (e.g. lxc.cgroup2.devices.allow, lxc.mount.entry);

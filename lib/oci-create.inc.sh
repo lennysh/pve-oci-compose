@@ -31,7 +31,7 @@ Common options:
   --onboot 0|1          pct --onboot (default: 0)
   --arch ARCH           pct --arch (optional; e.g. amd64)
   --pool ID             pct --pool (Datacenter resource pool; must exist)
-  --mp SPEC             Repeatable: STORAGE:GiB:/path
+  --mp SPEC             Repeatable: STORAGE:GiB:/path or STORAGE:GiB:/path:opt1,opt2 (default backup=1)
   --mp-bind SPEC        Repeatable: bind mount value for pct --mpN (host path + options), e.g.
                         /mnt/pve/nfs,mp=/mnt/Media,shared=1,replicate=0,size=0T
   --lxc-line LINE       Repeatable: raw PVE/LXC config line appended after pct create (key: value
@@ -870,14 +870,25 @@ done
 
 mp_idx=0
 for mp_spec in "${MP_SPECS[@]}"; do
-  if [[ ! "$mp_spec" =~ ^([^:]+):([0-9]+(\.[0-9]+)?):(/.*)$ ]]; then
-    die "Invalid --mp '${mp_spec}' (expected STORAGE:SIZE:/path — absolute path inside CT; SIZE is GiB, integer or decimal e.g. 8 or 0.25)"
+  if [[ ! "$mp_spec" =~ ^([^:]+):([0-9]+(\.[0-9]+)?):(.*)$ ]]; then
+    die "Invalid --mp '${mp_spec}' (expected STORAGE:SIZE:/path or STORAGE:SIZE:/path:extra — SIZE is GiB; optional extra is comma-separated pct mp flags after mp=)"
   fi
   mp_st="${BASH_REMATCH[1]}"
   mp_sz="${BASH_REMATCH[2]}"
-  mp_path="${BASH_REMATCH[4]}"
+  mp_rest="${BASH_REMATCH[4]}"
   awk -v s="$mp_sz" 'BEGIN { exit !(s > 0) }' || die "Invalid --mp '${mp_spec}': size must be > 0"
-  cmd+=( "--mp${mp_idx}" "${mp_st}:${mp_sz},mp=${mp_path}" )
+  if [[ "$mp_rest" == *:* ]]; then
+    mp_path="${mp_rest%%:*}"
+    mp_extra="${mp_rest#*:}"
+  else
+    mp_path="$mp_rest"
+    mp_extra=""
+  fi
+  [[ -n "$mp_path" && "$mp_path" == /* ]] || die "Invalid --mp '${mp_spec}' (mount path inside CT must be a non-empty absolute path starting with /)"
+  mp_val="${mp_st}:${mp_sz},mp=${mp_path}"
+  [[ -n "$mp_extra" ]] && mp_val+=",${mp_extra}"
+  [[ "$mp_val" == *backup=* ]] || mp_val+=",backup=1"
+  cmd+=( "--mp${mp_idx}" "$mp_val" )
   mp_idx=$((mp_idx + 1))
 done
 for bind_spec in "${MP_BIND_SPECS[@]}"; do
@@ -887,7 +898,7 @@ for bind_spec in "${MP_BIND_SPECS[@]}"; do
   cmd+=( "--mp${mp_idx}" "$bind_spec" )
   mp_idx=$((mp_idx + 1))
 done
-unset mp_st mp_sz mp_path mp_spec 2>/dev/null || true
+unset mp_st mp_sz mp_path mp_spec mp_rest mp_extra mp_val 2>/dev/null || true
 
 for dev_if in $(printf '%s\n' "${!DEV_MAP[@]}" | sort -n); do
   cmd+=(--"dev${dev_if}" "${DEV_MAP[$dev_if]}")

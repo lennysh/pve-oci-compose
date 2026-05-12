@@ -143,7 +143,9 @@ services:
     # --- Node override & extra disks ---
     # node: pve
     # mounts:
-    #   - "local-zfs:0.25:/var/cache/nginx"
+    #   - "local-zfs:0.25:/var/cache/nginx"              # default ,backup=1 appended
+    #   - "Storage:0.1:/config:backup=1"                 # explicit (same as default)
+    #   - "Storage:0.1:/scratch:backup=0,replicate=0"   # opt out of vzdump for this mp
     # bind_mounts:
     #   - "/mnt/pve/nfs-media,mp=/mnt/Media01,replicate=0,shared=1,size=0T"
     # lxc_config_lines:
