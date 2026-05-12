@@ -80,6 +80,8 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   lxc_dev            list of pct --dev0 … device specs (order = list order)
   unused_disks       list of pct --unused0 … volume specs (advanced)
   mounts             list of strings "STORAGE:GiB:/path" passed as --mp to create
+  bind_mounts        optional list of strings: full pct mp value (host path + options), e.g.
+                     /mnt/pve/nfs-media,mp=/mnt/Media01,shared=1,replicate=0,size=0T → --mp-bind
   pool               optional; Datacenter resource pool id. Defaults to top-level name/project
                      (stack). Use pool: "" or pool: null in defaults to disable. Missing pools are
                      auto-created unless PVE_OCI_POOL_NO_AUTOCREATE=1.
@@ -207,6 +209,14 @@ validate_service() {
   case "$(jq -r '.about | if . == null then "ok" elif type == "string" then "ok" else "bad" end' <<<"$json")" in
     bad) die "service $svc: about must be a string if set" ;;
   esac
+  case "$(jq -r '.bind_mounts | if . == null then "ok" elif type == "array" then "ok" else "bad" end' <<<"$json")" in
+    bad) die "service $svc: bind_mounts must be a YAML list" ;;
+  esac
+  while IFS= read -r bm; do
+    [[ -z "$bm" ]] && continue
+    [[ "$bm" =~ ^/.+,mp= ]] \
+      || die "service $svc: each bind_mounts entry must start with '/' and contain ',mp=' (pct bind mount); got: ${bm:0:120}"
+  done < <(jq -r '.bind_mounts[]? | strings' <<<"$json")
 }
 
 validate_service_refresh() {
@@ -358,6 +368,12 @@ cmd_plan() {
       echo "=== service: $sname (vmid $vmid) ==="
       echo "  image (file):  $image"
       echo "  rootfs:        $rootfs"
+      if jq -e '(.mounts // []) | length > 0' <<<"$svc" >/dev/null 2>&1; then
+        echo "  mounts:        $(jq -r '(.mounts // []) | map(tostring) | join(" | ")' <<<"$svc")"
+      fi
+      if jq -e '(.bind_mounts // []) | length > 0' <<<"$svc" >/dev/null 2>&1; then
+        echo "  bind_mounts:   $(jq -r '(.bind_mounts // []) | map(tostring) | join(" | ")' <<<"$svc")"
+      fi
       echo "  plan apply:    would allocate next free vmid and create from $image"
       echo "  plan refresh:  n/a until vmid is fixed in the file (run apply to write it)"
       desc_preview="$(printf '%s' "$svc" | pve_oci_compose_pct_description "$stack" "$sa" "$(jq -c '.repo' <<<"$json")" 2>/dev/null || true)"
@@ -397,6 +413,12 @@ cmd_plan() {
     fi
     echo "  image (file):  $image"
     echo "  rootfs:        $rootfs"
+    if jq -e '(.mounts // []) | length > 0' <<<"$svc" >/dev/null 2>&1; then
+      echo "  mounts:        $(jq -r '(.mounts // []) | map(tostring) | join(" | ")' <<<"$svc")"
+    fi
+    if jq -e '(.bind_mounts // []) | length > 0' <<<"$svc" >/dev/null 2>&1; then
+      echo "  bind_mounts:   $(jq -r '(.bind_mounts // []) | map(tostring) | join(" | ")' <<<"$svc")"
+    fi
     ns_plan="$(jq -r '
       (.nameserver // empty)
       | if type == "array" then map(tostring) | join(", ")
@@ -620,6 +642,10 @@ fill_create_args() {
     [[ -z "$mp" ]] && continue
     OCI_CREATE_ARGS+=(--mp "$mp")
   done < <(jq -r '.mounts[]? | strings' <<<"$svcjson")
+  while IFS= read -r bm; do
+    [[ -z "$bm" ]] && continue
+    OCI_CREATE_ARGS+=(--mp-bind "$bm")
+  done < <(jq -r '.bind_mounts[]? | strings' <<<"$svcjson")
 }
 
 OCI_CREATE_ARGS=()

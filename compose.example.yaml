@@ -144,3 +144,5 @@ services:
     # node: pve
     # mounts:
     #   - "local-zfs:0.25:/var/cache/nginx"
+    # bind_mounts:
+    #   - "/mnt/pve/nfs-media,mp=/mnt/Media01,replicate=0,shared=1,size=0T"

@@ -112,7 +112,8 @@ The file is YAML with a single top-level mapping.
 | `lxc_dev` | optional | List of device specs → **`--dev0`**, **`--dev1`**, … in list order (see **`pct(1)`** / **`--dev[n]`**). |
 | `unused_disks` | optional | List of volume specs → **`--unused0`**, … (advanced; see Proxmox docs). |
 | `unprivileged`, `onboot` | optional | YAML booleans or integers; mapped to `pct` flags on create. |
-| `mounts` | optional | List of strings `STORAGE:GiB:/absolute/path` → `--mp` on create (extra CT volumes). |
+| `mounts` | optional | List of strings `STORAGE:GiB:/absolute/path-in-CT` → `--mp` on create (sized volumes). |
+| `bind_mounts` | optional | List of strings for host bind mounts: each entry is the full **`pct`** `mp` value (absolute **host** path, comma-separated options including **`mp=`** guest path), e.g. `/mnt/pve/nfs-media,mp=/mnt/Media01,shared=1,replicate=0,size=0T`. Passed as **`--mp-bind`** after **`mounts`** (indexes continue as **`mp0`**, **`mp1`**, …). Compose checks for `/` + `,mp=`; Proxmox still validates at **`pct create`**. |
 
 The Proxmox UI may show **`description`** as plain text; Markdown-style headings and bullets still read clearly when copy-pasted. Very long text can hit UI limits—keep secrets out of compose and out of the CT description.
 

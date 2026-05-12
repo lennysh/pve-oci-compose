@@ -32,6 +32,8 @@ Common options:
   --arch ARCH           pct --arch (optional; e.g. amd64)
   --pool ID             pct --pool (Datacenter resource pool; must exist)
   --mp SPEC             Repeatable: STORAGE:GiB:/path
+  --mp-bind SPEC        Repeatable: bind mount value for pct --mpN (host path + options), e.g.
+                        /mnt/pve/nfs,mp=/mnt/Media,shared=1,replicate=0,size=0T
   --entrypoint CMD      pct --entrypoint (OCI / init override)
   --env KEY=val         pct --env (repeatable; same form as pct(1))
   --description TEXT    pct --description
@@ -205,6 +207,7 @@ PULL_ONLY=0
 LIST_TEMPLATE_STORAGES=0
 STORAGE_JSON_CACHED=""
 MP_SPECS=()
+MP_BIND_SPECS=()
 
 declare -A NET_IFACE=()
 declare -A DEV_MAP=()
@@ -240,6 +243,7 @@ while [[ $# -gt 0 ]]; do
     --onboot)           ONBOOT="${2:?}"; shift 2 ;;
     --pool)             POOL="${2:?}"; shift 2 ;;
     --mp)               MP_SPECS+=("${2:?}"); shift 2 ;;
+    --mp-bind)          MP_BIND_SPECS+=("${2:?}"); shift 2 ;;
     --entrypoint)       ENTRYPOINT="${2:?}"; shift 2 ;;
     --env)              ENVS+=("${2:?}"); shift 2 ;;
     --description)      DESCRIPTION="${2:?}"; shift 2 ;;
@@ -815,6 +819,13 @@ for mp_spec in "${MP_SPECS[@]}"; do
   mp_path="${BASH_REMATCH[4]}"
   awk -v s="$mp_sz" 'BEGIN { exit !(s > 0) }' || die "Invalid --mp '${mp_spec}': size must be > 0"
   cmd+=( "--mp${mp_idx}" "${mp_st}:${mp_sz},mp=${mp_path}" )
+  mp_idx=$((mp_idx + 1))
+done
+for bind_spec in "${MP_BIND_SPECS[@]}"; do
+  if [[ ! "$bind_spec" =~ ^/.+,mp= ]]; then
+    die "Invalid --mp-bind '${bind_spec}' (expected absolute host path then comma-separated options including mp=…, e.g. /mnt/pve/nfs,mp=/mnt/Media,shared=1,size=0T)"
+  fi
+  cmd+=( "--mp${mp_idx}" "$bind_spec" )
   mp_idx=$((mp_idx + 1))
 done
 unset mp_st mp_sz mp_path mp_spec 2>/dev/null || true
