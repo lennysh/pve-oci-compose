@@ -37,7 +37,8 @@ Common options:
   --lxc-line LINE       Repeatable: raw PVE/LXC config line appended after pct create (key: value
                         or key = value), e.g. lxc.cgroup2.devices.allow: c 188:* rwm
   --entrypoint CMD      pct --entrypoint (OCI / init override)
-  --env KEY=val         pct --env (repeatable; combined into one NUL-separated --env for pct(1))
+  --env KEY=val         Repeatable KEY=value; applied after pct create as lxc.environment.runtime
+                        (Proxmox OCI unpack replaces pct --env from the image manifest — see README)
   --description TEXT    pct --description
   --tags TAGS           pct --tags (semicolon-separated; apply still merges pve-oci-compose sentinel after create)
   --timezone SPEC       pct --timezone (e.g. host or Europe/Berlin)
@@ -842,18 +843,6 @@ done
 cmd+=(--unprivileged "$UNPRIV" --onboot "$ONBOOT")
 
 [[ -n "$ENTRYPOINT" ]] && cmd+=(--entrypoint "$ENTRYPOINT")
-# pct(1) --env is one argument: NUL-separated KEY=value pairs (not multiple --env flags).
-if [[ "${#ENVS[@]}" -gt 0 ]]; then
-  local env_blob=""
-  for _ev in "${ENVS[@]}"; do
-    [[ -z "$_ev" ]] && continue
-    if [[ -n "$env_blob" ]]; then
-      env_blob+=$'\0'
-    fi
-    env_blob+="$_ev"
-  done
-  [[ -n "$env_blob" ]] && cmd+=(--env "$env_blob")
-fi
 
 [[ -n "$MEMORY" ]] && cmd+=(--memory "$MEMORY")
 [[ -n "$SWAP" ]] && cmd+=(--swap "$SWAP")
@@ -947,14 +936,28 @@ if [[ "$_pct_ec" -ne 0 ]]; then
 fi
 rm -f "$_pct_log"
 
-if [[ "${#LXC_LINE_SPECS[@]}" -gt 0 ]]; then
-  pve_oci_append_lxc_config_lines "$VMID" "${LXC_LINE_SPECS[@]}"
+# Compose --env: do not pass pct create --env for OCI vztmpl. Proxmox restore_oci_archive() sets
+# conf->{env} from the image Config.Env and overwrites create-time --env. Apply each pair as
+# lxc.environment.runtime (same representation PVE uses for env) so values survive and override
+# same-named image defaults when the guest honors later assignments.
+local -a _pve_oci_postcreate_lxc=()
+for _ev in "${ENVS[@]}"; do
+  [[ -z "$_ev" ]] && continue
+  [[ "$_ev" == *$'\n'* ]] && die "invalid --env (no newlines): ${_ev:0:120}"
+  [[ "$_ev" == *'='* ]] || die "invalid --env (expected KEY=value): ${_ev:0:120}"
+  [[ "${_ev%%=*}" != "" ]] || die "invalid --env (empty key before '='): ${_ev:0:120}"
+  _pve_oci_postcreate_lxc+=( "lxc.environment.runtime: ${_ev}" )
+done
+local _pve_oci_post_n=$(( ${#_pve_oci_postcreate_lxc[@]} + ${#LXC_LINE_SPECS[@]} ))
+if [[ "$_pve_oci_post_n" -gt 0 ]]; then
+  pve_oci_append_lxc_config_lines "$VMID" "${_pve_oci_postcreate_lxc[@]}" "${LXC_LINE_SPECS[@]}"
   if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
-    out_muted "Wrote ${#LXC_LINE_SPECS[@]} lxc_config_lines to /etc/pve/lxc/${VMID}.conf"
+    out_muted "Wrote ${_pve_oci_post_n} post-create LXC line(s) to /etc/pve/lxc/${VMID}.conf"
   else
-    out_sub "Appended ${#LXC_LINE_SPECS[@]} low-level line(s) to CT config (lxc_config_lines)"
+    out_sub "Appended ${_pve_oci_post_n} line(s) to CT config (compose env as lxc.environment.runtime and/or lxc_config_lines)"
   fi
 fi
+unset _ev _pve_oci_postcreate_lxc _pve_oci_post_n 2>/dev/null || true
 
 if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
   out_muted "Scratch CT ${VMID} ready (stopped) — used only as rsync source; will be destroyed."

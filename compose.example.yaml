@@ -61,7 +61,9 @@ services:
     # entrypoint: "/sbin/init"
     # entrypoint: '/usr/sbin/nginx -g "daemon off;"'
 
-    # --- Environment (pct --env: one NUL-separated KEY=value block; use env: or environment:) ---
+    # --- Environment (env: or environment:) ---
+    # For OCI vztmpl, Proxmox overwrites pct --env with the image Config.Env; pve-oci-compose instead
+    # appends each KEY=value as lxc.environment.runtime after pct create (with lxc_config_lines).
     # As a mapping (recommended):
     # env:
     #   NGINX_ENTRYPOINT_QUIET_LOGS: "1"
@@ -70,7 +72,7 @@ services:
     # env:
     #   - "FOO=bar"
     #   - "BAZ=qux"
-    # Single string (must already be NUL-separated KEY=value pairs if you pass several):
+    # Single string (one KEY=value, or your tooling’s convention if you pass multiple):
     # env: "MYVAR=value"
 
     # --- CPU / RAM tuning ---

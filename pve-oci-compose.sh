@@ -83,7 +83,8 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   bind_mounts        optional list of strings: full pct mp value (host path + options), e.g.
                      /mnt/pve/nfs-media,mp=/mnt/Media01,shared=1,replicate=0,size=0T → --mp-bind
   lxc_config_lines   optional list of raw PVE/LXC lines (e.g. lxc.cgroup2.devices.allow, lxc.mount.entry);
-                     written after pct create to /etc/pve/lxc/<vmid>.conf (new CT only — not on apply skip)
+                     written after pct create to /etc/pve/lxc/<vmid>.conf together with compose env
+                     (as lxc.environment.runtime lines for OCI; new CT only — not on apply skip)
   pool               optional; Datacenter resource pool id. Defaults to top-level name/project
                      (stack). Use pool: "" or pool: null in defaults to disable. Missing pools are
                      auto-created unless PVE_OCI_POOL_NO_AUTOCREATE=1.
