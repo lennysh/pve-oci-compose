@@ -71,7 +71,7 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   template_storage   vztmpl storage id for oci-registry-pull (optional; see create script)
   hostname, net0 … net7   pct --netN (any net keys net0, net1, …); default net0 if none set
   node, memory, swap, cores, cpulimit, cpuunits, ostype, arch, unprivileged, features, onboot
-  nameserver, searchdomain, entrypoint, env (map or list of KEY=val), description, guest_ports, about
+  nameserver, searchdomain, entrypoint, env or environment (map / list / string; see below), description, guest_ports, about
   tags (pct UI tags). Top-level about (string) is optional stack notes merged into the built description.
   Top-level repo: optional string URL for the Source footer (default https://github.com/lennysh/pve-oci-compose);
   use repo: false to omit that footer from composed descriptions.
@@ -550,9 +550,14 @@ fill_create_args() {
     [[ -z "$ev" ]] && continue
     OCI_CREATE_ARGS+=(--env "$ev")
   done < <(jq -r '
-    (.env // empty)
+    (.env // .environment // empty)
     | if type == "object" then to_entries[] | "\(.key)=\(.value | tostring)"
-      elif type == "array" then .[] | tostring
+      elif type == "array" then
+        .[]
+        | if type == "string" then .
+          elif type == "object" and (.name != null) and has("value") then "\(.name)=\(.value | tostring)"
+          elif type == "object" and (length == 1) then (. | to_entries[] | "\(.key)=\(.value | tostring)")
+          else empty end
       elif type == "string" then .
       else empty end
     ' <<<"$svcjson")

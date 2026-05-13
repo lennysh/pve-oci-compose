@@ -37,7 +37,7 @@ Common options:
   --lxc-line LINE       Repeatable: raw PVE/LXC config line appended after pct create (key: value
                         or key = value), e.g. lxc.cgroup2.devices.allow: c 188:* rwm
   --entrypoint CMD      pct --entrypoint (OCI / init override)
-  --env KEY=val         pct --env (repeatable; same form as pct(1))
+  --env KEY=val         pct --env (repeatable; combined into one NUL-separated --env for pct(1))
   --description TEXT    pct --description
   --tags TAGS           pct --tags (semicolon-separated; apply still merges pve-oci-compose sentinel after create)
   --timezone SPEC       pct --timezone (e.g. host or Europe/Berlin)
@@ -842,9 +842,18 @@ done
 cmd+=(--unprivileged "$UNPRIV" --onboot "$ONBOOT")
 
 [[ -n "$ENTRYPOINT" ]] && cmd+=(--entrypoint "$ENTRYPOINT")
-for _ev in "${ENVS[@]}"; do
-  cmd+=(--env "$_ev")
-done
+# pct(1) --env is one argument: NUL-separated KEY=value pairs (not multiple --env flags).
+if [[ "${#ENVS[@]}" -gt 0 ]]; then
+  local env_blob=""
+  for _ev in "${ENVS[@]}"; do
+    [[ -z "$_ev" ]] && continue
+    if [[ -n "$env_blob" ]]; then
+      env_blob+=$'\0'
+    fi
+    env_blob+="$_ev"
+  done
+  [[ -n "$env_blob" ]] && cmd+=(--env "$env_blob")
+fi
 
 [[ -n "$MEMORY" ]] && cmd+=(--memory "$MEMORY")
 [[ -n "$SWAP" ]] && cmd+=(--swap "$SWAP")

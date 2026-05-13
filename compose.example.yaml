@@ -61,7 +61,7 @@ services:
     # entrypoint: "/sbin/init"
     # entrypoint: '/usr/sbin/nginx -g "daemon off;"'
 
-    # --- Environment (pct --env, repeatable) ---
+    # --- Environment (pct --env: one NUL-separated KEY=value block; use env: or environment:) ---
     # As a mapping (recommended):
     # env:
     #   NGINX_ENTRYPOINT_QUIET_LOGS: "1"
@@ -70,7 +70,7 @@ services:
     # env:
     #   - "FOO=bar"
     #   - "BAZ=qux"
-    # Single string (passed through as one --env if you need a custom format):
+    # Single string (must already be NUL-separated KEY=value pairs if you pass several):
     # env: "MYVAR=value"
 
     # --- CPU / RAM tuning ---
