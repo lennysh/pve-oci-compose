@@ -380,14 +380,15 @@ print(json.dumps({"service": svc, "ref": ref}, separators=(",", ":"), ensure_asc
   printf '%s\n' "$blob" | pct exec "$vmid" -- sh -ec 'cat >"$1"' x "$mr" || return 1
 }
 
-# Merge compose KEY=value pairs onto env already on the CT (OCI image + prior pct config).
-# Uses pct set --env (NUL-separated); does not strip lxc.environment.runtime lines manually.
+# Merge compose KEY=value pairs onto env already on the CT (OCI image env from unpack).
+# Writes /etc/pve/lxc/<vmid>.conf directly: pct set --env needs embedded NUL bytes, which
+# Python 3.13+ subprocess (and POSIX argv) cannot pass; the on-disk env: line may contain NUL.
 pve_oci_pct_env_merge_set() {
   local vmid="$1"
   shift
   [[ $# -gt 0 ]] || return 0
   python3 - "$vmid" "$@" <<'PY'
-import subprocess, sys
+import pathlib, sys
 
 def parse_env_blob(blob):
     out = {}
@@ -403,7 +404,6 @@ def parse_env_blob(blob):
     return out
 
 def parse_runtime_line(line):
-    # lxc.environment.runtime: KEY=value
     _, _, rest = line.partition(":")
     rest = rest.strip()
     if not rest or "=" not in rest:
@@ -411,33 +411,54 @@ def parse_runtime_line(line):
     k, _, v = rest.partition("=")
     return (k, v) if k else (None, None)
 
-def read_pct_env(vmid):
-    r = subprocess.run(["pct", "config", vmid], capture_output=True, text=True)
-    if r.returncode != 0:
-        return {}
-    base = {}
-    for line in r.stdout.splitlines():
-        if line.startswith("env:"):
-            base = parse_env_blob(line[4:].lstrip())
-        elif line.startswith("lxc.environment.runtime:"):
-            k, v = parse_runtime_line(line)
-            if k:
-                base[k] = v
-    return base
+def is_env_line(line):
+    return line.startswith("env:") or line.startswith("lxc.environment.runtime:")
 
 vmid = sys.argv[1]
 compose_pairs = sys.argv[2:]
-base = read_pct_env(vmid)
+cfg = pathlib.Path(f"/etc/pve/lxc/{vmid}.conf")
+if not cfg.is_file():
+    sys.stderr.write(f"pve-oci-compose: CT config missing: {cfg}\n")
+    sys.exit(1)
+
+text = cfg.read_text(encoding="utf-8", errors="replace")
+lines = text.splitlines(keepends=True)
+body = []
+base = {}
+for line in lines:
+    raw = line.rstrip("\n")
+    if raw.startswith("env:"):
+        for k, v in parse_env_blob(raw[4:].lstrip()).items():
+            base[k] = v
+        continue
+    if raw.startswith("lxc.environment.runtime:"):
+        k, v = parse_runtime_line(raw)
+        if k:
+            base[k] = v
+        continue
+    body.append(line)
+
 for p in compose_pairs:
     if not p or "=" not in p:
         continue
     k, _, v = p.partition("=")
     if k:
         base[k] = v
+
 if not base:
     sys.exit(0)
-merged = "\0".join(f"{k}={v}" for k, v in base.items())
-subprocess.run(["pct", "set", vmid, "--env", merged], check=True)
+
+while body and body[-1].strip() == "":
+    body.pop()
+if body and not body[-1].endswith("\n"):
+    body[-1] = body[-1] + "\n"
+
+new_text = "".join(body)
+if new_text and not new_text.endswith("\n"):
+    new_text += "\n"
+new_text += "env: " + "\0".join(f"{k}={v}" for k, v in base.items()) + "\n"
+
+cfg.write_text(new_text, encoding="utf-8")
 PY
 }
 

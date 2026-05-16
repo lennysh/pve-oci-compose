@@ -948,12 +948,12 @@ for _ev in "${ENVS[@]}"; do
 done
 if [[ "${#_pve_oci_compose_env[@]}" -gt 0 ]]; then
   if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
-    out_muted "Merging ${#_pve_oci_compose_env[@]} compose env var(s) with image env (pct set --env)"
+    out_muted "Merging ${#_pve_oci_compose_env[@]} compose env var(s) with image env (CT config)"
   else
-    out_sub "Merge compose env with image env (pct set --env)"
+    out_sub "Merge compose env with image env (CT config)"
   fi
   pve_oci_pct_env_merge_set "$VMID" "${_pve_oci_compose_env[@]}" \
-    || die "pct set --env failed for CT ${VMID}"
+    || die "failed to merge env into CT ${VMID} config"
 fi
 if [[ "${#LXC_LINE_SPECS[@]}" -gt 0 ]]; then
   pve_oci_append_lxc_config_lines "$VMID" "${LXC_LINE_SPECS[@]}"
