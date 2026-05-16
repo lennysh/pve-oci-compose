@@ -88,8 +88,7 @@ Compose schema (per service; shallow merge from top-level "defaults"):
   bind_mounts        optional list of strings: full pct mp value (host path + options), e.g.
                      /mnt/pve/nfs-media,mp=/mnt/Media01,shared=1,replicate=0,size=0T → --mp-bind
   lxc_config_lines   optional list of raw PVE/LXC lines (e.g. lxc.cgroup2.devices.allow, lxc.mount.entry);
-                     written after pct create to /etc/pve/lxc/<vmid>.conf together with compose env
-                     (as lxc.environment.runtime lines for OCI; new CT only — not on apply skip)
+                     written after pct create to /etc/pve/lxc/<vmid>.conf (new CT only — not on apply skip)
   pool               optional; Datacenter resource pool id. Defaults to top-level name/project
                      (stack). Use pool: "" or pool: null in defaults to disable. Missing pools are
                      auto-created unless PVE_OCI_POOL_NO_AUTOCREATE=1.
@@ -162,6 +161,54 @@ if repo is not None and not isinstance(repo, (str, bool)):
     sys.stderr.write("pve-oci-compose: top-level 'repo' must be a string (URL), false, or omitted\n")
     sys.exit(1)
 
+
+def normalize_env_to_dict(val):
+    """YAML env / environment → flat dict (KEY → value string)."""
+    if val is None:
+        return {}
+    if isinstance(val, dict):
+        return {str(k): str(v) for k, v in val.items()}
+    if isinstance(val, str):
+        if "=" in val:
+            k, _, v = val.partition("=")
+            return {k: v} if k else {}
+        return {}
+    if isinstance(val, list):
+        out = {}
+        for item in val:
+            if isinstance(item, str) and "=" in item:
+                k, _, v = item.partition("=")
+                if k:
+                    out[k] = v
+            elif isinstance(item, dict):
+                if item.get("name") is not None and "value" in item:
+                    out[str(item["name"])] = str(item["value"])
+                elif len(item) == 1:
+                    k, v = next(iter(item.items()))
+                    out[str(k)] = str(v)
+        return out
+    return {}
+
+
+def env_from_mapping(m):
+    """Collect env + environment from a service/defaults mapping into one dict."""
+    out = {}
+    out.update(normalize_env_to_dict(m.get("environment")))
+    out.update(normalize_env_to_dict(m.get("env")))
+    return out
+
+
+def merge_service(defaults, svc):
+    merged = {**defaults, **svc}
+    denv = env_from_mapping(defaults)
+    senv = env_from_mapping(svc)
+    if denv or senv:
+        merged_env = {**denv, **senv}
+        merged["env"] = merged_env
+        merged.pop("environment", None)
+    return merged
+
+
 out = {
     "project": doc.get("name") or doc.get("project"),
     "stack_about": stack_about,
@@ -174,7 +221,7 @@ for sname, svc in services.items():
     if not isinstance(svc, dict):
         sys.stderr.write(f"pve-oci-compose: service {sname!r} must be a mapping\n")
         sys.exit(1)
-    merged = {**defaults, **svc}
+    merged = merge_service(defaults, svc)
     merged["_service"] = sname
     out["services"][sname] = merged
 

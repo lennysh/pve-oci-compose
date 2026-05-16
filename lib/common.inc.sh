@@ -380,6 +380,67 @@ print(json.dumps({"service": svc, "ref": ref}, separators=(",", ":"), ensure_asc
   printf '%s\n' "$blob" | pct exec "$vmid" -- sh -ec 'cat >"$1"' x "$mr" || return 1
 }
 
+# Merge compose KEY=value pairs onto env already on the CT (OCI image + prior pct config).
+# Uses pct set --env (NUL-separated); does not strip lxc.environment.runtime lines manually.
+pve_oci_pct_env_merge_set() {
+  local vmid="$1"
+  shift
+  [[ $# -gt 0 ]] || return 0
+  python3 - "$vmid" "$@" <<'PY'
+import subprocess, sys
+
+def parse_env_blob(blob):
+    out = {}
+    if not blob:
+        return out
+    for part in blob.split("\0"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        if k:
+            out[k] = v
+    return out
+
+def parse_runtime_line(line):
+    # lxc.environment.runtime: KEY=value
+    _, _, rest = line.partition(":")
+    rest = rest.strip()
+    if not rest or "=" not in rest:
+        return None, None
+    k, _, v = rest.partition("=")
+    return (k, v) if k else (None, None)
+
+def read_pct_env(vmid):
+    r = subprocess.run(["pct", "config", vmid], capture_output=True, text=True)
+    if r.returncode != 0:
+        return {}
+    base = {}
+    for line in r.stdout.splitlines():
+        if line.startswith("env:"):
+            base = parse_env_blob(line[4:].lstrip())
+        elif line.startswith("lxc.environment.runtime:"):
+            k, v = parse_runtime_line(line)
+            if k:
+                base[k] = v
+    return base
+
+vmid = sys.argv[1]
+compose_pairs = sys.argv[2:]
+base = read_pct_env(vmid)
+for p in compose_pairs:
+    if not p or "=" not in p:
+        continue
+    k, _, v = p.partition("=")
+    if k:
+        base[k] = v
+if not base:
+    sys.exit(0)
+merged = "\0".join(f"{k}={v}" for k, v in base.items())
+subprocess.run(["pct", "set", vmid, "--env", merged], check=True)
+PY
+}
+
 # --- Proxmox CT description (Markdown from compose) -------------------------
 # stdin: one merged service object (JSON). argv1: stack label; argv2: optional stack-level about.
 # argv3: JSON for compose "repo" key (null = default footer URL, false = no footer, string = URL).

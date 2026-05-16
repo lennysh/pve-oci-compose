@@ -37,8 +37,8 @@ Common options:
   --lxc-line LINE       Repeatable: raw PVE/LXC config line appended after pct create (key: value
                         or key = value), e.g. lxc.cgroup2.devices.allow: c 188:* rwm
   --entrypoint CMD      pct --entrypoint (OCI / init override)
-  --env KEY=val         Repeatable KEY=value; applied after pct create as lxc.environment.runtime
-                        (Proxmox OCI unpack replaces pct --env from the image manifest — see README)
+  --env KEY=val         Repeatable KEY=value; after pct create merged with image env via pct set --env
+                        (Proxmox OCI unpack sets env from the image — compose adds/overrides keys)
   --description TEXT    pct --description
   --tags TAGS           pct --tags (semicolon-separated; apply still merges pve-oci-compose sentinel after create)
   --timezone SPEC       pct --timezone (e.g. host or Europe/Berlin)
@@ -120,12 +120,10 @@ pve_oci_append_lxc_config_lines() {
   done
   tmp="$(mktemp "${TMPDIR:-/tmp}/pve-oci-lxc-lines.XXXXXX")" || die "mktemp failed"
   # Strip legacy # BEGIN/END comment blocks (Proxmox shows # lines from .conf in the CT Notes UI).
-  # Also drop prior compose-managed lxc.environment.runtime lines on re-append (destroy + re-apply).
   awk '
     /^# BEGIN pve-oci-compose lxc_config_lines$/ { skip=1; next }
     /^# END pve-oci-compose lxc_config_lines$/ { skip=0; next }
-    /^[[:space:]]*lxc\.environment\.runtime:/ { next }
-    { print }
+    !skip { print }
   ' "$cfg" >"$tmp" || {
     rm -f "$tmp"
     die "failed to read ${cfg}"
@@ -938,28 +936,34 @@ if [[ "$_pct_ec" -ne 0 ]]; then
 fi
 rm -f "$_pct_log"
 
-# Compose --env: do not pass pct create --env for OCI vztmpl. Proxmox restore_oci_archive() sets
-# conf->{env} from the image Config.Env and overwrites create-time --env. Apply each pair as
-# lxc.environment.runtime (same representation PVE uses for env) so values survive and override
-# same-named image defaults when the guest honors later assignments.
-local -a _pve_oci_postcreate_lxc=()
+# Compose --env: do not pass pct create --env for OCI vztmpl (unpack sets image env on the CT).
+# Merge compose pairs onto that via pct set --env so image + defaults + service keys all remain.
+local -a _pve_oci_compose_env=()
 for _ev in "${ENVS[@]}"; do
   [[ -z "$_ev" ]] && continue
   [[ "$_ev" == *$'\n'* ]] && die "invalid --env (no newlines): ${_ev:0:120}"
   [[ "$_ev" == *'='* ]] || die "invalid --env (expected KEY=value): ${_ev:0:120}"
   [[ "${_ev%%=*}" != "" ]] || die "invalid --env (empty key before '='): ${_ev:0:120}"
-  _pve_oci_postcreate_lxc+=( "lxc.environment.runtime: ${_ev}" )
+  _pve_oci_compose_env+=( "$_ev" )
 done
-local _pve_oci_post_n=$(( ${#_pve_oci_postcreate_lxc[@]} + ${#LXC_LINE_SPECS[@]} ))
-if [[ "$_pve_oci_post_n" -gt 0 ]]; then
-  pve_oci_append_lxc_config_lines "$VMID" "${_pve_oci_postcreate_lxc[@]}" "${LXC_LINE_SPECS[@]}"
+if [[ "${#_pve_oci_compose_env[@]}" -gt 0 ]]; then
   if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
-    out_muted "Wrote ${_pve_oci_post_n} post-create LXC line(s) to /etc/pve/lxc/${VMID}.conf"
+    out_muted "Merging ${#_pve_oci_compose_env[@]} compose env var(s) with image env (pct set --env)"
   else
-    out_sub "Appended ${_pve_oci_post_n} line(s) to CT config (compose env as lxc.environment.runtime and/or lxc_config_lines)"
+    out_sub "Merge compose env with image env (pct set --env)"
+  fi
+  pve_oci_pct_env_merge_set "$VMID" "${_pve_oci_compose_env[@]}" \
+    || die "pct set --env failed for CT ${VMID}"
+fi
+if [[ "${#LXC_LINE_SPECS[@]}" -gt 0 ]]; then
+  pve_oci_append_lxc_config_lines "$VMID" "${LXC_LINE_SPECS[@]}"
+  if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
+    out_muted "Wrote ${#LXC_LINE_SPECS[@]} lxc_config_lines to /etc/pve/lxc/${VMID}.conf"
+  else
+    out_sub "Appended ${#LXC_LINE_SPECS[@]} lxc_config_lines to CT config"
   fi
 fi
-unset _ev _pve_oci_postcreate_lxc _pve_oci_post_n 2>/dev/null || true
+unset _ev _pve_oci_compose_env 2>/dev/null || true
 
 if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
   out_muted "Scratch CT ${VMID} ready (stopped) — used only as rsync source; will be destroyed."

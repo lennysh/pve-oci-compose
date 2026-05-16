@@ -1,7 +1,8 @@
 # Example compose file for pve-oci-compose (YAML).
 # Requires: python3 + PyYAML (on PVE: apt install python3-yaml)
 #
-# Top-level "defaults" are shallow-merged into each service (service keys win).
+# Top-level "defaults" are shallow-merged into each service (service keys win), except
+# env/environment mappings which are deep-merged (service keys override defaults on conflict).
 #
 # Optional top-level **about:** (multiline string) is merged into the Proxmox **Notes** section of
 # the composed CT **description** for every service that opts into the rich description (see
@@ -62,8 +63,8 @@ services:
     # entrypoint: '/usr/sbin/nginx -g "daemon off;"'
 
     # --- Environment (env: or environment:) ---
-    # For OCI vztmpl, Proxmox overwrites pct --env with the image Config.Env; pve-oci-compose instead
-    # appends each KEY=value as lxc.environment.runtime after pct create (with lxc_config_lines).
+    # For OCI vztmpl, the image Config.Env is kept; pve-oci-compose merges compose env on top via
+    # pct set --env after pct create (defaults env + service env; service wins on duplicate keys).
     # As a mapping (recommended):
     # env:
     #   NGINX_ENTRYPOINT_QUIET_LOGS: "1"
