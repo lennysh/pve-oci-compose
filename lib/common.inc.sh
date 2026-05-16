@@ -475,11 +475,14 @@ def format_guest_ports(gp):
 
 port_lines = format_guest_ports(svc.get("guest_ports"))
 compose_triggers = bool(port_lines or about_text)
+has_img = bool(img)
 
-if not body_user and not compose_triggers:
+# Nothing to put in pct --description.
+if not body_user and not compose_triggers and not has_img:
     sys.exit(0)
 
-if not compose_triggers:
+# User description only (no guest_ports / about / stack about): pass through verbatim.
+if body_user and not compose_triggers:
     sys.stdout.write(body_user.rstrip() + "\n")
     sys.exit(0)
 
@@ -538,10 +541,20 @@ sys.stdout.write("\n".join(lines).rstrip() + "\n")
 # holds the ref actually pulled (skopeo-resolved :latest, etc.); pve-oci-compose calls finalize → pct set.
 pve_oci_compose_description_needs_runtime_meta() {
   local svc="$1" sa="${2:-}"
+  # After pull: refresh Image (pulled) + Template sync. Skip when the user set only a verbatim description:.
   jq -e --arg sa "$sa" '
-    ((.guest_ports // []) | length > 0)
-    or ((.about | type) == "string" and (.about | length > 0))
-    or (($sa | length > 0))
+    def has_img:
+      ((.image // .reference) | type) == "string" and ((.image // .reference) | length) > 0;
+    def user_desc_only:
+      (.description | type) == "string" and (.description | length > 0)
+      and ((.guest_ports // []) | length == 0)
+      and ((.about // "") | length == 0)
+      and ($sa | length == 0);
+    def rich:
+      ((.guest_ports // []) | length > 0)
+      or ((.about | type) == "string" and (.about | length > 0))
+      or ($sa | length > 0);
+    rich or (has_img and (user_desc_only | not))
   ' <<<"$svc" >/dev/null 2>&1
 }
 

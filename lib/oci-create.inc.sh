@@ -119,10 +119,13 @@ pve_oci_append_lxc_config_lines() {
       || die "invalid --lxc-line (expected KEY: value or KEY = value; no snapshot [section] lines): ${line:0:120}"
   done
   tmp="$(mktemp "${TMPDIR:-/tmp}/pve-oci-lxc-lines.XXXXXX")" || die "mktemp failed"
+  # Strip legacy # BEGIN/END comment blocks (Proxmox shows # lines from .conf in the CT Notes UI).
+  # Also drop prior compose-managed lxc.environment.runtime lines on re-append (destroy + re-apply).
   awk '
     /^# BEGIN pve-oci-compose lxc_config_lines$/ { skip=1; next }
     /^# END pve-oci-compose lxc_config_lines$/ { skip=0; next }
-    !skip { print }
+    /^[[:space:]]*lxc\.environment\.runtime:/ { next }
+    { print }
   ' "$cfg" >"$tmp" || {
     rm -f "$tmp"
     die "failed to read ${cfg}"
@@ -133,11 +136,9 @@ pve_oci_append_lxc_config_lines() {
   }
   {
     cat "$tmp"
-    echo "# BEGIN pve-oci-compose lxc_config_lines"
     for line in "$@"; do
       printf '%s\n' "$line"
     done
-    echo "# END pve-oci-compose lxc_config_lines"
   } >"$newf" || {
     rm -f "$tmp" "$newf"
     die "write failed (${cfg})"
