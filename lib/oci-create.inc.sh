@@ -142,11 +142,12 @@ pve_oci_append_lxc_config_lines() {
     rm -f "$tmp" "$newf"
     die "write failed (${cfg})"
   }
-  mv -f "$newf" "$cfg" || {
+  # pmxcfs (/etc/pve/…): GNU mv warns or fails on --preserve for ownership/mode; overwrite in place.
+  if ! cat "$newf" >"$cfg"; then
     rm -f "$tmp" "$newf"
-    die "mv to ${cfg} failed"
-  }
-  rm -f "$tmp"
+    die "failed to write ${cfg}"
+  fi
+  rm -f "$tmp" "$newf"
 }
 
 _oci_validate_lxc_config_line() {
