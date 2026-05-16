@@ -17,6 +17,8 @@ source "${SCRIPT_DIR}/lib/oci-refresh.inc.sh"
 COMPOSE_FILE="${COMPOSE_FILE:-${PWD}/compose.yaml}"
 ADOPT=0
 FORCE_REFRESH=0
+REFRESH_NO_SNAPSHOT=0
+REFRESH_ALLOW_FAILED_SNAPSHOT=0
 DRY_RUN=0
 WRITE_COMPOSE_VMID=1
 
@@ -37,6 +39,9 @@ Options:
                     marker file + sentinel tag applied after success. Path: see
                     PVE_OCI_ROOTFS_MARKER (default /etc/pve-oci-compose.json).
   --force           refresh: run refresh even when stored ref matches compose image.
+  --no-snapshot     refresh: skip pct snapshot before rootfs sync (see lib/oci-refresh.inc.sh).
+  --allow-failed-snapshot
+                    refresh: try pct snapshot but continue if it fails (default: abort).
   -n, --dry-run     Print commands only (apply / refresh / pull).
   --no-write-compose After apply with vmid: next (or auto / null), do not rewrite the compose
                     file with the allocated id (default is to update the YAML).
@@ -784,6 +789,7 @@ cmd_apply() {
 
 cmd_refresh() {
   local json sname svc vmid image merged stored ts stack effpool sa rj compose_node me adopt_ex
+  local -a refresh_args
   json="$(compose_json)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
@@ -835,7 +841,10 @@ cmd_refresh() {
     fi
 
     echo "refresh: [$sname] vmid $vmid → $image"
-    run_or_print oci_refresh_main "$vmid" "$image"
+    refresh_args=()
+    [[ "$REFRESH_NO_SNAPSHOT" -eq 1 ]] && refresh_args+=(--no-snapshot)
+    [[ "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 ]] && refresh_args+=(--allow-failed-snapshot)
+    run_or_print oci_refresh_main "${refresh_args[@]}" "$vmid" "$image"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
       merged="$(pve_oci_tags_merge_sentinel_only "$(pve_oci_pct_tags "$vmid")")"
@@ -887,21 +896,38 @@ while [[ $# -gt 0 ]]; do
     -f|--file)       COMPOSE_FILE="${2:?}"; shift 2 ;;
     --adopt)         ADOPT=1; shift ;;
     --force)         FORCE_REFRESH=1; shift ;;
+    --no-snapshot)   REFRESH_NO_SNAPSHOT=1; shift ;;
+    --allow-failed-snapshot) REFRESH_ALLOW_FAILED_SNAPSHOT=1; shift ;;
     -n|--dry-run)    DRY_RUN=1; shift ;;
     --no-write-compose) WRITE_COMPOSE_VMID=0; shift ;;
     -h|--help)       usage ;;
     -*)
       die "unknown option: $1"
       ;;
-    *)
-      [[ -z "$CMD" ]] || die "extra argument: $1"
+    plan|apply|refresh|pull)
+      [[ -n "$CMD" ]] && die "extra argument: $1"
       CMD="$1"
       shift
+      ;;
+    *)
+      die "extra argument: $1"
       ;;
   esac
 done
 
 [[ -n "$CMD" ]] || usage
+
+if [[ "$REFRESH_NO_SNAPSHOT" -eq 1 && "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 ]]; then
+  die "cannot combine --no-snapshot with --allow-failed-snapshot"
+fi
+if [[ "$CMD" != refresh ]]; then
+  if [[ "$REFRESH_NO_SNAPSHOT" -eq 1 || "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 ]]; then
+    die "--no-snapshot and --allow-failed-snapshot are only valid with refresh"
+  fi
+  if [[ "$ADOPT" -eq 1 || "$FORCE_REFRESH" -eq 1 ]]; then
+    die "--adopt and --force are only valid with refresh"
+  fi
+fi
 
 case "$CMD" in
   plan)

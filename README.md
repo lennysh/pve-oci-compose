@@ -63,7 +63,7 @@ Typical flow:
 ./pve-oci-compose.sh refresh         # rootfs sync when image ref changed
 ```
 
-Override the compose path:
+Override the compose path (`-f` / `--file`, or env **`COMPOSE_FILE`**; default **`./compose.yaml`** in the current directory):
 
 ```bash
 ./pve-oci-compose.sh -f /path/to/compose.yaml plan
@@ -133,15 +133,54 @@ See **`compose.example.yaml`**: a minimal working service plus **long commented 
 | **refresh** | If compose **`image`** ≠ stored **`ref`** ( **`--force`** always), refresh rootfs then reconcile tag + JSON. Existence uses **`pct config`** or, when that fails on a cluster member, **`pvesh`** on the hosting node ( **`/cluster/resources`** ) and your compose **`node:`** hint; if the CT is on another member, the tool tells you to re-run refresh there (**`pct mount`** is local to the host that holds the rootfs). |
 | **pull** | For each service, run the create script with **`--pull-only`** (and your `template_storage` / `image`). |
 
-### Flags
+### CLI options
+
+Global options may appear **before or after** the command (`plan`, `apply`, `refresh`, `pull`), e.g. `./pve-oci-compose.sh -f compose.yaml refresh --no-snapshot`.
+
+| Option | Commands | Meaning |
+|--------|----------|--------|
+| `-f`, `--file PATH` | all | Compose file path. Default: **`./compose.yaml`** in the current directory, or **`$COMPOSE_FILE`** if set. |
+| `-n`, `--dry-run` | apply, refresh, pull | Print worker invocations (`DRY-RUN: …`); do not run them. **plan** is always read-only. |
+| `--no-write-compose` | apply | After **apply** with `vmid: next` / `auto` / `null`, do not rewrite the compose file with the allocated id. Same as **`PVE_OCI_COMPOSE_NO_WRITE=1`**. |
+| `--adopt` | refresh | Refresh a CT that has **no readable guest marker JSON** yet (hand-created / UI OCI guest). After a successful refresh, writes the marker file and merges the **`pve-oci-compose`** sentinel tag. Does **not** make **apply** create over an unmanaged CT. |
+| `--force` | refresh | Run refresh even when the stored **`ref`** in the guest marker already matches the compose **`image`**. |
+| `--no-snapshot` | refresh | Skip **`pct snapshot`** before rootfs sync. |
+| `--allow-failed-snapshot` | refresh | Try **`pct snapshot`** but continue if it fails (default: abort on snapshot failure). Cannot be combined with **`--no-snapshot`**. |
+| `-h`, `--help` | — | Print usage (compose schema summary + options) and exit. |
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| **`COMPOSE_FILE`** | Default compose path when **`-f`** is not passed (see above). |
+| **`PVE_OCI_COMPOSE_NO_WRITE=1`** | Same as **`--no-write-compose`** (skip vmid writeback after **apply**). |
+| **`PVE_OCI_ROOTFS_MARKER`** | Path inside the CT rootfs for the JSON marker (default **`/etc/pve-oci-compose.json`**). |
+| **`PVE_OCI_POOL_NO_AUTOCREATE=1`** | Do not auto-create missing Datacenter resource pools; pool must exist before **apply** / **refresh**. |
+| **`PVE_OCI_VERBOSE=1`** | Show dim hints and full **`pct`** / **`skopeo`** command lines during **apply** / **pull** / **refresh** (`lib/ui.inc.sh`). |
+| **`PVE_OCI_COMPOSE_TASK_DEBUG=1`** | During **`oci-registry-pull`**, print a short JSON preview on each task poll (stderr) if the UPID status poll looks empty. |
+| **`PVE_OCI_CREATE_QUIET=1`** | Set internally during **refresh** temp-CT create; fewer banners. Rarely set by hand. |
+| **`OCI_CT_CREATE_NET0`** | Default **`pct --net0`** when compose sets no **`netN`** keys (default: `name=eth0,bridge=vmbr0,ip=dhcp`). |
+| **`OCI_CT_CREATE_NO_RESOLVE_LATEST=1`** | Skip **`skopeo`** resolution of floating **`:latest`** / **`*_latest`** refs before pull (use the compose string as-is). |
+| **`OCI_REFRESH_TEMPLATE_STORAGE`** | Vztmpl storage id for **refresh** temp-CT pulls when a node has multiple template stores. **refresh** from compose sets this from **`template_storage`** / **`storage`** per service; set manually only for direct **`oci_refresh_main`** calls. |
+
+### Advanced: inlined workers (`lib/*.inc.sh`)
+
+The compose driver calls **`oci_create_main`** and **`oci_refresh_main`**; you normally do not invoke them directly. For debugging or one-off use on the node (after sourcing the same **`lib/`** layout as **`pve-oci-compose.sh`**):
+
+**Create / pull** (`oci_create_main`):
 
 | Flag | Meaning |
 |------|--------|
-| `-f`, `--file PATH` | Compose file (default `./compose.yaml`). |
-| `--adopt` | **refresh** only: allow refreshing when guest marker JSON is missing/unreadable (**e.g.** hand-created CT). |
-| `--force` | **refresh** only: run refresh even when the stored ref already matches the compose image. |
-| `-n`, `--dry-run` | Print worker invocations; do not run them (**apply**, **refresh**, **pull**). |
-| `--no-write-compose` | After **apply** with `vmid: next` / `auto` / `null`, do not rewrite the compose file (same as **`PVE_OCI_COMPOSE_NO_WRITE=1`**). |
+| `--reference REF` | OCI image reference (required unless listing storages). |
+| `--rootfs SPEC` | New CT root disk **`STORAGE:GiB`** (required for create, not for **`--pull-only`**). |
+| `--storage ID` | Vztmpl storage for **`oci-registry-pull`**; omit to auto-pick when exactly one candidate exists. |
+| `--pull-only` | Pull template only (what **`pve-oci-compose.sh pull`** uses). |
+| `--skip-pull` | Skip **`oci-registry-pull`** (use existing vztmpl on storage). |
+| `--reuse-local-template` | Reuse existing normalized **`.tar`** if present. |
+| `--list-template-storages` | List vztmpl-capable storages on this node; exit 0. |
+| `--vmid` … `--mp-bind`, `--lxc-line`, … | Same **`pct create`** surface as compose fields (see **`oci_create_usage`** in **`lib/oci-create.inc.sh`**). |
+
+**Refresh** (`oci_refresh_main OLD_VMID NEW_REF [TEMP_VMID]`): same **`--no-snapshot`** / **`--allow-failed-snapshot`** flags as **`pve-oci-compose.sh refresh`** (must appear before positional args when calling **`oci_refresh_main`** directly). Optional third argument: temp CT vmid (default: cluster next free id).
 
 ## Compose marker (UI + drift + snapshots)
 
@@ -159,12 +198,12 @@ Use **pinned tags or digests** in compose when you care about exactly when a ref
 - **OCI pull “Waiting for pull task …”** polls `pvesh get /nodes/<node>/tasks/<UPID>/status`. UPIDs contain colons—the tool **URL-encodes** the UPID for that path and **retries** with the raw UPID if the first response is empty. If a pull still hangs after the task logged OK in the UI, verify **`jq`** and run with **`PVE_OCI_COMPOSE_TASK_DEBUG=1`** so each poll prints a short JSON preview on stderr.
 - **Entrypoint**: **`pct` `entrypoint`** lives in **`/etc/pve/lxc/<vmid>.conf`**, not in the root disk. After **`refresh`**, that value is synced from the temp CT built from the new image (or **`--delete entrypoint`** if the new template has none). Other config keys (**`ostype`**, **`features`**, …) stay as they were unless you extend the tool.
 - **Why a scratch CT for refresh:** Proxmox turns an OCI template into a runnable root tree via **`pct create`** (unpack + metadata). There is no supported one-step “re-unpack this vztmpl **onto** an existing CT’s root volume in place.” Alternatives would be hand-unpacking the **`.tar`** to a directory and **`rsync`** (still scratch space + you must mirror whatever **`pct create`** does), or a second volume you swap in (**ZFS** dataset replace, etc.)—more moving parts. The temp VMID is only a **read source** for **`rsync`**; **`PVE_OCI_CREATE_QUIET=1`** trims duplicate create-style banners so logs read as “refresh,” not “go start this CT.”
-- **Stateful data**: keep long-lived data on **`mp`** volumes or bind mounts, not only on rootfs—the refresh worker replaces the root tree (see the refresh script README for details).
+- **Stateful data**: keep long-lived data on **`mp`** volumes or bind mounts, not only on rootfs—the refresh worker replaces the root tree (see **`lib/oci-refresh.inc.sh`** and the **Advanced** section above for snapshot flags).
 - **Snapshots / backups**: refresh uses the worker’s snapshot behaviour; production DR is still **vzdump** / PBS / your policy—not replaced by this tool.
 - **Clusters**: run **refresh** on the node that owns the CT (**`pct mount`** / **`rsync`** need local storage). If you run it elsewhere, the driver resolves the guest via the API (and **`node:`** in compose) and errors with the hosting node name instead of “vmid does not exist.”
 
 ## Help
 
 ```bash
-./pve-oci-compose.sh --help
+./pve-oci-compose.sh --help    # same as -h; prints options + compose schema summary
 ```
