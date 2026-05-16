@@ -213,6 +213,7 @@ out = {
     "project": doc.get("name") or doc.get("project"),
     "stack_about": stack_about,
     "repo": repo,
+    "service_order": [],
     "services": {},
 }
 for sname, svc in services.items():
@@ -224,6 +225,7 @@ for sname, svc in services.items():
     merged = merge_service(defaults, svc)
     merged["_service"] = sname
     out["services"][sname] = merged
+    out["service_order"].append(sname)
 
 print(json.dumps(out))
 PY
@@ -556,7 +558,7 @@ cmd_plan() {
       echo "  plan refresh:  n/a (CT missing)"
     fi
     echo
-  done < <(jq -r '.services | keys[]' <<<"$json")
+  done < <(jq -r '.service_order[]' <<<"$json")
 }
 
 fill_create_args() {
@@ -831,7 +833,7 @@ cmd_apply() {
         echo "apply: [$sname] vmid was 'next' — set vmid: $resolved in $COMPOSE_FILE (or re-run apply without --no-write-compose)"
       fi
     fi
-  done < <(jq -r '.services | keys[]' <<<"$json")
+  done < <(jq -r '.service_order[]' <<<"$json")
 }
 
 cmd_refresh() {
@@ -916,7 +918,7 @@ cmd_refresh() {
         echo "refresh: [$sname] pool membership → ${effpool}"
       fi
     fi
-  done < <(jq -r '.services | keys[]' <<<"$json")
+  done < <(jq -r '.service_order[]' <<<"$json")
 }
 
 cmd_pull() {
@@ -932,7 +934,7 @@ cmd_pull() {
     pull_args=(--pull-only --reference "$ref")
     [[ -n "$ts" ]] && pull_args=(--storage "$ts" "${pull_args[@]}")
     run_or_print oci_create_main "${pull_args[@]}"
-  done < <(jq -r '.services | keys[]' <<<"$json")
+  done < <(jq -r '.service_order[]' <<<"$json")
 }
 
 CMD=""

@@ -85,7 +85,7 @@ The file is YAML with a single top-level mapping.
 - **`about`** (optional): multiline string appended under **Notes** in the **composed** Proxmox CT description (see below) for services that use **`guest_ports`** or **`about`**; combined with each service’s own **`about`** (stack text first).
 - **`repo`** (optional): controls the **Source** link at the bottom of composed CT descriptions. Omit or **`null`** → default [lennysh/pve-oci-compose](https://github.com/lennysh/pve-oci-compose). Set a **string** (URL) to point elsewhere (forks / internal docs). Set **`false`** to omit that footer entirely.
 - **`defaults`** (optional): mapping shallow-merged into **each** service; any key on a service overrides `defaults`. Exception: **`env`** / **`environment`** mappings are **deep-merged** (service keys override `defaults` on the same variable name).
-- **`services`** (required): mapping of **service name** → **service spec** (use stable names; stored inside the CT marker JSON plus the **`pve-oci-compose`** tag).
+- **`services`** (required): mapping of **service name** → **service spec** (use stable names; stored inside the CT marker JSON plus the **`pve-oci-compose`** tag). **plan** / **apply** / **refresh** / **pull** run services in **YAML file order** (not alphabetical).
 
 ### Per-service fields
 
