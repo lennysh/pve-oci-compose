@@ -442,7 +442,9 @@ compose_validate_service_filter() {
   local json="$1"
   local sname svc spec n=0 match_name match_spec=""
   [[ -n "$FILTER_SERVICE" || -n "$FILTER_VMID" ]] || return 0
-  [[ "$FILTER_VMID" =~ ^[0-9]+$ ]] || die "--vmid must be a numeric CT VMID (got: $FILTER_VMID)"
+  if [[ -n "$FILTER_VMID" ]]; then
+    [[ "$FILTER_VMID" =~ ^[0-9]+$ ]] || die "--vmid must be a numeric CT VMID (got: $FILTER_VMID)"
+  fi
 
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
