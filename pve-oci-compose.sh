@@ -21,6 +21,8 @@ REFRESH_NO_SNAPSHOT=0
 REFRESH_ALLOW_FAILED_SNAPSHOT=0
 DRY_RUN=0
 WRITE_COMPOSE_VMID=1
+FILTER_SERVICE=""
+FILTER_VMID=""
 
 usage() {
   cat <<'EOF'
@@ -43,6 +45,9 @@ Options:
   --allow-failed-snapshot
                     refresh: try pct snapshot but continue if it fails (default: abort).
   -n, --dry-run     Print commands only (apply / refresh / pull).
+  --service NAME    plan / apply / refresh / pull: run only this services: key (YAML order ignored).
+  --vmid ID         plan / apply / refresh / pull: run only the service with this numeric vmid.
+                    Combine with --service only when both refer to the same service.
   --no-write-compose After apply with vmid: next (or auto / null), do not rewrite the compose
                     file with the allocated id (default is to update the YAML).
 
@@ -416,6 +421,68 @@ run_or_print() {
   fi
 }
 
+# True when service sname/svcjson should run under --service / --vmid filters.
+compose_service_matches_filter() {
+  local sname="$1" svcjson="$2"
+  local spec
+  [[ -n "$FILTER_SERVICE" || -n "$FILTER_VMID" ]] || return 0
+  if [[ -n "$FILTER_SERVICE" && "$sname" != "$FILTER_SERVICE" ]]; then
+    return 1
+  fi
+  if [[ -n "$FILTER_VMID" ]]; then
+    spec="$(vmid_spec_from_json "$svcjson")"
+    [[ "$spec" =~ ^[0-9]+$ ]] || return 1
+    [[ "$spec" == "$FILTER_VMID" ]] || return 1
+  fi
+  return 0
+}
+
+# Fail fast if --service / --vmid does not match exactly one compose service.
+compose_validate_service_filter() {
+  local json="$1"
+  local sname svc spec n=0 match_name match_spec=""
+  [[ -n "$FILTER_SERVICE" || -n "$FILTER_VMID" ]] || return 0
+  [[ "$FILTER_VMID" =~ ^[0-9]+$ ]] || die "--vmid must be a numeric CT VMID (got: $FILTER_VMID)"
+
+  while IFS= read -r sname; do
+    svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
+    compose_service_matches_filter "$sname" "$svc" || continue
+    n=$((n + 1))
+    match_name="$sname"
+    match_spec="$(vmid_spec_from_json "$svc")"
+  done < <(jq -r '.service_order[]' <<<"$json")
+
+  if [[ "$n" -eq 0 ]]; then
+    if [[ -n "$FILTER_SERVICE" && -n "$FILTER_VMID" ]]; then
+      die "no service named '$FILTER_SERVICE' with vmid $FILTER_VMID in $COMPOSE_FILE"
+    elif [[ -n "$FILTER_SERVICE" ]]; then
+      die "no service named '$FILTER_SERVICE' in $COMPOSE_FILE"
+    else
+      die "no service with vmid $FILTER_VMID in $COMPOSE_FILE"
+    fi
+  fi
+  if [[ "$n" -gt 1 ]]; then
+    die "vmid $FILTER_VMID matches more than one service in $COMPOSE_FILE (compose must use unique vmids)"
+  fi
+  if [[ -n "$FILTER_SERVICE" && -n "$FILTER_VMID" && "$match_spec" != "$FILTER_VMID" ]]; then
+    die "service '$FILTER_SERVICE' has vmid $match_spec in compose, not $FILTER_VMID"
+  fi
+  if [[ -n "$FILTER_VMID" && "$match_spec" == next ]]; then
+    die "service '$match_name' uses vmid: next — run apply without --vmid to allocate, or set a fixed vmid in compose"
+  fi
+}
+
+compose_print_service_filter_hint() {
+  [[ -n "$FILTER_SERVICE" || -n "$FILTER_VMID" ]] || return 0
+  if [[ -n "$FILTER_SERVICE" && -n "$FILTER_VMID" ]]; then
+    echo "pve-oci-compose: filter → service '$FILTER_SERVICE' (vmid $FILTER_VMID) only"
+  elif [[ -n "$FILTER_SERVICE" ]]; then
+    echo "pve-oci-compose: filter → service '$FILTER_SERVICE' only"
+  else
+    echo "pve-oci-compose: filter → vmid $FILTER_VMID only"
+  fi
+}
+
 cmd_plan() {
   local json sname svc spec vmid image rootfs tags stored exists hint mr stack effpool sa desc_preview managedp guest_svc mrj ck hostn pct_readable
   json="$(compose_json)"
@@ -423,10 +490,13 @@ cmd_plan() {
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
   echo "Compose file: $COMPOSE_FILE"
   jq -r '.project // empty' <<<"$json" | sed '/^$/d' | sed 's/^/Project: /' || true
+  compose_validate_service_filter "$json"
+  compose_print_service_filter_hint
   echo
 
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
+    compose_service_matches_filter "$sname" "$svc" || continue
     validate_service "$svc" "$sname"
     spec="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
@@ -728,10 +798,13 @@ cmd_apply() {
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
   rj="$(jq -c '.repo' <<<"$json")"
+  compose_validate_service_filter "$json"
+  compose_print_service_filter_hint
   while IFS= read -r sname; do
     unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
     unset PVE_OCI_LAST_PULL_REFERENCE PVE_OCI_LAST_REFERENCE_INPUT 2>/dev/null || true
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
+    compose_service_matches_filter "$sname" "$svc" || continue
     validate_service "$svc" "$sname"
     spec="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
@@ -836,10 +909,13 @@ cmd_refresh() {
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
   rj="$(jq -c '.repo' <<<"$json")"
+  compose_validate_service_filter "$json"
+  compose_print_service_filter_hint
   while IFS= read -r sname; do
     unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
     unset PVE_OCI_LAST_PULL_REFERENCE PVE_OCI_LAST_REFERENCE_INPUT 2>/dev/null || true
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
+    compose_service_matches_filter "$sname" "$svc" || continue
     validate_service_refresh "$svc" "$sname"
     vmid="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
@@ -918,8 +994,11 @@ cmd_pull() {
   local json sname svc ts ref
   local -a pull_args
   json="$(compose_json)"
+  compose_validate_service_filter "$json"
+  compose_print_service_filter_hint
   while IFS= read -r sname; do
     svc="$(jq -c --arg n "$sname" '.services[$n]' <<<"$json")"
+    compose_service_matches_filter "$sname" "$svc" || continue
     validate_service_pull "$svc" "$sname"
     ref="$(service_image "$svc")"
     ts="$(jq -r '.template_storage // .storage // empty' <<<"$svc")"
@@ -942,6 +1021,8 @@ while [[ $# -gt 0 ]]; do
     --allow-failed-snapshot) REFRESH_ALLOW_FAILED_SNAPSHOT=1; shift ;;
     -n|--dry-run)    DRY_RUN=1; shift ;;
     --no-write-compose) WRITE_COMPOSE_VMID=0; shift ;;
+    --service)       FILTER_SERVICE="${2:?}"; shift 2 ;;
+    --vmid)          FILTER_VMID="${2:?}"; shift 2 ;;
     -h|--help)       usage ;;
     -*)
       die "unknown option: $1"
@@ -970,6 +1051,14 @@ if [[ "$CMD" != refresh ]]; then
     die "--adopt and --force are only valid with refresh"
   fi
 fi
+case "$CMD" in
+  plan|apply|refresh|pull) ;;
+  *)
+    if [[ -n "$FILTER_SERVICE" || -n "$FILTER_VMID" ]]; then
+      die "--service and --vmid are only valid with plan, apply, refresh, or pull"
+    fi
+    ;;
+esac
 
 case "$CMD" in
   plan)

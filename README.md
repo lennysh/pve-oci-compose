@@ -82,6 +82,14 @@ Dry-run (print the underlying commands, do not execute):
 ./pve-oci-compose.sh --dry-run refresh
 ```
 
+Target a single service (by compose key or fixed **vmid**; also works with **plan** and **pull**):
+
+```bash
+./pve-oci-compose.sh -f compose.yaml apply --service list-sync
+./pve-oci-compose.sh refresh --vmid 713
+./pve-oci-compose.sh apply --service traefik --vmid 710   # both must match the same service
+```
+
 ## Compose file format
 
 The file is YAML with a single top-level mapping.
@@ -146,6 +154,8 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 |--------|----------|--------|
 | `-f`, `--file PATH` | all | Compose file path. Default: **`./compose.yaml`** in the current directory, or **`$COMPOSE_FILE`** if set. |
 | `-n`, `--dry-run` | apply, refresh, pull | Print worker invocations (`DRY-RUN: …`); do not run them. **plan** is always read-only. |
+| `--service NAME` | plan, apply, refresh, pull | Run only the **`services:`** entry with that key (other services in the file are skipped). |
+| `--vmid ID` | plan, apply, refresh, pull | Run only the service whose compose **`vmid:`** is that number (**`vmid: next`** cannot match). Fails if the id is missing or ambiguous. |
 | `--no-write-compose` | apply | After **apply** with `vmid: next` / `auto` / `null`, do not rewrite the compose file with the allocated id. Same as **`PVE_OCI_COMPOSE_NO_WRITE=1`**. |
 | `--adopt` | refresh | Refresh a CT that has **no readable guest marker JSON** yet (hand-created / UI OCI guest). After a successful refresh, writes the marker file and merges the **`pve-oci-compose`** sentinel tag. Does **not** make **apply** create over an unmanaged CT. |
 | `--force` | refresh | Run refresh even when the stored **`ref`** in the guest marker already matches the compose **`image`**. |

@@ -3,6 +3,8 @@
 #
 # Copy:  cp compose.example.yaml compose.yaml
 # Flow:  ./pve-oci-compose.sh plan | apply | pull | refresh
+# One service:  ./pve-oci-compose.sh apply --service nginx-demo
+# By vmid:       ./pve-oci-compose.sh refresh --vmid 200
 #
 # Top-level keys (see README.md):
 #   name / project   — stack label; default resource pool id unless pool: overridden
