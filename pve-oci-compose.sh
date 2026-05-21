@@ -69,14 +69,17 @@ Requirements:
   - pvesh, pct, skopeo, rsync, perl (PVE::Storage) as required by the inlined workflows.
   - Optional: env PVE_OCI_VERBOSE=1 — print extra hints and full pct/skopeo command lines during apply/pull/refresh.
 
-Compose schema (per service; shallow merge from top-level "defaults"):
+Compose schema (per service; shallow merge from defaults except env — see README):
+  Services run in YAML file order (service_order), not alphabetical.
   vmid               Fixed CT VMID, or next / auto / null / omitted = allocate at apply (refresh needs a number).
-  image or reference (required) OCI ref for create / refresh (same as existing scripts)
+  image or reference (required) OCI ref for create / refresh (bare refs get oci:// prefix in refresh worker)
   rootfs             (required for apply) e.g. local-zfs:8
-  template_storage   vztmpl storage id for oci-registry-pull (optional; see create script)
-  hostname, net0 … net7   pct --netN (any net keys net0, net1, …); default net0 if none set
+  template_storage   vztmpl storage id for oci-registry-pull (optional; alias storage)
+  hostname, net0 … netN   pct --netN (any net keys net0, net1, …); default net0 if none set
   node, memory, swap, cores, cpulimit, cpuunits, ostype, arch, unprivileged, features, onboot
-  nameserver, searchdomain, entrypoint, env or environment (map / list / string; see below), description, guest_ports, about
+  nameserver, searchdomain, entrypoint
+  env or environment  image env, then defaults.env, then service env (each overrides same key); see README
+  description, guest_ports, about
   tags (pct UI tags). Top-level about (string) is optional stack notes merged into the built description.
   Top-level repo: optional string URL for the Source footer (default https://github.com/lennysh/pve-oci-compose);
   use repo: false to omit that footer from composed descriptions.

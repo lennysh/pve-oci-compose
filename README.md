@@ -16,10 +16,14 @@ Declarative **Proxmox VE** LXC workflows driven by a **YAML** compose file: crea
 
 ## Requirements
 
-- **Proxmox VE** node (run as **root**): `pct`, `pvesh`, OCI template storage with **`oci-registry-pull`**, `skopeo`, `rsync`, **`jq`**, **`perl`** with **`PVE::Storage`** (same as a normal PVE node used for OCI templates).
-- **`python3`** and **PyYAML** (`python3-yaml`) to parse the compose file (`apt install python3-yaml`).
+Run on a **Proxmox VE** node as **root** (same host that will own the CTs / storage).
 
-APT packages used by this stack are listed in **`bindep.txt`**. Install them in one shot (from the directory that contains `bindep.txt`):
+| Source | Packages / tools |
+|--------|------------------|
+| **Proxmox VE** (preinstalled) | `pct`, `pvesh`, **`oci-registry-pull`**, **`perl`** + **`PVE::Storage`**, cluster API |
+| **`bindep.txt`** (install via apt) | `jq`, `python3`, `python3-yaml`, `skopeo`, `rsync` |
+
+Install the extra packages (from the directory that contains `bindep.txt`):
 
 ```bash
 sudo apt-get update && sudo apt-get install -y $(awk '!/^[[:space:]]*#/ && NF {print $1}' bindep.txt)
@@ -54,13 +58,14 @@ cp compose.example.yaml compose.yaml
 chmod +x pve-oci-compose.sh
 ```
 
-Typical flow:
+Typical flow (multiple **`services:`** run in **YAML order**, one after another):
 
 ```bash
 ./pve-oci-compose.sh plan
 ./pve-oci-compose.sh apply          # create missing CTs only
 ./pve-oci-compose.sh pull            # optional: templates only (--pull-only)
 ./pve-oci-compose.sh refresh         # rootfs sync when image ref changed
+./pve-oci-compose.sh refresh --force # re-sync even if marker ref matches compose image
 ```
 
 Override the compose path (`-f` / `--file`, or env **`COMPOSE_FILE`**; default **`./compose.yaml`** in the current directory):
@@ -130,8 +135,8 @@ See **`compose.example.yaml`**: a minimal working service plus **long commented 
 |---------|----------|
 | **plan** | No changes. For each service: CT exists?, **`tags`** from **`pct`** / API, stored **`ref`** from the guest marker JSON (**`PVE_OCI_ROOTFS_MARKER`**), would **apply** / **refresh**? If the vmid is an **existing LXC** without compose marker/tag (e.g. OCI created outside this tool), **plan** prints a **WARNING** and **would REFUSE** for **apply** so you can verify before pulling templates. |
 | **apply** | If missing, **create**, then sentinel tag **`pve-oci-compose`** + guest JSON marker (**`pct mount`** briefly on a stopped CT). **plan**/`refresh` use **`pct exec`** when running else **`pct mount`** to read the JSON. Before pull/create, **apply** checks **`pvesh get /cluster/resources`** so a vmid already used by a **QEMU** guest fails immediately (LXC-only **`pct config`** is not enough). An LXC may **run on another cluster node**: **`pct config`** can fail on the member where you run the script even though the guest exists; the tool then uses the API (**hosting node** from resources + **`pvesh …/lxc/<vmid>/config`**) for **tags** and still treats the vmid as taken. If the vmid is an existing LXC without a compose marker/tag, **apply** refuses (same as “not adopted”) instead of pulling then failing at **`pct create`**. |
-| **refresh** | If compose **`image`** ≠ stored **`ref`** ( **`--force`** always), refresh rootfs then reconcile tag + JSON. Existence uses **`pct config`** or, when that fails on a cluster member, **`pvesh`** on the hosting node ( **`/cluster/resources`** ) and your compose **`node:`** hint; if the CT is on another member, the tool tells you to re-run refresh there (**`pct mount`** is local to the host that holds the rootfs). |
-| **pull** | For each service, run the create script with **`--pull-only`** (and your `template_storage` / `image`). |
+| **refresh** | Per service: if compose **`image`** ≠ guest marker **`ref`**, run rootfs replace (optional **`pct snapshot`** unless **`--no-snapshot`** / **`--allow-failed-snapshot`**), **`rsync`** from a temp CT built from the new image, sync **`entrypoint`** on the host config, destroy temp CT, **start** the target CT. Skips when refs match unless **`--force`**. Skips CTs with no readable marker unless **`--adopt`** (then writes marker + tag after success). **`rsync`** excludes **`mp*`** bind-mount guest paths so **`--delete`** does not hit busy mountpoints. |
+| **pull** | Per service: **`oci-registry-pull`** only (**`--pull-only`**); needs **`image`** / **`reference`**, not **`rootfs`**. |
 
 ### CLI options
 
@@ -162,6 +167,17 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 | **`OCI_CT_CREATE_NET0`** | Default **`pct --net0`** when compose sets no **`netN`** keys (default: `name=eth0,bridge=vmbr0,ip=dhcp`). |
 | **`OCI_CT_CREATE_NO_RESOLVE_LATEST=1`** | Skip **`skopeo`** resolution of floating **`:latest`** / **`*_latest`** refs before pull (use the compose string as-is). |
 | **`OCI_REFRESH_TEMPLATE_STORAGE`** | Vztmpl storage id for **refresh** temp-CT pulls when a node has multiple template stores. **refresh** from compose sets this from **`template_storage`** / **`storage`** per service; set manually only for direct **`oci_refresh_main`** calls. |
+| **`OCI_REFRESH_TEMP_NET0`** | Default **`pct --net0`** for the **disposable temp CT** during **refresh** (default: `name=eth0,bridge=vmbr0,ip=dhcp`). |
+
+### Image references and pulls
+
+- **Compose / CLI refs** may be bare (`ghcr.io/org/app:tag`) or prefixed with **`oci://`**. The refresh worker normalizes bare registry paths to **`oci://…`** before pull (local paths and `http(s)://` are left unchanged).
+- **Floating `:latest` / `*_latest`:** before **`oci-registry-pull`**, the create worker can **`skopeo`**-resolve the ref to a digest or concrete tag so pulls are repeatable. Opt out with **`OCI_CT_CREATE_NO_RESOLVE_LATEST=1`** (use the compose string as-is).
+- **Resolved ref in Notes:** after a successful pull, **`PVE_OCI_LAST_PULL_REFERENCE`** feeds the composed CT **description** (**Image (pulled):** + **Template sync:**) when that feature is enabled for the service.
+
+### Validation (before **apply** / **refresh** / **pull**)
+
+Per service, the driver checks (non-exhaustive): numeric or **`next`** **`vmid`**; **`image`** / **`reference`** present; **`rootfs`** present (except **pull**); **`ssh_public_keys`** path exists on the host when set; **`guest_ports`**, **`about`**, **`bind_mounts`**, **`lxc_config_lines`** are lists with valid shapes; each **`bind_mounts`** entry starts with **`/`** and contains **`,mp=`**; each **`lxc_config_lines`** entry looks like **`KEY: value`** (no **`[snapshots]`** sections).
 
 ### Advanced: inlined workers (`lib/*.inc.sh`)
 
@@ -184,17 +200,24 @@ The compose driver calls **`oci_create_main`** and **`oci_refresh_main`**; you n
 
 ## Compose marker (UI + drift + snapshots)
 
-Canonical **`service`** + **`ref`** live in a small JSON file on the CT root disk (default **`/etc/pve-oci-compose.json`**, configurable with **`PVE_OCI_ROOTFS_MARKER`**). **`pct rollback`** restores that file with the rest of rootfs—so **`plan` / `--force` / drift checks** align with whatever image tree is actually on disk.
+Guest marker JSON (default path **`/etc/pve-oci-compose.json`**, override with **`PVE_OCI_ROOTFS_MARKER`**) stores:
 
-Optional host tag (**`pve-oci-compose`**) stays short; **`ref`** drift always comes from the guest JSON (**`stopped`**: **`pct mount`** briefly; **`running`**: **`pct exec cat`**).
+```json
+{"service": "<compose service name>", "ref": "<image ref last applied>"}
+```
 
-After **refresh**, the driver also updates the JSON via **`pct exec`** so the host does not need another mount.
+- **`pct rollback`** restores that file with rootfs — **`plan`**, **`--force`**, and drift checks follow the rolled-back tree.
+- Host tag **`pve-oci-compose`** is a short UI hint; drift uses the **guest JSON**, not tags alone (**`stopped`**: brief **`pct mount`**; **`running`**: **`pct exec cat`**).
+- After **refresh**, the marker is updated via **`pct exec`** when possible.
+- **plan** warns if marker **`service`** ≠ compose service key for that **`vmid`**.
 
-Use **pinned tags or digests** in compose when you care about exactly when a refresh runs; floating `:latest` is easy to misread across machines.
+Use **pinned tags or digests** when you care exactly when **refresh** runs; floating **`:latest`** is easy to misread across machines.
 
 ## Operational notes
 
-- **Post-create env:** compose **`env`** is merged with the OCI image env by rewriting the CT’s **`env:`** line in **`/etc/pve/lxc/<vmid>.conf`** (NUL-separated pairs). **`lxc_config_lines`** are still appended separately (no **`#` markers** — Proxmox copies **`#` comment lines from the conf into the CT Notes field).
+- **Post-create env (layer order):** **(1)** OCI image vars from unpack, **(2)** **`defaults.env`**, **(3)** service **`env`** — later layers override the same key. The tool removes old **`env:`** / **`lxc.environment.runtime:`** lines and writes one **`env:`** line (NUL-separated). Do not put **`#` comments** in **`/etc/pve/lxc/*.conf`** for compose markers; Proxmox shows **`#` lines in the CT Notes field.
+- **Failed `pct create`:** on failure, the create worker removes a partial CT and drops an auto-created pool only if this run created that pool (**`PVE_OCI_POOL_JUST_AUTOCREATED`**).
+- **Unmanaged CTs:** LXC exists but no marker/tag → **plan** warns, **apply** refuses, **refresh** skips (or **`--adopt`** once you align the CT with compose).
 - **Log style:** **apply** / **pull** (create path) and **refresh** use the same helpers in **`lib/ui.inc.sh`**: phase **title** + horizontal rule, **key/value** lines, **steps**, and **✓** completion. Long explanations and full `pct` / `skopeo` command lines are **hidden by default**; set **`PVE_OCI_VERBOSE=1`** to show them (`out_detail` / `out_cmd`).
 - **OCI pull “Waiting for pull task …”** polls `pvesh get /nodes/<node>/tasks/<UPID>/status`. UPIDs contain colons—the tool **URL-encodes** the UPID for that path and **retries** with the raw UPID if the first response is empty. If a pull still hangs after the task logged OK in the UI, verify **`jq`** and run with **`PVE_OCI_COMPOSE_TASK_DEBUG=1`** so each poll prints a short JSON preview on stderr.
 - **Entrypoint**: **`pct` `entrypoint`** lives in **`/etc/pve/lxc/<vmid>.conf`**, not in the root disk. After **`refresh`**, that value is synced from the temp CT built from the new image (or **`--delete entrypoint`** if the new template has none). Other config keys (**`ostype`**, **`features`**, …) stay as they were unless you extend the tool.

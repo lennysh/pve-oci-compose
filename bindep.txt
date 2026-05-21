@@ -1,5 +1,5 @@
-# Binary / runtime package dependencies for pve-oci-compose and the oci_ct_* worker
-# scripts on Debian-based hosts (dpkg), including Proxmox VE.
+# Extra APT packages for pve-oci-compose on a Proxmox VE node (dpkg).
+# pct, pvesh, perl (PVE::Storage), and oci-registry-pull come with Proxmox — not listed here.
 #
 # Format follows openstack/bindep: <packagename> [platform:dpkg ...]
 # https://docs.opendev.org/opendev/bindep/latest/

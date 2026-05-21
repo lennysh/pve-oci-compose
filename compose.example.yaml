@@ -1,156 +1,152 @@
 # Example compose file for pve-oci-compose (YAML).
 # Requires: python3 + PyYAML (on PVE: apt install python3-yaml)
 #
-# Top-level "defaults" are shallow-merged into each service (service keys win), except
-# env/environment mappings which are deep-merged (service keys override defaults on conflict).
+# Copy:  cp compose.example.yaml compose.yaml
+# Flow:  ./pve-oci-compose.sh plan | apply | pull | refresh
 #
-# Optional top-level **about:** (multiline string) is merged into the Proxmox **Notes** section of
-# the composed CT **description** for every service that opts into the rich description (see
-# **guest_ports** / per-service **about** below). Omit it if you prefer no stack-wide blurb.
+# Top-level keys (see README.md):
+#   name / project   — stack label; default resource pool id unless pool: overridden
+#   about            — optional stack notes in composed CT descriptions
+#   repo             — Source footer URL in descriptions (or repo: false to omit)
+#   defaults         — shallow-merged into each service (env is layered: defaults then service)
+#   services         — one entry per CT; processed in YAML order (not alphabetical)
 #
-# Optional **repo:** — URL string for the “Source” footer on composed descriptions (default is the
-# upstream GitHub repo). Use **repo: false** to omit that footer.
+# Per-service: vmid, image|reference, rootfs (not required for pull), template_storage|storage,
+# pool, net0…, env|environment, mounts, bind_mounts, lxc_config_lines, guest_ports, about, …
 
-# Used as the default Datacenter → Permissions → **resource pool** id (pct --pool) unless you set
-# `defaults.pool` / per-service `pool` (use `pool: ""` to opt out). Missing pools are auto-created
-# (set PVE_OCI_POOL_NO_AUTOCREATE=1 on the host to disable).
+# Optional stack-wide description footer (composed CT Notes):
+# repo: https://github.com/your-org/your-fork
+# repo: false
+# about: |
+#   Shared infrastructure for the example stack.
+
 name: example-stack
 
 defaults:
-  template_storage: "" # vztmpl storage id for oci-registry-pull; omit or "" to auto-pick when unique
+  template_storage: "" # vztmpl id for oci-registry-pull; "" = auto-pick when exactly one store exists
 
   # --- pool (optional) ---
   # pool: ""                    # disable default pool id (= stack name) for every service
   # pool: "oci-example-stack"  # explicit pool id (must exist or be auto-created)
 
   # --- net0 (default for every service unless overridden) ---
-  # Same string pct(1) expects for --net0. VLAN example on a VLAN-aware bridge:
   # net0: "name=eth0,bridge=vmbr0,tag=42,ip=dhcp"
   net0: "name=eth0,bridge=vmbr0,ip=dhcp"
 
   unprivileged: 1
   onboot: 0
+  # start: 0                 # pct --start when create finishes (separate from onboot)
+
+  # --- defaults env (merged after image env, before per-service env) ---
+  # env:
+  #   TZ: "America/New_York"
 
 services:
+  # Services run in this order: nginx-demo first, then alpine-next (when uncommented).
+
   nginx-demo:
-    vmid: 200 # or: next | auto | null | omit key — apply allocates next free id and can write it back
+    vmid: 200 # or: next | auto | null | omit — apply allocates next free id and can write it back
     image: docker.io/library/nginx:latest
     rootfs: local-zfs:8
     hostname: nginx-oci-demo
 
     # =============================================================================
     # Optional pct create fields — examples (uncomment / copy into this service)
-    # All of these map 1:1 to `pct create` flags; see README + `pct(1)` on your PVE version.
-    # They apply only when a *new* CT is created (apply), not on refresh.
+    # All map 1:1 to pct create flags; see README + pct(1). Create-only (apply), not refresh.
     # =============================================================================
 
     # --- Extra NICs: net1, net2, … (keys must match ^net[0-9]+$) ---
-    # Second interface, same bridge, DHCP:
     # net1: "name=eth1,bridge=vmbr0,ip=dhcp"
-    # Static IPv4 on eth0 (adjust to your LAN); gateway often on net0 only:
     # net0: "name=eth0,bridge=vmbr0,ip=192.168.1.50/24,gw=192.168.1.1"
 
-    # --- DNS (pct --nameserver / --searchdomain) ---
-    # One string with commas or spaces → multiple --nameserver flags:
+    # --- DNS ---
     # nameserver: "10.0.0.1, 10.0.0.2"
-    # Or a YAML list → one --nameserver per element:
     # nameserver: [10.0.0.1, 8.8.8.8]
     # searchdomain: "lan.local"
     # searchdomain: [lan.local, corp.example.com]
 
-    # --- OCI-style process (pct --entrypoint) ---
+    # --- OCI-style process ---
     # entrypoint: "/sbin/init"
     # entrypoint: '/usr/sbin/nginx -g "daemon off;"'
 
     # --- Environment (env: or environment:) ---
-    # For OCI vztmpl, image Config.Env is kept; after pct create env is merged in order:
-    # image → defaults.env → service env (each layer overrides the same key).
-    # As a mapping (recommended):
+    # Runtime merge order: image Config.Env → defaults.env → service env (override per key).
     # env:
     #   NGINX_ENTRYPOINT_QUIET_LOGS: "1"
-    #   TZ: "UTC"
-    # As a list of KEY=value strings:
-    # env:
-    #   - "FOO=bar"
-    #   - "BAZ=qux"
-    # Single string (one KEY=value, or your tooling’s convention if you pass multiple):
+    # env: ["FOO=bar", "BAZ=qux"]
     # env: "MYVAR=value"
 
-    # --- CPU / RAM tuning ---
+    # --- CPU / RAM ---
     # memory: 512
     # cores: 2
     # swap: 512
     # cpulimit: 4
     # cpuunits: 2048
 
-    # --- OS / features (unchanged from before; shown for context) ---
+    # --- OS / features ---
     # ostype: debian
     # arch: amd64
     # features: "nesting=1"
 
-    # --- UI metadata (pct --description / --tags) ---
-    # **description** alone → passed through as a plain pct description (no extra header).
-    #
-    # If you set **guest_ports** and/or **about** (here or top-level **about:**), **apply** builds a
-    # richer Markdown-style description: stack, service, image, your text, a **Listener ports**
-    # section (what listens *inside* the CT — not Docker `ports:` maps), and **Notes** from
-    # stack + service **about**. Use this to remember which ports to allow on a firewall or proxy.
-    #
+    # --- UI metadata (description / guest_ports / about) ---
+    # description alone → verbatim pct description.
+    # guest_ports and/or about → composed Markdown Notes (stack, service, image, ports, notes).
     # description: |
     #   Demo nginx from OCI; static site only.
     # guest_ports:
     #   - port: 80
     #     proto: tcp
     #     description: HTTP (default server)
-    #   - "443/tcp — HTTPS (uncomment if you terminate TLS in the guest)"
+    #   - "443/tcp — HTTPS"
     # about: |
     #   Docs: https://nginx.org/en/docs/
     # tags: "env=prod;team=netops"
-    # apply still merges the short sentinel tag `pve-oci-compose` after create.
 
-    # --- Timezone / access (pct --timezone / --password / --ssh-public-keys) ---
+    # --- Timezone / access ---
     # timezone: host
     # timezone: "Europe/Berlin"
-    # Avoid committing real passwords — prefer `pct set` after first boot:
     # password: "CHANGE_ME"
-    # Path on the *Proxmox host* to a file (one OpenSSH public key per line):
     # ssh_public_keys: "/root/.ssh/authorized_keys"
 
-    # --- Boot / ordering (different from each other) ---
-    # onboot: 1              # start this CT when the *node* boots (pct --onboot)
-    # startup: "order=10,up=30,down=30"   # order + delays vs other guests (pct --startup)
-    # start: 1               # start the CT immediately when `pct create` finishes (pct --start)
+    # --- Boot / ordering ---
+    # onboot: 1
+    # startup: "order=10,up=30,down=30"
+    # start: 1
 
-    # --- Hooks / HA / safety (pct --hookscript / --ha-managed / --protection / …) ---
+    # --- Hooks / HA / safety ---
     # hookscript: "local:snippets/lxc-hook.sh"
     # protection: 1
     # ha_managed: 0
     # ignore_unpack_errors: 0
     # pct_debug: 0
 
-    # --- Console / I/O (pct --cmode / --console / --tty / --bwlimit) ---
+    # --- Console / I/O ---
     # cmode: tty
     # console: 1
     # tty: 2
     # bwlimit: 12500
 
-    # --- Host devices into the CT (pct --dev0, --dev1, … list order) ---
+    # --- Devices / unused volumes ---
     # lxc_dev:
     #   - "path=/dev/net/tun,mp=/dev/net/tun"
-    #   - "path=/dev/kvm,mp=/dev/kvm"
-
-    # --- Advanced: unused volume refs (pct --unused0, …) — rarely needed ---
     # unused_disks:
     #   - "local-zfs:vm-999-disk-0"
 
-    # --- Node override & extra disks ---
+    # --- Node override & disks ---
     # node: pve
     # mounts:
-    #   - "local-zfs:0.25:/var/cache/nginx"              # default ,backup=1 appended
-    #   - "Storage:0.1:/config:backup=1"                 # explicit (same as default)
-    #   - "Storage:0.1:/scratch:backup=0,replicate=0"   # opt out of vzdump for this mp
+    #   - "local-zfs:0.25:/var/cache/nginx"
+    #   - "Storage:0.1:/scratch:backup=0,replicate=0"
     # bind_mounts:
     #   - "/mnt/pve/nfs-media,mp=/mnt/Media01,replicate=0,shared=1,size=0T"
     # lxc_config_lines:
     #   - "lxc.cgroup2.devices.allow: c 188:* rwm"
-    #   - "lxc.mount.entry: /dev/dri/card1 dev/dri/card1 none bind,optional,create=file"
+
+  # Second service example: runs after nginx-demo (YAML order). Uncomment to try vmid writeback.
+  # alpine-next:
+  #   vmid: next
+  #   image: docker.io/library/alpine:latest
+  #   rootfs: local-zfs:4
+  #   hostname: alpine-next-demo
+  #   env:
+  #     FOO: bar

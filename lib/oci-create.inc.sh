@@ -37,8 +37,8 @@ Common options:
   --lxc-line LINE       Repeatable: raw PVE/LXC config line appended after pct create (key: value
                         or key = value), e.g. lxc.cgroup2.devices.allow: c 188:* rwm
   --entrypoint CMD      pct --entrypoint (OCI / init override)
-  --env KEY=val         Repeatable KEY=value; after pct create merged with image env via pct set --env
-                        (Proxmox OCI unpack sets env from the image — compose adds/overrides keys)
+  --env KEY=val         Repeatable KEY=value; after pct create merged with image env in CT config
+                        (image → compose layers; see pve_oci_pct_env_merge_set in lib/common.inc.sh)
   --description TEXT    pct --description
   --tags TAGS           pct --tags (semicolon-separated; apply still merges pve-oci-compose sentinel after create)
   --timezone SPEC       pct --timezone (e.g. host or Europe/Berlin)
