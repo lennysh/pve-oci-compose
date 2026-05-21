@@ -939,8 +939,9 @@ rm -f "$_pct_log"
 # Compose --env: do not pass pct create --env for OCI vztmpl (unpack sets image env on the CT).
 # Layered merge (image → defaults → service) via PVE_OCI_ENV_*_JSON from fill_create_args, or
 # flat --env pairs when this worker is invoked directly.
-local _def_json="${PVE_OCI_ENV_DEFAULTS_JSON:-{}}"
-local _svc_json="${PVE_OCI_ENV_SERVICE_JSON:-{}}"
+local _pve_oci_json_empty='{}'
+local _def_json="${PVE_OCI_ENV_DEFAULTS_JSON:-$_pve_oci_json_empty}"
+local _svc_json="${PVE_OCI_ENV_SERVICE_JSON:-$_pve_oci_json_empty}"
 local -a _pve_oci_compose_env=()
 for _ev in "${ENVS[@]}"; do
   [[ -z "$_ev" ]] && continue

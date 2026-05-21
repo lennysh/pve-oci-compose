@@ -385,8 +385,10 @@ print(json.dumps({"service": svc, "ref": ref}, separators=(",", ":"), ensure_asc
 # argv2/3: JSON objects; argv4+: optional KEY=value pairs (direct oci_create_main --env).
 pve_oci_pct_env_merge_set() {
   local vmid="$1"
-  local defaults_json="${2:-{}}"
-  local service_json="${3:-{}}"
+  # ${var:-{}} is unsafe in bash (default "{" + stray "}" corrupts JSON); use a variable.
+  local _pve_oci_json_empty='{}'
+  local defaults_json="${2:-$_pve_oci_json_empty}"
+  local service_json="${3:-$_pve_oci_json_empty}"
   shift 3
   python3 - "$vmid" "$defaults_json" "$service_json" "$@" <<'PY'
 import json, pathlib, sys
