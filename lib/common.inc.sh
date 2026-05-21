@@ -380,28 +380,26 @@ print(json.dumps({"service": svc, "ref": ref}, separators=(",", ":"), ensure_asc
   printf '%s\n' "$blob" | pct exec "$vmid" -- sh -ec 'cat >"$1"' x "$mr" || return 1
 }
 
-# Merge compose KEY=value pairs onto env already on the CT (OCI image env from unpack).
-# Writes /etc/pve/lxc/<vmid>.conf directly: pct set --env needs embedded NUL bytes, which
-# Python 3.13+ subprocess (and POSIX argv) cannot pass; the on-disk env: line may contain NUL.
+# Merge env in precedence order: (1) OCI image env on the CT, (2) compose defaults, (3) service.
+# Writes /etc/pve/lxc/<vmid>.conf (env: NUL-separated); avoids pct set --env (NUL in argv).
+# argv2/3: JSON objects; argv4+: optional KEY=value pairs (direct oci_create_main --env).
 pve_oci_pct_env_merge_set() {
   local vmid="$1"
-  shift
-  [[ $# -gt 0 ]] || return 0
-  python3 - "$vmid" "$@" <<'PY'
-import pathlib, sys
+  local defaults_json="${2:-{}}"
+  local service_json="${3:-{}}"
+  shift 3
+  python3 - "$vmid" "$defaults_json" "$service_json" "$@" <<'PY'
+import json, pathlib, sys
+from collections import OrderedDict
 
 def parse_env_blob(blob):
-    out = {}
-    if not blob:
-        return out
     for part in blob.split("\0"):
         part = part.strip()
         if not part or "=" not in part:
             continue
         k, _, v = part.partition("=")
         if k:
-            out[k] = v
-    return out
+            yield k, v
 
 def parse_runtime_line(line):
     _, _, rest = line.partition(":")
@@ -411,11 +409,18 @@ def parse_runtime_line(line):
     k, _, v = rest.partition("=")
     return (k, v) if k else (None, None)
 
-def is_env_line(line):
-    return line.startswith("env:") or line.startswith("lxc.environment.runtime:")
+def layer(ordered, mapping):
+    for k, v in mapping.items():
+        ordered[str(k)] = str(v)
 
 vmid = sys.argv[1]
-compose_pairs = sys.argv[2:]
+defaults = json.loads(sys.argv[2] or "{}")
+service = json.loads(sys.argv[3] or "{}")
+extra_pairs = sys.argv[4:]
+
+if not defaults and not service and not extra_pairs:
+    sys.exit(0)
+
 cfg = pathlib.Path(f"/etc/pve/lxc/{vmid}.conf")
 if not cfg.is_file():
     sys.stderr.write(f"pve-oci-compose: CT config missing: {cfg}\n")
@@ -424,28 +429,31 @@ if not cfg.is_file():
 text = cfg.read_text(encoding="utf-8", errors="replace")
 lines = text.splitlines(keepends=True)
 body = []
-base = {}
+image = OrderedDict()
 for line in lines:
     raw = line.rstrip("\n")
     if raw.startswith("env:"):
-        for k, v in parse_env_blob(raw[4:].lstrip()).items():
-            base[k] = v
+        for k, v in parse_env_blob(raw[4:].lstrip()):
+            image[k] = v
         continue
     if raw.startswith("lxc.environment.runtime:"):
         k, v = parse_runtime_line(raw)
         if k:
-            base[k] = v
+            image[k] = v
         continue
     body.append(line)
 
-for p in compose_pairs:
+merged = OrderedDict(image)
+layer(merged, defaults)
+layer(merged, service)
+for p in extra_pairs:
     if not p or "=" not in p:
         continue
     k, _, v = p.partition("=")
     if k:
-        base[k] = v
+        merged[k] = v
 
-if not base:
+if not merged:
     sys.exit(0)
 
 while body and body[-1].strip() == "":
@@ -456,8 +464,7 @@ if body and not body[-1].endswith("\n"):
 new_text = "".join(body)
 if new_text and not new_text.endswith("\n"):
     new_text += "\n"
-new_text += "env: " + "\0".join(f"{k}={v}" for k, v in base.items()) + "\n"
-
+new_text += "env: " + "\0".join(f"{k}={v}" for k, v in merged.items()) + "\n"
 cfg.write_text(new_text, encoding="utf-8")
 PY
 }

@@ -202,9 +202,10 @@ def merge_service(defaults, svc):
     merged = {**defaults, **svc}
     denv = env_from_mapping(defaults)
     senv = env_from_mapping(svc)
+    merged["_defaults_env"] = denv
+    merged["_service_env"] = senv
     if denv or senv:
-        merged_env = {**denv, **senv}
-        merged["env"] = merged_env
+        merged["env"] = {**denv, **senv}
         merged.pop("environment", None)
     return merged
 
@@ -601,21 +602,9 @@ fill_create_args() {
 
   v="$(jq -r '.entrypoint // empty | if type == "string" then . else empty end' <<<"$svcjson")"
   [[ -n "$v" ]] && OCI_CREATE_ARGS+=(--entrypoint "$v")
-  while IFS= read -r ev; do
-    [[ -z "$ev" ]] && continue
-    OCI_CREATE_ARGS+=(--env "$ev")
-  done < <(jq -r '
-    (.env // .environment // empty)
-    | if type == "object" then to_entries[] | "\(.key)=\(.value | tostring)"
-      elif type == "array" then
-        .[]
-        | if type == "string" then .
-          elif type == "object" and (.name != null) and has("value") then "\(.name)=\(.value | tostring)"
-          elif type == "object" and (length == 1) then (. | to_entries[] | "\(.key)=\(.value | tostring)")
-          else empty end
-      elif type == "string" then .
-      else empty end
-    ' <<<"$svcjson")
+  # Env: layered merge after pct create (image → defaults → service); see pve_oci_pct_env_merge_set.
+  export PVE_OCI_ENV_DEFAULTS_JSON="$(jq -c '._defaults_env // {}' <<<"$svcjson")"
+  export PVE_OCI_ENV_SERVICE_JSON="$(jq -c '._service_env // {}' <<<"$svcjson")"
 
   while IFS= read -r ns; do
     [[ -z "$ns" ]] && continue
@@ -802,6 +791,7 @@ cmd_apply() {
     fi
     fill_create_args "$svc" "$resolved" "$stack" "$sa" "$rj"
     run_or_print oci_create_main "${OCI_CREATE_ARGS[@]}"
+    unset PVE_OCI_ENV_DEFAULTS_JSON PVE_OCI_ENV_SERVICE_JSON 2>/dev/null || true
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
       merged="$(pve_oci_tags_merge_sentinel_only "$(pve_oci_pct_tags "$resolved")")"

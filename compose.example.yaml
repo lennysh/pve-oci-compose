@@ -63,8 +63,8 @@ services:
     # entrypoint: '/usr/sbin/nginx -g "daemon off;"'
 
     # --- Environment (env: or environment:) ---
-    # For OCI vztmpl, the image Config.Env is kept; pve-oci-compose merges compose env on top via
-    # pct set --env after pct create (defaults env + service env; service wins on duplicate keys).
+    # For OCI vztmpl, image Config.Env is kept; after pct create env is merged in order:
+    # image → defaults.env → service env (each layer overrides the same key).
     # As a mapping (recommended):
     # env:
     #   NGINX_ENTRYPOINT_QUIET_LOGS: "1"

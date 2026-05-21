@@ -937,7 +937,10 @@ fi
 rm -f "$_pct_log"
 
 # Compose --env: do not pass pct create --env for OCI vztmpl (unpack sets image env on the CT).
-# Merge compose pairs onto that via pct set --env so image + defaults + service keys all remain.
+# Layered merge (image → defaults → service) via PVE_OCI_ENV_*_JSON from fill_create_args, or
+# flat --env pairs when this worker is invoked directly.
+local _def_json="${PVE_OCI_ENV_DEFAULTS_JSON:-{}}"
+local _svc_json="${PVE_OCI_ENV_SERVICE_JSON:-{}}"
 local -a _pve_oci_compose_env=()
 for _ev in "${ENVS[@]}"; do
   [[ -z "$_ev" ]] && continue
@@ -946,15 +949,16 @@ for _ev in "${ENVS[@]}"; do
   [[ "${_ev%%=*}" != "" ]] || die "invalid --env (empty key before '='): ${_ev:0:120}"
   _pve_oci_compose_env+=( "$_ev" )
 done
-if [[ "${#_pve_oci_compose_env[@]}" -gt 0 ]]; then
+if [[ "$_def_json" != "{}" || "$_svc_json" != "{}" || ${#_pve_oci_compose_env[@]} -gt 0 ]]; then
   if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
-    out_muted "Merging ${#_pve_oci_compose_env[@]} compose env var(s) with image env (CT config)"
+    out_muted "Merging env: image, then defaults, then service (CT config)"
   else
-    out_sub "Merge compose env with image env (CT config)"
+    out_sub "Merge env (image → defaults → service)"
   fi
-  pve_oci_pct_env_merge_set "$VMID" "${_pve_oci_compose_env[@]}" \
+  pve_oci_pct_env_merge_set "$VMID" "$_def_json" "$_svc_json" "${_pve_oci_compose_env[@]}" \
     || die "failed to merge env into CT ${VMID} config"
 fi
+unset _def_json _svc_json _pve_oci_compose_env 2>/dev/null || true
 if [[ "${#LXC_LINE_SPECS[@]}" -gt 0 ]]; then
   pve_oci_append_lxc_config_lines "$VMID" "${LXC_LINE_SPECS[@]}"
   if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
@@ -963,7 +967,6 @@ if [[ "${#LXC_LINE_SPECS[@]}" -gt 0 ]]; then
     out_sub "Appended ${#LXC_LINE_SPECS[@]} lxc_config_lines to CT config"
   fi
 fi
-unset _ev _pve_oci_compose_env 2>/dev/null || true
 
 if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
   out_muted "Scratch CT ${VMID} ready (stopped) — used only as rsync source; will be destroyed."
