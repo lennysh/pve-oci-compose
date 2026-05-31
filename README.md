@@ -178,6 +178,7 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 | **`OCI_CT_CREATE_NO_RESOLVE_LATEST=1`** | Skip **`skopeo`** resolution of floating **`:latest`** / **`*_latest`** refs before pull (use the compose string as-is). |
 | **`OCI_REFRESH_TEMPLATE_STORAGE`** | Vztmpl storage id for **refresh** temp-CT pulls when a node has multiple template stores. **refresh** from compose sets this from **`template_storage`** / **`storage`** per service; set manually only for direct **`oci_refresh_main`** calls. |
 | **`OCI_REFRESH_TEMP_NET0`** | Default **`pct --net0`** for the **disposable temp CT** during **refresh** (default: `name=eth0,bridge=vmbr0,ip=dhcp`). |
+| **`OCI_REFRESH_SHUTDOWN_TIMEOUT`** | Seconds to wait for **`pct shutdown`** on the CT being refreshed before **`pct stop`** (default **60**). Temp CT still uses **`pct stop`**. |
 
 ### Image references and pulls
 

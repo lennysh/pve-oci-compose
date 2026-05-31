@@ -22,6 +22,9 @@ oci_refresh_usage() {
   echo "OCI temp CTs use the same vztmpl path as apply (oci-registry-pull). For multiple template"
   echo "storages on a node, set OCI_REFRESH_TEMPLATE_STORAGE to the vztmpl storage id (compose refresh"
   echo "also exports this from template_storage / storage)."
+  echo ""
+  echo "Running CTs are shut down gracefully (pct shutdown) before rootfs work; pct stop runs only"
+  echo "if still active after OCI_REFRESH_SHUTDOWN_TIMEOUT seconds (default 60). Temp CT uses pct stop."
   exit 1
 }
 
@@ -122,13 +125,6 @@ pct_sync_entrypoint_from_temp() {
       out_warn "Could not pct set --delete entrypoint (${old}); review manually vs CT ${temp}."
     fi
   fi
-}
-
-# True if CT should be stopped (running or frozen). The script only needs CT stopped, not "was running".
-pct_ct_needs_stop() {
-  local s
-  s=$(pct status "$1" 2>/dev/null || true)
-  [[ "$s" == *running* || "$s" == *frozen* ]]
 }
 
 # pct create --rootfs for a NEW disk: STORAGE:<GiB_integer> (e.g. Storage:8, local-zfs:32).
@@ -260,10 +256,14 @@ out_kv "Temp alloc" "${ROOTFS_NEWVOL}  (from ${SIZE})"
 [[ -n "$MEMORY" ]] && out_kv "Memory (MB)" "${MEMORY} (cloned to temp create)"
 out_kv "Node" "$(hostname -s)"
 
-out_sub "Stop CT ${OLD}"
-if pct_ct_needs_stop "$OLD"; then
-  pct stop "$OLD"
-  out_ok "Stopped CT ${OLD}"
+out_sub "Shutdown CT ${OLD}"
+if pve_oci_pct_ct_is_active "$OLD"; then
+  out_kv "Graceful timeout" "${OCI_REFRESH_SHUTDOWN_TIMEOUT:-60}s (then pct stop)"
+  if ! pve_oci_pct_shutdown_or_stop "$OLD"; then
+    echo "Could not shut down or stop CT ${OLD}." >&2
+    exit 1
+  fi
+  out_ok "CT ${OLD} offline"
 else
   out_ok "CT ${OLD} already stopped"
 fi

@@ -128,6 +128,43 @@ pve_oci_lxc_refresh_resolve_context() {
   return 1
 }
 
+# True if CT is running or frozen (must be offline before host-side rootfs work).
+pve_oci_pct_ct_is_active() {
+  local s
+  s=$(pct status "$1" 2>/dev/null || true)
+  [[ "$s" == *running* || "$s" == *frozen* ]]
+}
+
+# pct shutdown, then pct stop only if still active after timeout (seconds).
+# Second arg overrides OCI_REFRESH_SHUTDOWN_TIMEOUT (default 60).
+# Returns 0 when CT is offline; 1 if still active after forced stop.
+pve_oci_pct_shutdown_or_stop() {
+  local vmid="$1" timeout="${2:-${OCI_REFRESH_SHUTDOWN_TIMEOUT:-60}}"
+
+  [[ "$vmid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$timeout" =~ ^[0-9]+$ ]] || return 1
+
+  pve_oci_pct_ct_is_active "$vmid" || return 0
+
+  set +e
+  pct shutdown "$vmid" --timeout "$timeout"
+  local shutdown_rc=$?
+  if [[ "$shutdown_rc" -ne 0 ]] && pve_oci_pct_ct_is_active "$vmid"; then
+    pct shutdown "$vmid"
+    shutdown_rc=$?
+  fi
+  set -e
+
+  if pve_oci_pct_ct_is_active "$vmid"; then
+    set +e
+    pct stop "$vmid"
+    set -e
+  fi
+
+  pve_oci_pct_ct_is_active "$vmid" && return 1
+  return 0
+}
+
 # Tags string for pct UI (semicolon-separated). Uses pct(1) when /etc/pve is visible here; else
 # pvesh GET /nodes/<host>/lxc/<vmid>/config when cluster resources list the CT (other member / pmxcfs).
 pve_oci_lxc_tags_pct_or_api() {
