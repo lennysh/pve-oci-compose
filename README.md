@@ -108,6 +108,8 @@ The file is YAML with a single top-level mapping.
 | `image` or `reference` | all | OCI image reference (same conventions as the worker create/refresh scripts). |
 | `rootfs` | **plan**, **apply**, **refresh** | e.g. `local-zfs:8` — passed to create; **pull** does not require it. |
 | `template_storage` | optional | vztmpl storage id for `oci-registry-pull`; alias `storage`. Empty or omitted lets the create script auto-pick when there is exactly one suitable store. |
+| `refresh_pre_backup` | optional | Pre-refresh safety: **`snapshot`** (default), **`auto`** (snapshot then **`vzdump`** on failure), **`vzdump`**, **`none`**. |
+| `refresh_backup_storage` | optional | **`vzdump`** storage id for **`auto`** / **`vzdump`** (e.g. **`nfs-backups`**, **`pbs`**). Required for **`auto`** fallback when snapshots fail. |
 | `pool` | optional | Datacenter **resource pool** id for UI grouping. Defaults to top-level **`name`** / **`project`**. Set to **`""`** or **`null`** in **`defaults`** to disable. If the pool id does not exist, **apply** / **refresh** run **`pvesh create /pools`** (opt out with **`PVE_OCI_POOL_NO_AUTOCREATE=1`**). |
 | `hostname`, `net0`, `net1`, … | optional | **`pct --netN`**: any keys matching **`net[0-9]+`** are passed in numeric order. If none are set, **`net0`** defaults to `name=eth0,bridge=vmbr0,ip=dhcp` (or env **`OCI_CT_CREATE_NET0`**). |
 | `node`, `memory`, `swap`, `cores`, `cpulimit`, `cpuunits`, `ostype`, `arch`, `features` | optional | Passed to **`pct create`** as the matching flags (`--memory`, `--swap`, …). **`node`** is also used as a hint when **`refresh`** cannot read **`pct config`** on this cluster member (existence via **`pvesh`**). |
@@ -143,7 +145,7 @@ See **`compose.example.yaml`**: a minimal working service plus **long commented 
 |---------|----------|
 | **plan** | No changes. For each service: CT exists?, **`tags`** from **`pct`** / API, stored **`ref`** from the guest marker JSON (**`PVE_OCI_ROOTFS_MARKER`**), would **apply** / **refresh**? If the vmid is an **existing LXC** without compose marker/tag (e.g. OCI created outside this tool), **plan** prints a **WARNING** and **would REFUSE** for **apply** so you can verify before pulling templates. |
 | **apply** | If missing, **create**, then sentinel tag **`pve-oci-compose`** + guest JSON marker (**`pct mount`** briefly on a stopped CT). **plan**/`refresh` use **`pct exec`** when running else **`pct mount`** to read the JSON. Before pull/create, **apply** checks **`pvesh get /cluster/resources`** so a vmid already used by a **QEMU** guest fails immediately (LXC-only **`pct config`** is not enough). An LXC may **run on another cluster node**: **`pct config`** can fail on the member where you run the script even though the guest exists; the tool then uses the API (**hosting node** from resources + **`pvesh …/lxc/<vmid>/config`**) for **tags** and still treats the vmid as taken. If the vmid is an existing LXC without a compose marker/tag, **apply** refuses (same as “not adopted”) instead of pulling then failing at **`pct create`**. |
-| **refresh** | Per service: if compose **`image`** ≠ guest marker **`ref`**, run rootfs replace (optional **`pct snapshot`** unless **`--no-snapshot`** / **`--allow-failed-snapshot`**), **`rsync`** from a temp CT built from the new image, sync **`entrypoint`** on the host config, destroy temp CT, **start** the target CT. Skips when refs match unless **`--force`**. Skips CTs with no readable marker unless **`--adopt`** (then writes marker + tag after success). **`rsync`** excludes **`mp*`** bind-mount guest paths so **`--delete`** does not hit busy mountpoints. |
+| **refresh** | Per service: if compose **`image`** ≠ guest marker **`ref`**, run rootfs replace (pre-backup: **`pct snapshot`**, optional **`vzdump`** fallback — see **`refresh_pre_backup`** / **`--pre-backup auto`**), **`rsync`** from a temp CT built from the new image, sync **`entrypoint`** on the host config, destroy temp CT, **start** the target CT. Skips when refs match unless **`--force`**. Skips CTs with no readable marker unless **`--adopt`** (then writes marker + tag after success). **`rsync`** excludes **`mp*`** bind-mount guest paths so **`--delete`** does not hit busy mountpoints. |
 | **pull** | Per service: **`oci-registry-pull`** only (**`--pull-only`**); needs **`image`** / **`reference`**, not **`rootfs`**. |
 
 ### CLI options
@@ -159,8 +161,10 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 | `--no-write-compose` | apply | After **apply** with `vmid: next` / `auto` / `null`, do not rewrite the compose file with the allocated id. Same as **`PVE_OCI_COMPOSE_NO_WRITE=1`**. |
 | `--adopt` | refresh | Refresh a CT that has **no readable guest marker JSON** yet (hand-created / UI OCI guest). After a successful refresh, writes the marker file and merges the **`pve-oci-compose`** sentinel tag. Does **not** make **apply** create over an unmanaged CT. |
 | `--force` | refresh | Run refresh even when the stored **`ref`** in the guest marker already matches the compose **`image`**. |
-| `--no-snapshot` | refresh | Skip **`pct snapshot`** before rootfs sync. |
-| `--allow-failed-snapshot` | refresh | Try **`pct snapshot`** but continue if it fails (default: abort on snapshot failure). Cannot be combined with **`--no-snapshot`**. |
+| `--no-snapshot` | refresh | Skip pre-backup (`--pre-backup none`). |
+| `--pre-backup MODE` | refresh | **`snapshot`** (default), **`auto`** (snapshot then **`vzdump`** on failure), **`vzdump`**, or **`none`**. |
+| `--backup-storage ID` | refresh | **`vzdump`** target for **`auto`** / **`vzdump`** (overrides compose **`refresh_backup_storage`**). |
+| `--allow-failed-snapshot` | refresh | Continue if pre-backup fails (default: abort). Cannot combine with **`--no-snapshot`**. |
 | `-h`, `--help` | — | Print usage (compose schema summary + options) and exit. |
 
 ### Environment variables
@@ -178,6 +182,8 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 | **`OCI_CT_CREATE_NO_RESOLVE_LATEST=1`** | Skip **`skopeo`** resolution of floating **`:latest`** / **`*_latest`** refs before pull (use the compose string as-is). |
 | **`OCI_REFRESH_TEMPLATE_STORAGE`** | Vztmpl storage id for **refresh** temp-CT pulls when a node has multiple template stores. **refresh** from compose sets this from **`template_storage`** / **`storage`** per service; set manually only for direct **`oci_refresh_main`** calls. |
 | **`OCI_REFRESH_TEMP_NET0`** | Default **`pct --net0`** for the **disposable temp CT** during **refresh** (default: `name=eth0,bridge=vmbr0,ip=dhcp`). |
+| **`OCI_REFRESH_PRE_BACKUP`** | Pre-refresh mode for **`oci_refresh_main`**: **`snapshot`**, **`auto`**, **`vzdump`**, **`none`**. Compose **`refresh`** sets this from **`refresh_pre_backup`** per service (defaults merge). |
+| **`OCI_REFRESH_VZDUMP_STORAGE`** | **`vzdump`** storage id for **`auto`** / **`vzdump`** (e.g. **`nfs-backups`**, **`pbs`**). Compose **`refresh`** sets from **`refresh_backup_storage`**. |
 | **`OCI_REFRESH_SHUTDOWN_TIMEOUT`** | Seconds to wait for **`pct shutdown`** on the CT being refreshed before **`pct stop`** (default **60**). Temp CT still uses **`pct stop`**. |
 
 ### Image references and pulls
@@ -207,7 +213,7 @@ The compose driver calls **`oci_create_main`** and **`oci_refresh_main`**; you n
 | `--list-template-storages` | List vztmpl-capable storages on this node; exit 0. |
 | `--vmid` … `--mp-bind`, `--lxc-line`, … | Same **`pct create`** surface as compose fields (see **`oci_create_usage`** in **`lib/oci-create.inc.sh`**). |
 
-**Refresh** (`oci_refresh_main OLD_VMID NEW_REF [TEMP_VMID]`): same **`--no-snapshot`** / **`--allow-failed-snapshot`** flags as **`pve-oci-compose.sh refresh`** (must appear before positional args when calling **`oci_refresh_main`** directly). Optional third argument: temp CT vmid (default: cluster next free id).
+**Refresh** (`oci_refresh_main OLD_VMID NEW_REF [TEMP_VMID]`): same **`--pre-backup`**, **`--backup-storage`**, **`--no-snapshot`**, and **`--allow-failed-snapshot`** flags as **`pve-oci-compose.sh refresh`** (must appear before positional args when calling **`oci_refresh_main`** directly). Optional third argument: temp CT vmid (default: cluster next free id).
 
 ## Compose marker (UI + drift + snapshots)
 
@@ -234,7 +240,7 @@ Use **pinned tags or digests** when you care exactly when **refresh** runs; floa
 - **Entrypoint**: **`pct` `entrypoint`** lives in **`/etc/pve/lxc/<vmid>.conf`**, not in the root disk. After **`refresh`**, that value is synced from the temp CT built from the new image (or **`--delete entrypoint`** if the new template has none). Other config keys (**`ostype`**, **`features`**, …) stay as they were unless you extend the tool.
 - **Why a scratch CT for refresh:** Proxmox turns an OCI template into a runnable root tree via **`pct create`** (unpack + metadata). There is no supported one-step “re-unpack this vztmpl **onto** an existing CT’s root volume in place.” Alternatives would be hand-unpacking the **`.tar`** to a directory and **`rsync`** (still scratch space + you must mirror whatever **`pct create`** does), or a second volume you swap in (**ZFS** dataset replace, etc.)—more moving parts. The temp VMID is only a **read source** for **`rsync`**; **`PVE_OCI_CREATE_QUIET=1`** trims duplicate create-style banners so logs read as “refresh,” not “go start this CT.”
 - **Stateful data**: keep long-lived data on **`mp`** volumes or bind mounts, not only on rootfs—the refresh worker replaces the root tree (see **`lib/oci-refresh.inc.sh`** and the **Advanced** section above for snapshot flags).
-- **Snapshots / backups**: refresh uses the worker’s snapshot behaviour; production DR is still **vzdump** / PBS / your policy—not replaced by this tool.
+- **Snapshots / backups**: refresh pre-backup uses **`pct snapshot`** by default; set **`refresh_pre_backup: auto`** and **`refresh_backup_storage`** (or **`--pre-backup auto --backup-storage …`**) to **`vzdump`** when snapshots fail. Production DR is still your scheduled **vzdump** / PBS policy—not replaced by this tool.
 - **Clusters**: run **refresh** on the node that owns the CT (**`pct mount`** / **`rsync`** need local storage). If you run it elsewhere, the driver resolves the guest via the API (and **`node:`** in compose) and errors with the hosting node name instead of “vmid does not exist.”
 
 ## Help

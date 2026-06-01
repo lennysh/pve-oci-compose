@@ -19,6 +19,8 @@ ADOPT=0
 FORCE_REFRESH=0
 REFRESH_NO_SNAPSHOT=0
 REFRESH_ALLOW_FAILED_SNAPSHOT=0
+REFRESH_PRE_BACKUP=""
+REFRESH_BACKUP_STORAGE=""
 DRY_RUN=0
 WRITE_COMPOSE_VMID=1
 FILTER_SERVICE=""
@@ -41,9 +43,12 @@ Options:
                     marker file + sentinel tag applied after success. Path: see
                     PVE_OCI_ROOTFS_MARKER (default /etc/pve-oci-compose.json).
   --force           refresh: run refresh even when stored ref matches compose image.
-  --no-snapshot     refresh: skip pct snapshot before rootfs sync (see lib/oci-refresh.inc.sh).
+  --no-snapshot     refresh: skip pre-backup (--pre-backup none; see lib/oci-refresh.inc.sh).
+  --pre-backup MODE refresh: snapshot (default), auto (snapshot then vzdump on failure), vzdump, none.
+  --backup-storage ID
+                    refresh: vzdump target for auto/vzdump (overrides compose refresh_backup_storage).
   --allow-failed-snapshot
-                    refresh: try pct snapshot but continue if it fails (default: abort).
+                    refresh: continue if pre-backup fails (default: abort).
   -n, --dry-run     Print commands only (apply / refresh / pull).
   --service NAME    plan / apply / refresh / pull: run only this services: key (YAML order ignored).
   --vmid ID         plan / apply / refresh / pull: run only the service with this numeric vmid.
@@ -80,6 +85,8 @@ Compose schema (per service; shallow merge from defaults except env — see READ
   image or reference (required) OCI ref for create / refresh (bare refs get oci:// prefix in refresh worker)
   rootfs             (required for apply) e.g. local-zfs:8
   template_storage   vztmpl storage id for oci-registry-pull (optional; alias storage)
+  refresh_pre_backup snapshot | auto | vzdump | none — pre-refresh safety (default snapshot)
+  refresh_backup_storage  vzdump storage id for auto/vzdump (e.g. nfs-backups, pbs)
   hostname, net0 … netN   pct --netN (any net keys net0, net1, …); default net0 if none set
   node, memory, swap, cores, cpulimit, cpuunits, ostype, arch, unprivileged, features, onboot
   nameserver, searchdomain, entrypoint
@@ -921,9 +928,13 @@ cmd_refresh() {
     validate_service_refresh "$svc" "$sname"
     vmid="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
-    unset OCI_REFRESH_TEMPLATE_STORAGE || true
+    unset OCI_REFRESH_TEMPLATE_STORAGE OCI_REFRESH_PRE_BACKUP OCI_REFRESH_VZDUMP_STORAGE || true
     ts="$(jq -r '.template_storage // .storage // empty' <<<"$svc")"
     [[ -n "$ts" ]] && export OCI_REFRESH_TEMPLATE_STORAGE="$ts"
+    pb="$(jq -r '.refresh_pre_backup // empty' <<<"$svc")"
+    bs="$(jq -r '.refresh_backup_storage // empty' <<<"$svc")"
+    [[ -n "$pb" ]] && export OCI_REFRESH_PRE_BACKUP="$pb"
+    [[ -n "$bs" ]] && export OCI_REFRESH_VZDUMP_STORAGE="$bs"
     unset PVE_OCI_COMPOSE_SERVICE || true
     unset PVE_OCI_COMPOSE_REF || true
     export PVE_OCI_COMPOSE_SERVICE="$sname"
@@ -964,6 +975,8 @@ cmd_refresh() {
     refresh_args=()
     [[ "$REFRESH_NO_SNAPSHOT" -eq 1 ]] && refresh_args+=(--no-snapshot)
     [[ "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 ]] && refresh_args+=(--allow-failed-snapshot)
+    [[ -n "$REFRESH_PRE_BACKUP" ]] && refresh_args+=(--pre-backup "$REFRESH_PRE_BACKUP")
+    [[ -n "$REFRESH_BACKUP_STORAGE" ]] && refresh_args+=(--backup-storage "$REFRESH_BACKUP_STORAGE")
     run_or_print oci_refresh_main "${refresh_args[@]}" "$vmid" "$image"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -1020,6 +1033,8 @@ while [[ $# -gt 0 ]]; do
     --adopt)         ADOPT=1; shift ;;
     --force)         FORCE_REFRESH=1; shift ;;
     --no-snapshot)   REFRESH_NO_SNAPSHOT=1; shift ;;
+    --pre-backup)    REFRESH_PRE_BACKUP="${2:?}"; shift 2 ;;
+    --backup-storage) REFRESH_BACKUP_STORAGE="${2:?}"; shift 2 ;;
     --allow-failed-snapshot) REFRESH_ALLOW_FAILED_SNAPSHOT=1; shift ;;
     -n|--dry-run)    DRY_RUN=1; shift ;;
     --no-write-compose) WRITE_COMPOSE_VMID=0; shift ;;
@@ -1042,12 +1057,26 @@ done
 
 [[ -n "$CMD" ]] || usage
 
+if [[ -n "$REFRESH_PRE_BACKUP" ]]; then
+  case "$REFRESH_PRE_BACKUP" in
+    snapshot|auto|vzdump|none) ;;
+    *) die "invalid --pre-backup: ${REFRESH_PRE_BACKUP} (use snapshot, auto, vzdump, none)" ;;
+  esac
+fi
+if [[ "$REFRESH_PRE_BACKUP" == "none" && "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 ]]; then
+  die "cannot combine --pre-backup none with --allow-failed-snapshot"
+fi
+
 if [[ "$REFRESH_NO_SNAPSHOT" -eq 1 && "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 ]]; then
   die "cannot combine --no-snapshot with --allow-failed-snapshot"
 fi
+if [[ "$REFRESH_NO_SNAPSHOT" -eq 1 && -n "$REFRESH_PRE_BACKUP" && "$REFRESH_PRE_BACKUP" != "none" ]]; then
+  die "cannot combine --no-snapshot with --pre-backup ${REFRESH_PRE_BACKUP}"
+fi
 if [[ "$CMD" != refresh ]]; then
-  if [[ "$REFRESH_NO_SNAPSHOT" -eq 1 || "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 ]]; then
-    die "--no-snapshot and --allow-failed-snapshot are only valid with refresh"
+  if [[ "$REFRESH_NO_SNAPSHOT" -eq 1 || "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 \
+      || -n "$REFRESH_PRE_BACKUP" || -n "$REFRESH_BACKUP_STORAGE" ]]; then
+    die "--no-snapshot, --pre-backup, --backup-storage, and --allow-failed-snapshot are only valid with refresh"
   fi
   if [[ "$ADOPT" -eq 1 || "$FORCE_REFRESH" -eq 1 ]]; then
     die "--adopt and --force are only valid with refresh"

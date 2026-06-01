@@ -7,8 +7,10 @@ oci_refresh_usage() {
   echo "   or: oci_refresh_main [options] [--] <old_ctid> <new_oci_ref> [temp_ctid]"
   echo ""
   echo "Options:"
-  echo "  --no-snapshot             Skip pct snapshot entirely"
-  echo "  --allow-failed-snapshot   Try pct snapshot, but continue if it fails (default: abort on failure)"
+  echo "  --pre-backup MODE         Pre-refresh safety: snapshot (default), auto, vzdump, or none"
+  echo "  --backup-storage ID       vzdump target when MODE is auto or vzdump (see OCI_REFRESH_VZDUMP_STORAGE)"
+  echo "  --no-snapshot             Same as --pre-backup none"
+  echo "  --allow-failed-snapshot   Continue if pre-backup fails (default: abort)"
   echo "  -h, --help                Show this help"
   echo ""
   echo "  old_ctid     Running or stopped CT to update (keeps same CTID, net, mpX, ...)"
@@ -25,18 +27,90 @@ oci_refresh_usage() {
   echo ""
   echo "Running CTs are shut down gracefully (pct shutdown) before rootfs work; pct stop runs only"
   echo "if still active after OCI_REFRESH_SHUTDOWN_TIMEOUT seconds (default 60). Temp CT uses pct stop."
+  echo ""
+  echo "Pre-backup modes:"
+  echo "  snapshot  pct snapshot only (abort on failure unless --allow-failed-snapshot)"
+  echo "  auto        pct snapshot, then vzdump to --backup-storage / OCI_REFRESH_VZDUMP_STORAGE on failure"
+  echo "  vzdump      vzdump only (no pct snapshot)"
+  echo "  none        skip pre-backup (--no-snapshot)"
   exit 1
+}
+
+pve_oci_refresh_node_name() {
+  if command -v pvecm >/dev/null 2>&1; then
+    pvecm nodename 2>/dev/null || hostname -s
+  else
+    hostname -s
+  fi
+}
+
+# vzdump a stopped CT; waits on the Proxmox task UPID when returned. Returns 0 on success.
+pve_oci_refresh_vzdump_ct() {
+  local vmid="$1" storage="$2"
+  local node out upid
+
+  [[ "$vmid" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "$storage" ]] || return 1
+
+  node="$(pve_oci_refresh_node_name)"
+  NODE="$node"
+  export NODE
+
+  out_sub "vzdump CT ${vmid}"
+  out_kv "Backup storage" "$storage"
+  out_kv "Mode" "stop (CT already offline)"
+  out_cmd "pvesh create /nodes/${node}/vzdump --vmid ${vmid} --storage ${storage} --mode stop --compress zstd"
+
+  set +e
+  out=$(pvesh create "/nodes/${node}/vzdump" \
+    --vmid "$vmid" \
+    --storage "$storage" \
+    --mode stop \
+    --compress zstd \
+    --notes-template "pve-oci-compose-pre-refresh" \
+    --output-format json 2>&1)
+  local vz_rc=$?
+  set -e
+  if [[ "$vz_rc" -ne 0 ]]; then
+    echo "$out" >&2
+    return 1
+  fi
+
+  upid="$(parse_upid_from_create_response "$out" || true)"
+  if [[ -n "$upid" ]]; then
+    out_kv "Task UPID" "$upid"
+    out_sub "Waiting for vzdump task …"
+    wait_for_task "$upid"
+  fi
+
+  out_ok "vzdump finished"
+  out_kv "Restore" "Proxmox UI → Datacenter → Backup, or storage ${storage} for CT ${vmid}"
+  return 0
+}
+
+oci_refresh_pre_backup_abort_or_continue() {
+  local msg="$1"
+  if [[ "$ALLOW_FAILED_SNAPSHOT" -eq 0 ]]; then
+    echo "$msg" >&2
+    exit 1
+  fi
+  out_warn "$msg"
+  out_warn "Continuing without rollback safety (--allow-failed-snapshot)."
 }
 
 oci_refresh_main() {
   unset PVE_OCI_LAST_PULL_REFERENCE PVE_OCI_LAST_REFERENCE_INPUT 2>/dev/null || true
 SKIP_SNAPSHOT=0
 ALLOW_FAILED_SNAPSHOT=0
+PRE_BACKUP_MODE=""
+VZDUMP_STORAGE="${OCI_REFRESH_VZDUMP_STORAGE:-}"
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
     --)                        shift; break ;;
     --no-snapshot)             SKIP_SNAPSHOT=1; shift ;;
     --allow-failed-snapshot)   ALLOW_FAILED_SNAPSHOT=1; shift ;;
+    --pre-backup)              PRE_BACKUP_MODE="${2:?}"; shift 2 ;;
+    --backup-storage)          VZDUMP_STORAGE="${2:?}"; shift 2 ;;
     -h|--help)                 oci_refresh_usage ;;
     *)
       echo "Unknown option: $1" >&2
@@ -49,6 +123,29 @@ done
 ORIG_REF_RAW="$2"
 if [[ "$SKIP_SNAPSHOT" -ne 0 && "$ALLOW_FAILED_SNAPSHOT" -ne 0 ]]; then
   echo "Cannot combine --no-snapshot with --allow-failed-snapshot (nothing to allow)." >&2
+  exit 1
+fi
+if [[ "$SKIP_SNAPSHOT" -ne 0 && -n "$PRE_BACKUP_MODE" && "$PRE_BACKUP_MODE" != "none" ]]; then
+  echo "Cannot combine --no-snapshot with --pre-backup ${PRE_BACKUP_MODE}." >&2
+  exit 1
+fi
+
+if [[ "$SKIP_SNAPSHOT" -ne 0 ]]; then
+  PRE_BACKUP="none"
+elif [[ -n "$PRE_BACKUP_MODE" ]]; then
+  PRE_BACKUP="$PRE_BACKUP_MODE"
+else
+  PRE_BACKUP="${OCI_REFRESH_PRE_BACKUP:-snapshot}"
+fi
+case "$PRE_BACKUP" in
+  snapshot|auto|vzdump|none) ;;
+  *)
+    echo "Invalid pre-backup mode: ${PRE_BACKUP} (use snapshot, auto, vzdump, or none)." >&2
+    exit 1
+    ;;
+esac
+if [[ "$PRE_BACKUP" == "none" && "$ALLOW_FAILED_SNAPSHOT" -ne 0 ]]; then
+  echo "Cannot combine --no-snapshot / --pre-backup none with --allow-failed-snapshot." >&2
   exit 1
 fi
 
@@ -268,32 +365,46 @@ else
   out_ok "CT ${OLD} already stopped"
 fi
 
-# Proxmox integrates pct snapshot with snapshot-capable rootfs/mp storages (e.g. ZFS).
+# Pre-backup before rootfs rsync: pct snapshot, vzdump, or both (auto = snapshot then vzdump on failure).
 # Bind-mount host paths are not part of the root volume; snapshot mainly covers managed volumes.
-if [[ "$SKIP_SNAPSHOT" -eq 0 ]]; then
-  SNAP_NAME="pre-oci-refresh-$(date -u +%Y%m%d-%H%M%S)UTC"
-  SNAP_DESC="oci-ct-refresh-rootfs.sh before rsync from ${NEW_OCI}"
-  out_sub "Snapshot CT ${OLD}"
-  out_kv "Snapshot" "$SNAP_NAME"
-  set +e
-  pct snapshot "$OLD" "$SNAP_NAME" --description "$SNAP_DESC"
-  snap_rc=$?
-  set -e
-  if [[ "$snap_rc" -eq 0 ]]; then
-    out_ok "Snapshot created"
-    out_kv "Rollback cmd" "pct rollback ${OLD} ${SNAP_NAME}"
-  else
-    if [[ "$ALLOW_FAILED_SNAPSHOT" -eq 0 ]]; then
-      echo "Snapshot failed (exit ${snap_rc}); aborting. Fix storage/snapshot support or pass --allow-failed-snapshot." >&2
-      exit 1
+case "$PRE_BACKUP" in
+  none)
+    out_sub "Pre-backup (none)"
+    out_ok "Skipped"
+    ;;
+  vzdump)
+    [[ -n "$VZDUMP_STORAGE" ]] \
+      || oci_refresh_pre_backup_abort_or_continue "pre-backup vzdump requires --backup-storage or OCI_REFRESH_VZDUMP_STORAGE (compose refresh_backup_storage)."
+    if [[ -n "$VZDUMP_STORAGE" ]]; then
+      pve_oci_refresh_vzdump_ct "$OLD" "$VZDUMP_STORAGE" \
+        || oci_refresh_pre_backup_abort_or_continue "vzdump failed for CT ${OLD} on storage ${VZDUMP_STORAGE}."
     fi
-    out_warn "pct snapshot failed (exit ${snap_rc}); continuing (--allow-failed-snapshot)."
-    out_warn "Prefer snapshot-capable storage, or vzdump/PBS for rollback safety."
-  fi
-else
-  out_sub "Snapshot (--no-snapshot)"
-  out_ok "Skipped snapshot"
-fi
+    ;;
+  snapshot|auto)
+    SNAP_NAME="pre-oci-refresh-$(date -u +%Y%m%d-%H%M%S)UTC"
+    SNAP_DESC="oci-ct-refresh-rootfs.sh before rsync from ${NEW_OCI}"
+    out_sub "Pre-backup (${PRE_BACKUP})"
+    out_kv "Snapshot" "$SNAP_NAME"
+    [[ "$PRE_BACKUP" == "auto" && -n "$VZDUMP_STORAGE" ]] && out_kv "vzdump fallback" "$VZDUMP_STORAGE"
+    set +e
+    pct snapshot "$OLD" "$SNAP_NAME" --description "$SNAP_DESC"
+    snap_rc=$?
+    set -e
+    if [[ "$snap_rc" -eq 0 ]]; then
+      out_ok "Snapshot created"
+      out_kv "Rollback cmd" "pct rollback ${OLD} ${SNAP_NAME}"
+    elif [[ "$PRE_BACKUP" == "snapshot" ]]; then
+      oci_refresh_pre_backup_abort_or_continue "pct snapshot failed (exit ${snap_rc}). Fix storage/snapshot support, use --pre-backup auto with refresh_backup_storage, or pass --allow-failed-snapshot."
+    else
+      out_warn "pct snapshot failed (exit ${snap_rc}); trying vzdump fallback …"
+      if [[ -z "$VZDUMP_STORAGE" ]]; then
+        oci_refresh_pre_backup_abort_or_continue "snapshot failed and no backup storage configured (set refresh_backup_storage in compose, OCI_REFRESH_VZDUMP_STORAGE, or --backup-storage)."
+      elif ! pve_oci_refresh_vzdump_ct "$OLD" "$VZDUMP_STORAGE"; then
+        oci_refresh_pre_backup_abort_or_continue "snapshot and vzdump both failed for CT ${OLD}."
+      fi
+    fi
+    ;;
+esac
 
 if pct config "$TEMP" &>/dev/null; then
   out_warn "Temp CT ${TEMP} already exists — reusing (will stop and refresh from image)."

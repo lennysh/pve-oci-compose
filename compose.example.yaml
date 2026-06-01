@@ -14,7 +14,7 @@
 #   services         — one entry per CT; processed in YAML order (not alphabetical)
 #
 # Per-service: vmid, image|reference, rootfs (not required for pull), template_storage|storage,
-# pool, net0…, env|environment, mounts, bind_mounts, lxc_config_lines, guest_ports, about, …
+# refresh_pre_backup, refresh_backup_storage, pool, net0…, env|environment, mounts, bind_mounts,
 
 # Optional stack-wide description footer (composed CT Notes):
 # repo: https://github.com/your-org/your-fork
@@ -26,6 +26,12 @@ name: example-stack
 
 defaults:
   template_storage: "" # vztmpl id for oci-registry-pull; "" = auto-pick when exactly one store exists
+
+  # --- refresh pre-backup (optional) ---
+  # refresh_pre_backup: snapshot   # default: pct snapshot only; abort on failure
+  # refresh_pre_backup: auto       # snapshot first; vzdump to refresh_backup_storage if snapshot fails
+  # refresh_pre_backup: vzdump      # vzdump only (no pct snapshot)
+  # refresh_backup_storage: nfs-backups  # local/NFS vzdump store; use pbs for Proxmox Backup Server
 
   # --- pool (optional) ---
   # pool: ""                    # disable default pool id (= stack name) for every service
