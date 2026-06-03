@@ -469,6 +469,13 @@ else
   out_warn "Could not write guest marker — run compose refresh or apply afterward."
 fi
 
+if [[ -n "${PVE_OCI_COMPOSE_SVC_JSON:-}" && -n "${PVE_OCI_COMPOSE_DIR:-}" ]] \
+  && [[ "$(pve_oci_file_inject_count "$PVE_OCI_COMPOSE_SVC_JSON")" -gt 0 ]]; then
+  out_sub "Compose file inject (on_refresh)"
+  pve_oci_file_inject_report "$OLD" refresh "$PVE_OCI_COMPOSE_SVC_JSON" "$PVE_OCI_COMPOSE_DIR" "$M_OLD" \
+    || die "refresh: failed to inject compose files into CT ${OLD}"
+fi
+
 trap - EXIT
 out_sub "Cleanup: unmount → sync entrypoint → destroy ${TEMP} → start ${OLD}"
 pct unmount "$TEMP"

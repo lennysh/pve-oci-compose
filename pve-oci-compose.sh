@@ -7,6 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.inc.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/common.inc.sh"
+# shellcheck source=lib/file-inject.inc.sh disable=SC1091
+source "${SCRIPT_DIR}/lib/file-inject.inc.sh"
 # shellcheck source=lib/ui.inc.sh disable=SC1091
 source "${SCRIPT_DIR}/lib/ui.inc.sh"
 # shellcheck source=lib/oci-create.inc.sh disable=SC1091
@@ -104,6 +106,10 @@ Compose schema (per service; shallow merge from defaults except env — see READ
                      /mnt/pve/nfs-media,mp=/mnt/Media01,shared=1,replicate=0,size=0T → --mp-bind
   lxc_config_lines   optional list of raw PVE/LXC lines (e.g. lxc.cgroup2.devices.allow, lxc.mount.entry);
                      written after pct create to /etc/pve/lxc/<vmid>.conf (new CT only — not on apply skip)
+  rootfs_files       optional list: inject host source or inline content into the guest rootfs (apply: all entries;
+                     refresh: only on_refresh: true). path, source|content, mode, owner, group.
+  mount_files        optional list: inject into a guest path from mounts: or bind_mounts: (mount: /guest/mp, path: …).
+                     Same on_refresh semantics; volume paths use pvesm path when the mp is not under pct mount.
   pool               optional; Datacenter resource pool id. Defaults to top-level name/project
                      (stack). Use pool: "" or pool: null in defaults to disable. Missing pools are
                      auto-created unless PVE_OCI_POOL_NO_AUTOCREATE=1.
@@ -298,6 +304,9 @@ validate_service() {
     _oci_validate_lxc_config_line "$lx" \
       || die "service $svc: invalid lxc_config_lines entry (KEY: value or KEY = value; no [snapshots] or #-only lines): ${lx:0:120}"
   done < <(jq -r '.lxc_config_lines[]? | strings' <<<"$json")
+  local compose_dir
+  compose_dir="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)"
+  pve_oci_file_inject_validate "$json" "$svc" "$compose_dir"
 }
 
 validate_service_refresh() {
@@ -525,6 +534,7 @@ cmd_plan() {
       if jq -e '(.lxc_config_lines // []) | length > 0' <<<"$svc" >/dev/null 2>&1; then
         echo "  lxc_config_lines: $(jq -r '(.lxc_config_lines // []) | length' <<<"$svc") raw PVE/LXC line(s) (apply → new CT only)"
       fi
+      pve_oci_file_inject_plan_line "$svc"
       echo "  plan apply:    would allocate next free vmid and create from $image"
       echo "  plan refresh:  n/a until vmid is fixed in the file (run apply to write it)"
       desc_preview="$(printf '%s' "$svc" | pve_oci_compose_pct_description "$stack" "$sa" "$(jq -c '.repo' <<<"$json")" 2>/dev/null || true)"
@@ -573,6 +583,7 @@ cmd_plan() {
     if jq -e '(.lxc_config_lines // []) | length > 0' <<<"$svc" >/dev/null 2>&1; then
       echo "  lxc_config_lines: $(jq -r '(.lxc_config_lines // []) | length' <<<"$svc") raw PVE/LXC line(s) (apply → new CT only)"
     fi
+    pve_oci_file_inject_plan_line "$svc"
     ns_plan="$(jq -r '
       (.nameserver // empty)
       | if type == "array" then map(tostring) | join(", ")
@@ -802,8 +813,9 @@ fill_create_args() {
 OCI_CREATE_ARGS=()
 
 cmd_apply() {
-  local json sname svc spec resolved image merged stack effpool sa rj
+  local json sname svc spec resolved image merged stack effpool sa rj compose_dir
   json="$(compose_json)"
+  compose_dir="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
   rj="$(jq -c '.repo' <<<"$json")"
@@ -884,11 +896,15 @@ cmd_apply() {
       printf ' %q' pct set "$resolved" --tags "$merged"
       printf '\n'
       echo "apply: [$sname] would write guest ${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json} (pct mount briefly)"
+      if [[ "$(pve_oci_file_inject_count "$svc")" -gt 0 ]]; then
+        pve_oci_file_inject_report "$resolved" apply "$svc" "$compose_dir" "" || true
+      fi
       if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
         echo "apply: [$sname] DRY-RUN: after real create, would pct set $resolved --description … (resolved pull ref + template sync)"
       fi
     else
-      pve_oci_set_managed_marker "$resolved" "$sname" "$image"
+      pve_oci_set_managed_marker_with_files "$resolved" "$sname" "$image" "$svc" "$compose_dir" \
+        || die "apply: [$sname] failed marker or file inject on CT $resolved"
       if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
         pve_oci_compose_pct_description_finalize "$resolved" "$svc" "$stack" "$sa" "$rj" || true
       fi
@@ -912,9 +928,10 @@ cmd_apply() {
 }
 
 cmd_refresh() {
-  local json sname svc vmid image merged stored ts stack effpool sa rj compose_node me adopt_ex
+  local json sname svc vmid image merged stored ts stack effpool sa rj compose_node me adopt_ex compose_dir
   local -a refresh_args
   json="$(compose_json)"
+  compose_dir="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)"
   stack="$(jq -r '.project // empty' <<<"$json")"
   sa="$(jq -r 'if (.stack_about | type) == "string" then .stack_about else "" end' <<<"$json")"
   rj="$(jq -c '.repo' <<<"$json")"
@@ -935,10 +952,11 @@ cmd_refresh() {
     bs="$(jq -r '.refresh_backup_storage // empty' <<<"$svc")"
     [[ -n "$pb" ]] && export OCI_REFRESH_PRE_BACKUP="$pb"
     [[ -n "$bs" ]] && export OCI_REFRESH_VZDUMP_STORAGE="$bs"
-    unset PVE_OCI_COMPOSE_SERVICE || true
-    unset PVE_OCI_COMPOSE_REF || true
+    unset PVE_OCI_COMPOSE_SERVICE PVE_OCI_COMPOSE_REF PVE_OCI_COMPOSE_DIR PVE_OCI_COMPOSE_SVC_JSON 2>/dev/null || true
     export PVE_OCI_COMPOSE_SERVICE="$sname"
     export PVE_OCI_COMPOSE_REF="$image"
+    export PVE_OCI_COMPOSE_DIR="$compose_dir"
+    export PVE_OCI_COMPOSE_SVC_JSON="$svc"
 
     compose_node="$(jq -r '.node // empty' <<<"$svc")"
     unset PVE_OCI_REFRESH_PCT_OK PVE_OCI_REFRESH_LXC_ON_NODE 2>/dev/null || true
@@ -977,6 +995,10 @@ cmd_refresh() {
     [[ "$REFRESH_ALLOW_FAILED_SNAPSHOT" -eq 1 ]] && refresh_args+=(--allow-failed-snapshot)
     [[ -n "$REFRESH_PRE_BACKUP" ]] && refresh_args+=(--pre-backup "$REFRESH_PRE_BACKUP")
     [[ -n "$REFRESH_BACKUP_STORAGE" ]] && refresh_args+=(--backup-storage "$REFRESH_BACKUP_STORAGE")
+    if [[ "$DRY_RUN" -eq 1 && "$(pve_oci_file_inject_count "$svc")" -gt 0 ]]; then
+      echo "refresh: [$sname] DRY-RUN: after rsync, would inject on_refresh files (pct mount ${vmid})"
+      pve_oci_file_inject_report "$vmid" refresh "$svc" "$compose_dir" "" || true
+    fi
     run_or_print oci_refresh_main "${refresh_args[@]}" "$vmid" "$image"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then

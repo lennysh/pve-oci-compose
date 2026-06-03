@@ -15,6 +15,7 @@
 #
 # Per-service: vmid, image|reference, rootfs (not required for pull), template_storage|storage,
 # refresh_pre_backup, refresh_backup_storage, pool, net0…, env|environment, mounts, bind_mounts,
+# rootfs_files, mount_files (guest file inject; on_refresh for refresh-time re-apply),
 
 # Optional stack-wide description footer (composed CT Notes):
 # repo: https://github.com/your-org/your-fork
@@ -149,6 +150,24 @@ services:
     #   - "/mnt/pve/nfs-media,mp=/mnt/Media01,replicate=0,shared=1,size=0T"
     # lxc_config_lines:
     #   - "lxc.cgroup2.devices.allow: c 188:* rwm"
+
+    # --- Guest file inject (rootfs + mount paths; see README rootfs_files / mount_files) ---
+    # rootfs_files:
+    #   - path: /etc/resolv.conf
+    #     source: files/resolv.conf
+    #     on_refresh: true
+    #     mode: "644"
+    #   - path: /etc/myapp/bootstrap.conf
+    #     content: |
+    #       enabled=true
+    #     # apply-only (default): on_refresh omitted or false
+    # mount_files:
+    #   - mount: /var/lib/myapp
+    #     path: config.yml
+    #     source: files/myapp-config.yml
+    #   # owner: 1000
+    #   # group: 1000
+    #   # mode: "600"
 
   # Second service example: runs after nginx-demo (YAML order). Uncomment to try vmid writeback.
   # alpine-next:
