@@ -600,6 +600,7 @@ skopeo_copy_digest_ref_to_local_tar() {
 
 oci_registry_pull() {
   local ref="$1" out upid
+  pve_oci_skopeo_inspect_ref_or_die "$ref"
   if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
     out_muted "Scratch CT: template pull / reuse on ${STORAGE} (${ref})"
   else

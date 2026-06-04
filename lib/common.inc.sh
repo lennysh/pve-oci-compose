@@ -302,6 +302,9 @@ wait_for_task() {
         if [[ "${exitstatus^^}" == "OK" ]]; then
           return 0
         fi
+        if [[ "$exitstatus" == *skopeo*copy*failed* || "$exitstatus" == *manifest*unknown* ]]; then
+          echo "pve-oci-compose: hint: the image tag may not exist on the registry (check Docker Hub / GHCR tags for your compose image ref)." >&2
+        fi
         die "Task finished with exitstatus=${exitstatus:-unknown}. UPID=${upid}"
       fi
     else
@@ -340,6 +343,16 @@ elif len(parts) == 2:
 else:
     print(f"docker.io/{ref}")
 ' "$ref"
+}
+
+# Fail fast when a registry ref does not exist (skopeo inspect; optional if skopeo missing).
+pve_oci_skopeo_inspect_ref_or_die() {
+  local ref="$1" err
+  command -v skopeo >/dev/null 2>&1 || return 0
+  err="$(skopeo inspect "docker://${ref}" 2>&1)" || {
+    echo "$err" >&2
+    die "Registry image not found or not reachable: docker://${ref} (fix the compose image tag or use a full registry path)"
+  }
 }
 
 # CT hostname from pct config (fallback vmidN for vzdump notes).
