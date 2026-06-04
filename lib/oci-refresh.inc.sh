@@ -47,7 +47,7 @@ pve_oci_refresh_node_name() {
 # vzdump a stopped CT; waits on the Proxmox task UPID when returned. Returns 0 on success.
 pve_oci_refresh_vzdump_ct() {
   local vmid="$1" storage="$2"
-  local node out upid
+  local node out upid notes_host vz_notes
 
   [[ "$vmid" =~ ^[0-9]+$ ]] || return 1
   [[ -n "$storage" ]] || return 1
@@ -56,10 +56,14 @@ pve_oci_refresh_vzdump_ct() {
   NODE="$node"
   export NODE
 
+  notes_host="$(pve_oci_pct_hostname "$vmid")"
+  vz_notes="${notes_host} - pve-oci-compose-pre-refresh"
+
   out_sub "vzdump CT ${vmid}"
   out_kv "Backup storage" "$storage"
   out_kv "Mode" "stop (CT already offline)"
-  out_cmd "pvesh create /nodes/${node}/vzdump --vmid ${vmid} --storage ${storage} --mode stop --compress zstd"
+  out_kv "Notes" "$vz_notes"
+  out_cmd "pvesh create /nodes/${node}/vzdump --vmid ${vmid} --storage ${storage} --mode stop --compress zstd --notes-template $(printf '%q' "$vz_notes")"
 
   set +e
   out=$(pvesh create "/nodes/${node}/vzdump" \
@@ -67,7 +71,7 @@ pve_oci_refresh_vzdump_ct() {
     --storage "$storage" \
     --mode stop \
     --compress zstd \
-    --notes-template "pve-oci-compose-pre-refresh" \
+    --notes-template "$vz_notes" \
     --output-format json 2>&1)
   local vz_rc=$?
   set -e
@@ -152,17 +156,21 @@ fi
 OLD="$1"
 # pct requires oci:// for registry pulls; bare registry/repo:tag is normalized.
 normalize_image_ref() {
-  local r="$1"
+  local r="$1" bare
   case "$r" in
-    oci://*) printf '%s\n' "$r" ;;
+    oci://*) bare="${r#oci://}"; bare="$(pve_oci_normalize_registry_reference "$bare")"; printf 'oci://%s\n' "$bare" ;;
     /*|../*|./*) printf '%s\n' "$r" ;;
     http://*|https://*) printf '%s\n' "$r" ;;
     *:vztmpl/*|*:import/*) printf '%s\n' "$r" ;;
-    *) printf 'oci://%s\n' "$r" ;;
+    *)
+      bare="$(pve_oci_normalize_registry_reference "$r")"
+      printf 'oci://%s\n' "$bare"
+      ;;
   esac
 }
-NEW_OCI="$(normalize_image_ref "$2")"
-[[ "$NEW_OCI" != "$2" ]] && out_detail "Image ref normalized: $2 → $NEW_OCI"
+_ref_in="$2"
+NEW_OCI="$(normalize_image_ref "$_ref_in")"
+[[ "$NEW_OCI" != "$_ref_in" ]] && out_detail "Image ref normalized: $_ref_in → $NEW_OCI"
 
 if [[ -n "${3:-}" ]]; then
   TEMP="$3"

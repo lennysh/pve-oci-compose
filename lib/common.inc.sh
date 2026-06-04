@@ -232,6 +232,127 @@ pve_task_status_from_json() {
   ' 2>/dev/null
 }
 
+# Strip accidental JSON/string junk from a parsed UPID (pvesh often embeds UPID in quoted JSON).
+clean_parsed_upid() {
+  local u="${1//$'\r'/}"
+  u="${u#\"}"
+  u="${u%\"}"
+  u="${u%,}"
+  printf '%s\n' "$u"
+}
+
+# pvesh create sometimes prints a bare UPID line or mixes stderr; avoid jq on non-JSON.
+parse_upid_from_create_response() {
+  local raw="$1" upid
+  upid=$(printf '%s\n' "$raw" | grep -oE 'UPID:[^"[:space:]]+' | tail -1)
+  if [[ -n "$upid" ]]; then
+    clean_parsed_upid "$upid"
+    return 0
+  fi
+  upid=$(printf '%s\n' "$raw" | jq -r '
+    try (
+      (if type == "string" and test("^\\s*\\{") then fromjson else . end)
+      | if type == "object" and (.data != null) then .data else . end
+      | if type == "string" then . elif type == "number" then tostring else empty end
+    ) catch empty
+  ' 2>/dev/null) || true
+  if [[ -n "$upid" && "$upid" != "null" ]]; then
+    clean_parsed_upid "$upid"
+    return 0
+  fi
+  while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*\{ ]] || continue
+    upid=$(printf '%s\n' "$line" | jq -r '
+      try (
+        (if type == "string" and test("^\\s*\\{") then fromjson else . end)
+        | if type == "object" and (.data != null) then .data else . end
+        | if type == "string" then . elif type == "number" then tostring else empty end
+      ) catch empty
+    ' 2>/dev/null) || true
+    if [[ -n "$upid" && "$upid" != "null" ]]; then
+      clean_parsed_upid "$upid"
+      return 0
+    fi
+  done <<< "$(printf '%s\n' "$raw")"
+  return 1
+}
+
+# Poll Proxmox task status until stopped (requires NODE and die() from the driver).
+wait_for_task() {
+  local upid="$1" max="${2:-7200}" waited=0 poll_empty=0
+  local status exitstatus line upid_esc
+
+  upid_esc="$(pve_api_quote_path_segment "$upid")"
+
+  while [[ "$waited" -lt "$max" ]]; do
+    line=$(pvesh get "/nodes/${NODE}/tasks/${upid_esc}/status" --output-format json 2>/dev/null) || true
+    [[ -z "$line" ]] && line=$(pvesh get "/nodes/${NODE}/tasks/${upid}/status" --output-format json 2>/dev/null) || true
+
+    if [[ -n "${PVE_OCI_COMPOSE_TASK_DEBUG:-}" ]]; then
+      printf '[task-debug] waited=%ds len=%s first=%s\n' "$waited" "${#line}" "${line:0:120}" >&2
+    fi
+
+    if [[ -n "$line" ]]; then
+      poll_empty=0
+      IFS=$'\t' read -r status exitstatus <<<"$(pve_task_status_from_json "$line")"
+      status="${status//$'\r'/}"
+      exitstatus="${exitstatus//$'\r'/}"
+      if [[ "$status" == "stopped" ]]; then
+        if [[ "${exitstatus^^}" == "OK" ]]; then
+          return 0
+        fi
+        die "Task finished with exitstatus=${exitstatus:-unknown}. UPID=${upid}"
+      fi
+    else
+      poll_empty=$((poll_empty + 2))
+      if [[ "$poll_empty" -eq 30 ]]; then
+        printf '%s\n' "Still waiting on task UPID=${upid} … (no JSON from pvesh get …/tasks/…/status — check node name and API; try PVE_OCI_COMPOSE_TASK_DEBUG=1)" >&2
+      fi
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  die "Timed out waiting for task ${upid} (${max}s)"
+}
+
+# Docker Hub–style short refs (traefik:v3) → docker.io/library/… or docker.io/user/…
+pve_oci_normalize_registry_reference() {
+  local ref="$1"
+  python3 -c '
+import sys
+ref = sys.argv[1].strip()
+if not ref:
+    sys.exit(1)
+low = ref.lower()
+if low.startswith(("http://", "https://", "oci://", "docker://")):
+    print(ref)
+    raise SystemExit(0)
+host = ref.split("/")[0].split("@")[0].split(":")[0]
+if "." in host or host == "localhost" or host.isdigit():
+    print(ref)
+    raise SystemExit(0)
+parts = ref.split("/")
+if len(parts) == 1:
+    print(f"docker.io/library/{ref}")
+elif len(parts) == 2:
+    print(f"docker.io/{ref}")
+else:
+    print(f"docker.io/{ref}")
+' "$ref"
+}
+
+# CT hostname from pct config (fallback vmidN for vzdump notes).
+pve_oci_pct_hostname() {
+  local vmid="$1" h
+  h="$(pct config "$vmid" 2>/dev/null | grep -aE '^hostname:' | head -1 | sed 's/^hostname:[[:space:]]*//' | tr -d '\r')" || true
+  if [[ -n "$h" ]]; then
+    printf '%s' "$h"
+  else
+    printf 'vmid%s' "$vmid"
+  fi
+}
+
 # --- pve-oci-compose CT marker ----------------------------------------------
 # Canonical ref + service live on the **guest rootfs** (included in pct snapshots /
 # rollback). UI shows only the short sentinel tag **`pve-oci-compose`** (plus your own tags).

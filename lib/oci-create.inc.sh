@@ -485,7 +485,11 @@ strip_oci_scheme() {
   printf '%s\n' "$r"
 }
 
-REFERENCE="$(strip_oci_scheme "$REFERENCE")"
+_ref_before_norm="$(strip_oci_scheme "$REFERENCE")"
+REFERENCE="$(pve_oci_normalize_registry_reference "$_ref_before_norm")"
+[[ "$REFERENCE" != "$_ref_before_norm" ]] \
+  && echo "Normalized registry ref: ${_ref_before_norm} → ${REFERENCE}" >&2
+unset _ref_before_norm 2>/dev/null || true
 
 # True when the ref would produce normalize_content_filename ending in _latest (ambiguous tarball).
 is_floating_latest_ref() {
@@ -580,91 +584,7 @@ wait_until_ostemplate_visible() {
   return 1
 }
 
-# Next cluster VMID: pve_oci_next_cluster_id() in lib/common.inc.sh (sourced before this file).
-
-# Strip accidental JSON/string junk from a parsed UPID (pvesh often embeds UPID in quoted JSON).
-clean_parsed_upid() {
-  local u="${1//$'\r'/}"
-  u="${u#\"}"
-  u="${u%\"}"
-  u="${u%,}"
-  printf '%s\n' "$u"
-}
-
-# pvesh create sometimes prints a bare UPID line or mixes stderr; avoid jq on non-JSON.
-parse_upid_from_create_response() {
-  local raw="$1" upid
-  # Do not use [^[:space:]]+ here: a closing JSON " is not whitespace and would be captured.
-  upid=$(printf '%s\n' "$raw" | grep -oE 'UPID:[^"[:space:]]+' | tail -1)
-  if [[ -n "$upid" ]]; then
-    clean_parsed_upid "$upid"
-    return 0
-  fi
-  upid=$(printf '%s\n' "$raw" | jq -r '
-    try (
-      (if type == "string" and test("^\\s*\\{") then fromjson else . end)
-      | if type == "object" and (.data != null) then .data else . end
-      | if type == "string" then . elif type == "number" then tostring else empty end
-    ) catch empty
-  ' 2>/dev/null) || true
-  if [[ -n "$upid" && "$upid" != "null" ]]; then
-    clean_parsed_upid "$upid"
-    return 0
-  fi
-  while IFS= read -r line || [[ -n "${line:-}" ]]; do
-    [[ -z "$line" ]] && continue
-    [[ "$line" =~ ^[[:space:]]*\{ ]] || continue
-    upid=$(printf '%s\n' "$line" | jq -r '
-      try (
-        (if type == "string" and test("^\\s*\\{") then fromjson else . end)
-        | if type == "object" and (.data != null) then .data else . end
-        | if type == "string" then . elif type == "number" then tostring else empty end
-      ) catch empty
-    ' 2>/dev/null) || true
-    if [[ -n "$upid" && "$upid" != "null" ]]; then
-      clean_parsed_upid "$upid"
-      return 0
-    fi
-  done <<< "$(printf '%s\n' "$raw")"
-  return 1
-}
-
-wait_for_task() {
-  local upid="$1" max="${2:-7200}" waited=0 poll_empty=0
-  local status exitstatus line upid_esc
-
-  upid_esc="$(pve_api_quote_path_segment "$upid")"
-
-  while [[ "$waited" -lt "$max" ]]; do
-    line=$(pvesh get "/nodes/${NODE}/tasks/${upid_esc}/status" --output-format json 2>/dev/null) || true
-    [[ -z "$line" ]] && line=$(pvesh get "/nodes/${NODE}/tasks/${upid}/status" --output-format json 2>/dev/null) || true
-
-    if [[ -n "${PVE_OCI_COMPOSE_TASK_DEBUG:-}" ]]; then
-      printf '[task-debug] waited=%ds len=%s first=%s\n' "$waited" "${#line}" "${line:0:120}" >&2
-    fi
-
-    if [[ -n "$line" ]]; then
-      poll_empty=0
-      IFS=$'\t' read -r status exitstatus <<<"$(pve_task_status_from_json "$line")"
-      status="${status//$'\r'/}"
-      exitstatus="${exitstatus//$'\r'/}"
-      if [[ "$status" == "stopped" ]]; then
-        if [[ "${exitstatus^^}" == "OK" ]]; then
-          return 0
-        fi
-        die "Task finished with exitstatus=${exitstatus:-unknown}. UPID=${upid}"
-      fi
-    else
-      poll_empty=$((poll_empty + 2))
-      if [[ "$poll_empty" -eq 30 ]]; then
-        printf '%s\n' "Still waiting on task UPID=${upid} … (no JSON from pvesh get …/tasks/…/status — check node name and API; try PVE_OCI_COMPOSE_TASK_DEBUG=1)" >&2
-      fi
-    fi
-    sleep 2
-    waited=$((waited + 2))
-  done
-  die "Timed out waiting for task ${upid} (${max}s)"
-}
+# Next cluster VMID / task polling / registry ref normalization: lib/common.inc.sh
 
 # When oci-registry-pull rejects name@sha256 (API regex is :tag-only on some PVE versions), copy to the
 # same path the worker would have used so OSTEMPLATE / NORM stay consistent.
