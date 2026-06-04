@@ -63,7 +63,8 @@ pve_oci_refresh_vzdump_ct() {
   out_kv "Backup storage" "$storage"
   out_kv "Mode" "stop (CT already offline)"
   out_kv "Notes" "$vz_notes"
-  out_cmd "pvesh create /nodes/${node}/vzdump --vmid ${vmid} --storage ${storage} --mode stop --compress zstd --notes-template $(printf '%q' "$vz_notes")"
+  out_detail "Retention: --remove 0 (no prune; storage prune-backups policy is not applied)"
+  out_cmd "pvesh create /nodes/${node}/vzdump --vmid ${vmid} --storage ${storage} --mode stop --compress zstd --remove 0 --notes-template $(printf '%q' "$vz_notes")"
 
   set +e
   out=$(pvesh create "/nodes/${node}/vzdump" \
@@ -71,6 +72,7 @@ pve_oci_refresh_vzdump_ct() {
     --storage "$storage" \
     --mode stop \
     --compress zstd \
+    --remove 0 \
     --notes-template "$vz_notes" \
     --output-format json 2>&1)
   local vz_rc=$?
