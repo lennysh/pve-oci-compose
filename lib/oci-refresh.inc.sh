@@ -45,12 +45,22 @@ pve_oci_refresh_node_name() {
 }
 
 # vzdump a stopped CT; waits on the Proxmox task UPID when returned. Returns 0 on success.
+# OCI_REFRESH_VZDUMP_REMOVE=1 → --remove 1 (apply storage prune-backups to free a slot; default 0).
+# OCI_REFRESH_VZDUMP_PROTECTED=1 → --protected 1 (default; pre-refresh dumps skip scheduled prune).
 pve_oci_refresh_vzdump_ct() {
   local vmid="$1" storage="$2"
-  local node out upid notes_host vz_notes
+  local node out upid notes_host vz_notes vz_remove=0 vz_protected=1
+  local -a vz_extra=()
 
   [[ "$vmid" =~ ^[0-9]+$ ]] || return 1
   [[ -n "$storage" ]] || return 1
+
+  case "${OCI_REFRESH_VZDUMP_REMOVE:-0}" in
+    1|yes|true|TRUE|Y) vz_remove=1 ;;
+  esac
+  case "${OCI_REFRESH_VZDUMP_PROTECTED:-1}" in
+    0|no|false|FALSE|N) vz_protected=0 ;;
+  esac
 
   node="$(pve_oci_refresh_node_name)"
   NODE="$node"
@@ -63,8 +73,20 @@ pve_oci_refresh_vzdump_ct() {
   out_kv "Backup storage" "$storage"
   out_kv "Mode" "stop (CT already offline)"
   out_kv "Notes" "$vz_notes"
-  out_detail "Retention: --remove 0 (no prune; storage prune-backups policy is not applied)"
-  out_cmd "pvesh create /nodes/${node}/vzdump --vmid ${vmid} --storage ${storage} --mode stop --compress zstd --remove 0 --notes-template $(printf '%q' "$vz_notes")"
+  if [[ "$vz_remove" -eq 0 ]]; then
+    out_kv "Retention" "--remove 0 (no prune)"
+    vz_extra+=(--remove 0 --prune-backups keep-all=1)
+    out_detail "If vzdump fails with “max backup limit”, the storage is full for this CT — see hint below or use refresh_pre_backup: snapshot/auto."
+  else
+    out_kv "Retention" "--remove 1 (storage prune-backups may delete older backups)"
+    vz_extra+=(--remove 1)
+  fi
+  if [[ "$vz_protected" -eq 1 ]]; then
+    out_kv "Protected" "yes (excluded from scheduled backup prune jobs)"
+    vz_extra+=(--protected 1)
+  fi
+
+  out_cmd "pvesh create /nodes/${node}/vzdump --vmid ${vmid} --storage ${storage} --mode stop --compress zstd ${vz_extra[*]} --notes-template $(printf '%q' "$vz_notes")"
 
   set +e
   out=$(pvesh create "/nodes/${node}/vzdump" \
@@ -72,13 +94,14 @@ pve_oci_refresh_vzdump_ct() {
     --storage "$storage" \
     --mode stop \
     --compress zstd \
-    --remove 0 \
+    "${vz_extra[@]}" \
     --notes-template "$vz_notes" \
     --output-format json 2>&1)
   local vz_rc=$?
   set -e
   if [[ "$vz_rc" -ne 0 ]]; then
     echo "$out" >&2
+    pve_oci_vzdump_max_limit_hint "$out"
     return 1
   fi
 

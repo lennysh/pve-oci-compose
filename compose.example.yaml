@@ -33,6 +33,8 @@ defaults:
   # refresh_pre_backup: auto       # snapshot first; vzdump to refresh_backup_storage if snapshot fails
   # refresh_pre_backup: vzdump      # vzdump only (no pct snapshot)
   # refresh_backup_storage: nfs-backups  # local/NFS vzdump store; use pbs for Proxmox Backup Server
+  # refresh_vzdump_remove: false    # default: --remove 0 (no prune; may fail if storage max backups reached)
+  # refresh_vzdump_protected: true    # default: mark pre-refresh vzdump as protected
 
   # --- pool (optional) ---
   # pool: ""                    # disable default pool id (= stack name) for every service

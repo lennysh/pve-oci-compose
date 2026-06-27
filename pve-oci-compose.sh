@@ -945,13 +945,20 @@ cmd_refresh() {
     validate_service_refresh "$svc" "$sname"
     vmid="$(vmid_spec_from_json "$svc")"
     image="$(service_image "$svc")"
-    unset OCI_REFRESH_TEMPLATE_STORAGE OCI_REFRESH_PRE_BACKUP OCI_REFRESH_VZDUMP_STORAGE || true
+    unset OCI_REFRESH_TEMPLATE_STORAGE OCI_REFRESH_PRE_BACKUP OCI_REFRESH_VZDUMP_STORAGE \
+      OCI_REFRESH_VZDUMP_REMOVE OCI_REFRESH_VZDUMP_PROTECTED 2>/dev/null || true
     ts="$(jq -r '.template_storage // .storage // empty' <<<"$svc")"
     [[ -n "$ts" ]] && export OCI_REFRESH_TEMPLATE_STORAGE="$ts"
     pb="$(jq -r '.refresh_pre_backup // empty' <<<"$svc")"
     bs="$(jq -r '.refresh_backup_storage // empty' <<<"$svc")"
     [[ -n "$pb" ]] && export OCI_REFRESH_PRE_BACKUP="$pb"
     [[ -n "$bs" ]] && export OCI_REFRESH_VZDUMP_STORAGE="$bs"
+    if jq -e '.refresh_vzdump_remove == true or (.refresh_vzdump_remove | type) == "number" and .refresh_vzdump_remove != 0' <<<"$svc" >/dev/null 2>&1; then
+      export OCI_REFRESH_VZDUMP_REMOVE=1
+    fi
+    if jq -e '.refresh_vzdump_protected == false or .refresh_vzdump_protected == 0' <<<"$svc" >/dev/null 2>&1; then
+      export OCI_REFRESH_VZDUMP_PROTECTED=0
+    fi
     unset PVE_OCI_COMPOSE_SERVICE PVE_OCI_COMPOSE_REF PVE_OCI_COMPOSE_DIR PVE_OCI_COMPOSE_SVC_JSON 2>/dev/null || true
     export PVE_OCI_COMPOSE_SERVICE="$sname"
     export PVE_OCI_COMPOSE_REF="$image"

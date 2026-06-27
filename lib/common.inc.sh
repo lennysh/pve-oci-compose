@@ -278,6 +278,21 @@ parse_upid_from_create_response() {
   return 1
 }
 
+# Hint when a vzdump task hits Proxmox storage backup-count limits (--remove 0 cannot make room).
+pve_oci_vzdump_max_limit_hint() {
+  local msg="$1"
+  [[ "$msg" == *max*backup*limit* || "$msg" == *maxfiles* ]] || return 0
+  cat >&2 <<'EOF'
+pve-oci-compose: vzdump hit a per-guest backup limit on the target storage (--remove 0 does not delete old backups to free a slot).
+
+Options (pick one):
+  • Use refresh_pre_backup: snapshot or auto (local pct snapshot; no backup-storage quota)
+  • Use a separate refresh_backup_storage with no/low max-backups limit for pre-refresh dumps only
+  • Datacenter → Storage → your backup store → raise “Max Backups” (or free a slot manually)
+  • Opt in to prune for this job only: refresh_vzdump_remove: true (applies storage prune-backups)
+EOF
+}
+
 # Poll Proxmox task status until stopped (requires NODE and die() from the driver).
 wait_for_task() {
   local upid="$1" max="${2:-7200}" waited=0 poll_empty=0
@@ -305,6 +320,7 @@ wait_for_task() {
         if [[ "$exitstatus" == *skopeo*copy*failed* || "$exitstatus" == *manifest*unknown* ]]; then
           echo "pve-oci-compose: hint: the image tag may not exist on the registry (check Docker Hub / GHCR tags for your compose image ref)." >&2
         fi
+        pve_oci_vzdump_max_limit_hint "$exitstatus"
         die "Task finished with exitstatus=${exitstatus:-unknown}. UPID=${upid}"
       fi
     else
