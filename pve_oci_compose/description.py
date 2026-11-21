@@ -1,4 +1,4 @@
-"""Markdown text for ``pct --description`` (same output as the bash implementation)."""
+"""Markdown text for ``pct --description``."""
 
 from __future__ import annotations
 

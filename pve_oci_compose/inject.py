@@ -6,21 +6,13 @@ Ownership: ``owner`` / ``group`` are **guest** ids. For unprivileged CTs they ar
 to host ids through the CT's ``lxc.idmap`` lines (default ``0 → 100000``, 65536 ids).
 Values ``>= 65536`` are treated as already-mapped host ids (backward compatible with
 older compose files that wrote e.g. ``owner: 100033``). Default owner is guest root.
-
-CLI (used by the bash implementation; service JSON on stdin)::
-
-    python3 -m pve_oci_compose.inject --vmid 101 --phase apply \
-        --compose-dir DIR --rootfs /var/lib/lxc/101/rootfs [--unprivileged-default 1]
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
-import subprocess
-import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
@@ -223,52 +215,3 @@ def run(
             )
             done.append((kind, guest))
     return done
-
-
-def _pct_config_lines(vmid: str) -> list[str]:
-    try:
-        return subprocess.run(
-            ["pct", "config", vmid], capture_output=True, text=True, check=True
-        ).stdout.splitlines()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-
-
-def _pvesm_path(volid: str) -> str | None:
-    try:
-        return subprocess.run(
-            ["pvesm", "path", volid], capture_output=True, text=True, check=True
-        ).stdout.strip() or None
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="pve_oci_compose.inject")
-    ap.add_argument("--vmid", required=True)
-    ap.add_argument("--phase", required=True, choices=("apply", "refresh"))
-    ap.add_argument("--compose-dir", required=True)
-    ap.add_argument("--rootfs", required=True)
-    ap.add_argument("--unprivileged-default", default="1")
-    a = ap.parse_args(argv)
-    doc = json.load(sys.stdin)
-    try:
-        done = run(
-            a.phase,
-            doc,
-            a.compose_dir,
-            a.rootfs,
-            _pct_config_lines(a.vmid),
-            _pvesm_path,
-            truthy(a.unprivileged_default, True),
-        )
-    except (GuestPathError, OSError, ValueError, KeyError) as e:
-        print(f"pve-oci-compose: file inject failed: {e}", file=sys.stderr)
-        return 1
-    for kind, g in done:
-        print(f"INJECTED\t{kind}\t{g}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

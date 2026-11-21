@@ -5,21 +5,13 @@ the image author) controls. A plain ``open(root + path)`` follows symlinks, so a
 guest-planted ``/etc/foo -> /etc/shadow`` would make host root overwrite the
 host's file. Instead, every path component is opened relative to its parent
 directory fd with ``O_NOFOLLOW``, so resolution can never leave ``root``.
-
-Also usable as a small CLI (used by the bash implementation)::
-
-    python3 -m pve_oci_compose.guestfs write --root R --path /etc/x [--mode 644]
-        [--uid N --gid N] [--dir-uid N --dir-gid N] < content
-    python3 -m pve_oci_compose.guestfs read --root R --path /etc/x
 """
 
 from __future__ import annotations
 
-import argparse
 import errno
 import os
 import stat
-import sys
 
 MAX_READ = 1 << 20
 
@@ -157,42 +149,3 @@ def read_file(root: str, guest_path: str, max_bytes: int = MAX_READ) -> bytes | 
             os.close(fd)
     finally:
         os.close(dfd)
-
-
-def _parse_mode(s: str) -> int:
-    return int(s, 8)
-
-
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="pve_oci_compose.guestfs")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    w = sub.add_parser("write")
-    w.add_argument("--root", required=True)
-    w.add_argument("--path", required=True)
-    w.add_argument("--mode", type=_parse_mode, default=0o644)
-    w.add_argument("--uid", type=int)
-    w.add_argument("--gid", type=int)
-    w.add_argument("--dir-uid", type=int)
-    w.add_argument("--dir-gid", type=int)
-    r = sub.add_parser("read")
-    r.add_argument("--root", required=True)
-    r.add_argument("--path", required=True)
-    a = ap.parse_args(argv)
-    try:
-        if a.cmd == "write":
-            write_file(
-                a.root, a.path, sys.stdin.buffer.read(), a.mode, a.uid, a.gid, a.dir_uid, a.dir_gid
-            )
-            return 0
-        data = read_file(a.root, a.path)
-        if data is None:
-            return 1
-        sys.stdout.buffer.write(data)
-        return 0
-    except GuestPathError as e:
-        print(f"pve-oci-compose: {e}", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

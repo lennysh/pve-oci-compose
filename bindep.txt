@@ -10,7 +10,6 @@
 #
 # If you use the bindep tool itself:  bindep -f bindep.txt --brief --platform dpkg
 
-jq [platform:dpkg]
 python3 [platform:dpkg]
 python3-yaml [platform:dpkg]
 skopeo [platform:dpkg]

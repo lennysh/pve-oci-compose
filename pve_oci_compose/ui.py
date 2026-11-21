@@ -1,4 +1,4 @@
-"""Terminal output (same look as lib/ui.inc.sh).
+"""Terminal output.
 
 NO_COLOR=1 or a non-tty disables colour. PVE_OCI_VERBOSE=1 enables detail() and cmd().
 """
