@@ -429,9 +429,7 @@ validate_service_pull() {
 
 run_or_print() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf 'DRY-RUN:'
-    printf ' %q' "$@"
-    printf '\n'
+    printf 'DRY-RUN: %s\n' "$(pve_oci_redact_cmd "$@")"
   else
     "$@"
   fi
@@ -775,9 +773,12 @@ fill_create_args() {
     v="$(jq -r 'if (.unprivileged | type) == "boolean" then (if .unprivileged then "1" else "0" end) else "\(.unprivileged)" end' <<<"$svcjson")"
     OCI_CREATE_ARGS+=(--unprivileged "$v")
   fi
+  # start: never passed to pct create — apply starts the CT itself after the guest marker and
+  # file inject (both need a stopped CT); see APPLY_START_AFTER in cmd_apply.
+  APPLY_START_AFTER=0
   if jq -e '.start != null' <<<"$svcjson" >/dev/null 2>&1; then
     v="$(jq -r 'if (.start | type) == "boolean" then (if .start then "1" else "0" end) else "\(.start)" end' <<<"$svcjson")"
-    OCI_CREATE_ARGS+=(--start "$v")
+    [[ "$v" == 1 ]] && APPLY_START_AFTER=1
   fi
   if jq -e '.protection != null' <<<"$svcjson" >/dev/null 2>&1; then
     v="$(jq -r 'if (.protection | type) == "boolean" then (if .protection then "1" else "0" end) else "\(.protection)" end' <<<"$svcjson")"
@@ -811,6 +812,7 @@ fill_create_args() {
 }
 
 OCI_CREATE_ARGS=()
+APPLY_START_AFTER=0
 
 cmd_apply() {
   local json sname svc spec resolved image merged stack effpool sa rj compose_dir
@@ -902,26 +904,34 @@ cmd_apply() {
       if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
         echo "apply: [$sname] DRY-RUN: after real create, would pct set $resolved --description … (resolved pull ref + template sync)"
       fi
+      [[ "$APPLY_START_AFTER" -eq 1 ]] && echo "apply: [$sname] DRY-RUN: would pct start $resolved after marker / file inject (start: true)"
     else
-      pve_oci_set_managed_marker_with_files "$resolved" "$sname" "$image" "$svc" "$compose_dir" \
-        || die "apply: [$sname] failed marker or file inject on CT $resolved"
-      if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
-        pve_oci_compose_pct_description_finalize "$resolved" "$svc" "$stack" "$sa" "$rj" || true
+      # New CT: everything up to the guest marker is all-or-nothing. On failure the CT is
+      # destroyed (and an auto-created pool removed) so re-running apply starts clean
+      # instead of tripping over an untagged "unmanaged" CT or allocating a second vmid.
+      if ! pve_oci_set_managed_marker_with_files "$resolved" "$sname" "$image" "$svc" "$compose_dir"; then
+        oci_create_pct_failure_cleanup "$resolved" "$effpool" ""
+        die "apply: [$sname] failed marker or file inject on new CT $resolved — CT removed; fix the cause and re-run apply"
       fi
       echo "apply: [$sname] sentinel tag + guest marker file (${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json})"
-      if [[ -n "$effpool" ]]; then
-        if [[ "$DRY_RUN" -eq 0 ]]; then
-          pve_oci_pool_ensure_lxc_member "$effpool" "$resolved" \
-            || die "apply: [$sname] could not add CT $resolved to pool '$effpool'"
-          echo "apply: [$sname] pool membership → ${effpool}"
-        else
-          echo "apply: [$sname] DRY-RUN: would pass --pool '${effpool}' to pct create (and pvesh would no-op if already a member)"
-        fi
-      fi
+      unset PVE_OCI_POOL_JUST_AUTOCREATED 2>/dev/null || true
+      # Record the allocated vmid immediately: from here on the CT is complete and managed.
       if [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 1 ]]; then
         compose_write_service_vmid "$COMPOSE_FILE" "$sname" "$resolved"
       elif [[ "$spec" == next && "$WRITE_COMPOSE_VMID" -eq 0 ]]; then
         echo "apply: [$sname] vmid was 'next' — set vmid: $resolved in $COMPOSE_FILE (or re-run apply without --no-write-compose)"
+      fi
+      if pve_oci_compose_description_needs_runtime_meta "$svc" "$sa"; then
+        pve_oci_compose_pct_description_finalize "$resolved" "$svc" "$stack" "$sa" "$rj" || true
+      fi
+      if [[ -n "$effpool" ]]; then
+        pve_oci_pool_ensure_lxc_member "$effpool" "$resolved" \
+          || die "apply: [$sname] could not add CT $resolved to pool '$effpool'"
+        echo "apply: [$sname] pool membership → ${effpool}"
+      fi
+      if [[ "$APPLY_START_AFTER" -eq 1 ]]; then
+        pct start "$resolved" || die "apply: [$sname] CT $resolved created but pct start failed"
+        echo "apply: [$sname] started CT $resolved (start: true)"
       fi
     fi
   done < <(jq -r '.service_order[]' <<<"$json")

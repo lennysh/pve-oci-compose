@@ -197,6 +197,21 @@ pve_oci_lxc_tags_pct_or_api() {
   printf '%s\n' "${tags:-}"
 }
 
+# printf %q a command line with secret values (--password) replaced by ***.
+pve_oci_redact_cmd() {
+  local out="" redact=0 a
+  for a in "$@"; do
+    if [[ "$redact" -eq 1 ]]; then
+      out+="'***' "
+      redact=0
+      continue
+    fi
+    [[ "$a" == --password ]] && redact=1
+    out+="$(printf '%q' "$a") "
+  done
+  printf '%s' "${out% }"
+}
+
 # Encode a REST path segment (e.g. task UPID) so colons in UPID don't break parsing of the URL.
 pve_api_quote_path_segment() {
   python3 -c '
@@ -397,42 +412,37 @@ pve_oci_ct_rootfs_mountpoint() {
   printf '/var/lib/lxc/%s/rootfs' "$1"
 }
 
+# Symlink-safe guest file helper (pve_oci_compose/guestfs.py): never follows links out of the root.
+pve_oci_guestfs() {
+  PYTHONPATH="${SCRIPT_DIR:?}${PYTHONPATH:+:$PYTHONPATH}" python3 -m pve_oci_compose.guestfs "$@"
+}
+
 # Write JSON marker under an already-mounted rootfs tree (absolute host path ending in …/rootfs).
 pve_oci_marker_write_mountpoint() {
   local mp="$1" svc="$2" ref="$3"
-  local mr p
+  local mr
   mr="${PVE_OCI_ROOTFS_MARKER:-/etc/pve-oci-compose.json}"
   [[ "$mr" == /* ]] || mr="/$mr"
-  p="${mp%/}${mr}"
-  install -d "$(dirname "$p")"
   python3 -c '
 import json, sys
-svc, ref, path = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(path, "w", encoding="utf-8") as f:
-    json.dump({"service": svc, "ref": ref}, f, separators=(",", ":"), ensure_ascii=False)
-    f.write("\n")
-' "$svc" "$ref" "$p" || return 1
+json.dump({"service": sys.argv[1], "ref": sys.argv[2]}, sys.stdout, separators=(",", ":"), ensure_ascii=False)
+sys.stdout.write("\n")
+' "$svc" "$ref" | pve_oci_guestfs write --root "$mp" --path "$mr" --mode 644
 }
 
 # Stopped CT: mount briefly, write marker, unmount (used after oci create).
 pve_oci_marker_write_after_create_stopped() {
   local vmid="$1" svc="$2" ref="$3"
-  local mp
+  local mp rc=0
   mp="$(pve_oci_ct_rootfs_mountpoint "$vmid")"
-  pct mount "$vmid" >/dev/null
-  trap 'pct unmount "$vmid" 2>/dev/null || true' EXIT
-  if ! [[ -d "$mp" ]]; then
-    pct unmount "$vmid" 2>/dev/null || true
-    trap - EXIT
-    return 1
+  pct mount "$vmid" >/dev/null || return 1
+  if [[ -d "$mp" ]]; then
+    pve_oci_marker_write_mountpoint "$mp" "$svc" "$ref" || rc=1
+  else
+    rc=1
   fi
-  pve_oci_marker_write_mountpoint "$mp" "$svc" "$ref" || {
-    pct unmount "$vmid" 2>/dev/null || true
-    trap - EXIT
-    return 1
-  }
-  pct unmount "$vmid"
-  trap - EXIT
+  pct unmount "$vmid" 2>/dev/null || true
+  return "$rc"
 }
 
 # Ref from JSON blob (stdin).
@@ -473,10 +483,8 @@ pve_oci_marker_read_rootfs_json() {
   if ! pct mount "$vmid" >/dev/null 2>&1; then
     return 1
   fi
-  trap 'pct unmount "$vmid" 2>/dev/null || true' EXIT
-  if [[ -r "${mp%/}${mr}" ]]; then js="$(cat -- "${mp%/}${mr}")" || js=""; fi
+  js="$(pve_oci_guestfs read --root "$mp" --path "$mr" 2>/dev/null)" || js=""
   pct unmount "$vmid" >/dev/null 2>&1 || true
-  trap - EXIT
   [[ -n "$js" ]] && {
     printf '%s' "$js"
     return 0

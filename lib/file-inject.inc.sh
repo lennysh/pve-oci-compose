@@ -149,6 +149,10 @@ for key, label in (("rootfs_files", "rootfs_files"), ("mount_files", "mount_file
             err(f"{label}[{i}]: missing source or content")
         if hs:
             resolve_source(item["source"], compose_dir)
+        for pk in ("path", "mount", "mp"):
+            pv = item.get(pk)
+            if isinstance(pv, str) and ".." in pv.split("/"):
+                err(f"{label}[{i}].{pk}: '..' is not allowed ({pv!r})")
         if key == "rootfs_files":
             p = item.get("path")
             if not p or not isinstance(p, str) or not p.startswith("/"):
@@ -177,240 +181,55 @@ PY
 
 # phase: apply | refresh — apply injects all specs; refresh only on_refresh: true
 # rootfs_mp: host path to …/rootfs when already mounted (refresh); empty → pct mount briefly
+# Writes go through pve_oci_compose/inject.py + guestfs.py (no symlink following, guest→host id map).
 pve_oci_file_inject_run() {
   local vmid="$1" phase="$2" svcjson="$3" compose_dir="$4" rootfs_mp="${5:-}"
-  local count mounted=0
+  local count mounted=0 ec=0 unpriv_default
   count="$(pve_oci_file_inject_count "$svcjson")"
   [[ "$count" -gt 0 ]] || return 0
 
   if [[ -z "$rootfs_mp" ]]; then
-    pct mount "$vmid" >/dev/null
-    rootfs_mp="$(pve_oci_ct_rootfs_mountpoint "$vmid")"
-    mounted=1
-    trap 'pct unmount "$vmid" 2>/dev/null || true' RETURN
-    [[ -d "$rootfs_mp" ]] || {
-      [[ "$mounted" -eq 1 ]] && pct unmount "$vmid" 2>/dev/null || true
-      trap - RETURN
-      die "file inject: rootfs mount missing at $rootfs_mp"
+    pct mount "$vmid" >/dev/null || {
+      echo "pve-oci-compose: file inject: pct mount ${vmid} failed" >&2
+      return 1
     }
+    mounted=1
+    rootfs_mp="$(pve_oci_ct_rootfs_mountpoint "$vmid")"
+    if [[ ! -d "$rootfs_mp" ]]; then
+      pct unmount "$vmid" 2>/dev/null || true
+      echo "pve-oci-compose: file inject: rootfs mount missing at $rootfs_mp" >&2
+      return 1
+    fi
   fi
 
-  if ! python3 - "$vmid" "$phase" "$compose_dir" "$rootfs_mp" "$svcjson" <<'PY'
-import json, os, re, shutil, subprocess, sys
+  # Only used when pct config has no unprivileged: line (pct create defaults to unprivileged).
+  unpriv_default="$(jq -r 'if .unprivileged == null then "1"
+    elif (.unprivileged | type) == "boolean" then (if .unprivileged then "1" else "0" end)
+    else (.unprivileged | tostring) end' <<<"$svcjson")"
+  printf '%s' "$svcjson" | PYTHONPATH="${SCRIPT_DIR:?}${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m pve_oci_compose.inject --vmid "$vmid" --phase "$phase" \
+    --compose-dir "$compose_dir" --rootfs "$rootfs_mp" --unprivileged-default "$unpriv_default" \
+    || ec=$?
 
-vmid, phase, compose_dir, rootfs_mp = sys.argv[1:5]
-doc = json.loads(sys.argv[5])
-phase = phase.strip().lower()
-if phase not in ("apply", "refresh"):
-    sys.stderr.write(f"pve-oci-compose: file inject: invalid phase {phase!r}\n")
-    sys.exit(2)
-
-
-def on_refresh(item):
-    if "on_refresh" in item:
-        v = item["on_refresh"]
-    elif "refresh" in item:
-        v = item["refresh"]
-    else:
-        return False
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0
-    if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "yes", "on")
-    return False
-
-
-def should_run(item):
-    return phase == "apply" or on_refresh(item)
-
-
-def default_owner_group():
-    u = doc.get("unprivileged")
-    if u is True or u == 1 or (isinstance(u, str) and u.strip() in ("1", "true", "yes")):
-        return 100000, 100000
-    return 0, 0
-
-
-def parse_mode(item):
-    m = item.get("mode")
-    if m is None:
-        return 0o644
-    if isinstance(m, int):
-        return m
-    return int(str(m).strip(), 8)
-
-
-def pct_config_lines(vmid):
-    try:
-        return subprocess.check_output(
-            ["pct", "config", vmid], text=True, stderr=subprocess.DEVNULL
-        ).splitlines()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return []
-
-
-def parse_mp_lines(vmid):
-    """guest_mp -> (kind, host_base) kind is 'volume' or 'bind'."""
-    out = {}
-    for line in pct_config_lines(vmid):
-        if not re.match(r"^mp\d+:", line):
-            continue
-        body = line.split(":", 1)[1].strip()
-        mp_m = re.search(r",mp=([^,]+)", body)
-        if not mp_m:
-            continue
-        guest = mp_m.group(1).strip().rstrip("/") or "/"
-        vol_part = body.split(",")[0].strip()
-        if vol_part.startswith("/"):
-            out[guest] = ("bind", vol_part)
-        else:
-            try:
-                hp = subprocess.check_output(
-                    ["pvesm", "path", vol_part], text=True, stderr=subprocess.DEVNULL
-                ).strip()
-                out[guest] = ("volume", hp)
-            except subprocess.CalledProcessError:
-                out[guest] = ("volume", "")
-    return out
-
-
-def guest_dest_mount(item):
-    mp = (item.get("mount") or item.get("mp") or "").strip().rstrip("/") or "/"
-    rel = (item.get("path") or "").strip()
-    if rel.startswith("/"):
-        return rel
-    return f"{mp}/{rel.lstrip('/')}" if mp != "/" else f"/{rel.lstrip('/')}"
-
-
-def host_target_rootfs(guest_abs):
-    base = rootfs_mp.rstrip("/")
-    g = guest_abs if guest_abs.startswith("/") else "/" + guest_abs
-    return base + g
-
-
-def host_target_mount(vmid, guest_abs):
-    g = guest_abs if guest_abs.startswith("/") else "/" + guest_abs
-    g_norm = g.rstrip("/") or "/"
-    mps = parse_mp_lines(vmid)
-    best = None
-    for guest_mp, (kind, host_base) in sorted(mps.items(), key=lambda x: -len(x[0])):
-        if g_norm == guest_mp or g_norm.startswith(guest_mp + "/"):
-            best = (guest_mp, kind, host_base)
-            break
-    if not best:
-        return None
-    guest_mp, kind, host_base = best
-    if kind == "bind" and host_base:
-        rel = g_norm[len(guest_mp) :].lstrip("/")
-        return os.path.join(host_base, rel) if rel else host_base
-    if kind == "volume" and host_base:
-        rel = g_norm[len(guest_mp) :].lstrip("/")
-        return os.path.join(host_base, rel) if rel else host_base
-    # fallback: path under mounted rootfs (mp dir may exist as mount point)
-    return host_target_rootfs(g)
-
-
-def resolve_source(item):
-    src = item["source"].strip()
-    if src.startswith("/"):
-        return src
-    return os.path.normpath(os.path.join(compose_dir, src))
-
-
-def write_file(host_path, item, uid, gid, mode):
-    content = item.get("content")
-    os.makedirs(os.path.dirname(host_path) or "/", exist_ok=True)
-    if content is not None:
-        if isinstance(content, str):
-            data = content
-        else:
-            data = json.dumps(content)
-        with open(host_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(data)
-            if data and not data.endswith("\n"):
-                pass
-    else:
-        shutil.copy2(resolve_source(item), host_path)
-    os.chmod(host_path, mode)
-    os.chown(host_path, uid, gid)
-
-
-def inject_one(kind, item):
-    if not should_run(item):
-        return None
-    d_uid, d_gid = default_owner_group()
-    uid = int(item["owner"]) if item.get("owner") is not None else d_uid
-    if isinstance(item.get("owner"), str):
-        uid = int(item["owner"])
-    gid = int(item["group"]) if item.get("group") is not None else d_gid
-    if isinstance(item.get("group"), str):
-        gid = int(item["group"])
-    mode = parse_mode(item)
-    if kind == "rootfs":
-        guest = item["path"].strip()
-        host = host_target_rootfs(guest)
-    else:
-        guest = guest_dest_mount(item)
-        host = host_target_mount(vmid, guest)
-        if not host:
-            raise RuntimeError(f"could not resolve host path for mount_files → {guest}")
-    write_file(host, item, uid, gid, mode)
-    return guest
-
-
-done = []
-for item in doc.get("rootfs_files") or []:
-    if not should_run(item):
-        continue
-    g = inject_one("rootfs", item)
-    if g:
-        done.append(("rootfs", g))
-for item in doc.get("mount_files") or []:
-    if not should_run(item):
-        continue
-    g = inject_one("mount", item)
-    if g:
-        done.append(("mount", g))
-for kind, g in done:
-    print(f"INJECTED\t{kind}\t{g}")
-PY
-  then
-    local ec=$?
-    [[ "$mounted" -eq 1 ]] && pct unmount "$vmid" 2>/dev/null || true
-    trap - RETURN
-    return "$ec"
-  fi
-  [[ "$mounted" -eq 1 ]] && pct unmount "$vmid" 2>/dev/null || true
-  trap - RETURN
-  return 0
+  [[ "$mounted" -eq 1 ]] && { pct unmount "$vmid" 2>/dev/null || true; }
+  return "$ec"
 }
 
 # Mount stopped CT once: marker + apply-phase file inject.
 pve_oci_marker_and_files_stopped() {
   local vmid="$1" svc="$2" ref="$3" svcjson="$4" compose_dir="$5"
-  local mp
+  local mp rc=0
   mp="$(pve_oci_ct_rootfs_mountpoint "$vmid")"
-  pct mount "$vmid" >/dev/null
-  trap 'pct unmount "$vmid" 2>/dev/null || true' RETURN
-  if ! [[ -d "$mp" ]]; then
-    pct unmount "$vmid" 2>/dev/null || true
-    trap - RETURN
-    return 1
+  pct mount "$vmid" >/dev/null || return 1
+  if [[ ! -d "$mp" ]]; then
+    rc=1
+  elif ! pve_oci_marker_write_mountpoint "$mp" "$svc" "$ref"; then
+    rc=1
+  elif ! pve_oci_file_inject_report "$vmid" apply "$svcjson" "$compose_dir" "$mp"; then
+    rc=1
   fi
-  pve_oci_marker_write_mountpoint "$mp" "$svc" "$ref" || {
-    pct unmount "$vmid" 2>/dev/null || true
-    trap - RETURN
-    return 1
-  }
-  pve_oci_file_inject_run "$vmid" apply "$svcjson" "$compose_dir" "$mp" || {
-    pct unmount "$vmid" 2>/dev/null || true
-    trap - RETURN
-    return 1
-  }
-  pct unmount "$vmid"
-  trap - RETURN
+  pct unmount "$vmid" 2>/dev/null || true
+  return "$rc"
 }
 
 pve_oci_set_managed_marker_with_files() {

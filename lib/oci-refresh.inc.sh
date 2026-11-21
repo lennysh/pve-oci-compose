@@ -127,6 +127,49 @@ oci_refresh_pre_backup_abort_or_continue() {
   out_warn "Continuing without rollback safety (--allow-failed-snapshot)."
 }
 
+# EXIT trap while a refresh is in flight. Before the rootfs is touched: drop the temp CT and
+# restart the target if it was running. After rsync started (rootfs may be half-replaced):
+# roll back to the pre-refresh snapshot when one was taken (unless OCI_REFRESH_NO_AUTO_ROLLBACK=1),
+# otherwise leave the CT stopped and print recovery steps.
+oci_refresh_on_exit() {
+  local rc=$? rolled=0
+  [[ "${_OCI_REFRESH_ACTIVE:-0}" -eq 1 ]] || return 0
+  _OCI_REFRESH_ACTIVE=0
+  set +e
+  pct unmount "$TEMP" 2>/dev/null
+  pct unmount "$OLD" 2>/dev/null
+  echo >&2
+  echo "=== refresh of CT ${OLD} failed (exit ${rc}) ===" >&2
+  if [[ "${_OCI_REFRESH_TEMP_CREATED:-0}" -eq 1 ]] && pct config "$TEMP" &>/dev/null; then
+    pct destroy "$TEMP" --purge >/dev/null 2>&1 && echo "Removed temp CT ${TEMP}." >&2 \
+      || echo "Could not remove temp CT ${TEMP} — run: pct destroy ${TEMP} --purge" >&2
+  fi
+  if [[ "${_OCI_REFRESH_DESTRUCTIVE:-0}" -eq 1 ]]; then
+    if [[ "${_OCI_REFRESH_SNAP_OK:-0}" -eq 1 ]]; then
+      if [[ "${OCI_REFRESH_NO_AUTO_ROLLBACK:-0}" != 1 ]]; then
+        echo "Rolling back CT ${OLD} to snapshot ${SNAP_NAME} …" >&2
+        pct stop "$OLD" >/dev/null 2>&1
+        if pct rollback "$OLD" "$SNAP_NAME"; then
+          rolled=1
+          echo "Rolled back CT ${OLD} to ${SNAP_NAME} (snapshot kept; delete with: pct delsnapshot ${OLD} ${SNAP_NAME})." >&2
+        else
+          echo "Rollback failed. Recover manually: pct rollback ${OLD} ${SNAP_NAME}" >&2
+        fi
+      else
+        echo "Rootfs may be partially replaced. Recover with: pct rollback ${OLD} ${SNAP_NAME}" >&2
+      fi
+    elif [[ "${PRE_BACKUP:-}" == vzdump || "${PRE_BACKUP:-}" == auto ]] && [[ -n "${VZDUMP_STORAGE:-}" ]]; then
+      echo "Rootfs may be partially replaced. Restore the pre-refresh vzdump of CT ${OLD} from storage ${VZDUMP_STORAGE} (notes: '… - pve-oci-compose-pre-refresh')." >&2
+    else
+      echo "Rootfs may be partially replaced and no pre-refresh backup was taken. CT ${OLD} left stopped." >&2
+    fi
+  fi
+  if [[ "${_OCI_REFRESH_WAS_RUNNING:-0}" -eq 1 ]] && { [[ "${_OCI_REFRESH_DESTRUCTIVE:-0}" -eq 0 ]] || [[ "$rolled" -eq 1 ]]; }; then
+    pct start "$OLD" && echo "Started CT ${OLD} again (previous state)." >&2
+  fi
+  return 0
+}
+
 oci_refresh_main() {
   unset PVE_OCI_LAST_PULL_REFERENCE PVE_OCI_LAST_REFERENCE_INPUT 2>/dev/null || true
 SKIP_SNAPSHOT=0
@@ -386,8 +429,17 @@ out_kv "Temp alloc" "${ROOTFS_NEWVOL}  (from ${SIZE})"
 [[ -n "$MEMORY" ]] && out_kv "Memory (MB)" "${MEMORY} (cloned to temp create)"
 out_kv "Node" "$(hostname -s)"
 
+_OCI_REFRESH_WAS_RUNNING=0
+_OCI_REFRESH_TEMP_CREATED=0
+_OCI_REFRESH_DESTRUCTIVE=0
+_OCI_REFRESH_SNAP_OK=0
+SNAP_NAME=""
+pve_oci_pct_ct_is_active "$OLD" && _OCI_REFRESH_WAS_RUNNING=1
+_OCI_REFRESH_ACTIVE=1
+trap oci_refresh_on_exit EXIT
+
 out_sub "Shutdown CT ${OLD}"
-if pve_oci_pct_ct_is_active "$OLD"; then
+if [[ "$_OCI_REFRESH_WAS_RUNNING" -eq 1 ]]; then
   out_kv "Graceful timeout" "${OCI_REFRESH_SHUTDOWN_TIMEOUT:-60}s (then pct stop)"
   if ! pve_oci_pct_shutdown_or_stop "$OLD"; then
     echo "Could not shut down or stop CT ${OLD}." >&2
@@ -424,6 +476,7 @@ case "$PRE_BACKUP" in
     snap_rc=$?
     set -e
     if [[ "$snap_rc" -eq 0 ]]; then
+      _OCI_REFRESH_SNAP_OK=1
       out_ok "Snapshot created"
       out_kv "Rollback cmd" "pct rollback ${OLD} ${SNAP_NAME}"
     elif [[ "$PRE_BACKUP" == "snapshot" ]]; then
@@ -442,6 +495,7 @@ esac
 if pct config "$TEMP" &>/dev/null; then
   out_warn "Temp CT ${TEMP} already exists — reusing (will stop and refresh from image)."
 else
+  _OCI_REFRESH_TEMP_CREATED=1
   create_temp_ct
 fi
 
@@ -451,12 +505,6 @@ out_detail "pct stop temp CT is harmless if already stopped"
 
 out_sub "Mount root filesystems"
 out_detail "pct mount keeps a lock on the CT until unmount"
-cleanup_mounts() {
-  pct unmount "$TEMP" 2>/dev/null || true
-  pct unmount "$OLD" 2>/dev/null || true
-}
-trap cleanup_mounts EXIT
-
 pct mount "$OLD"
 pct mount "$TEMP"
 out_ok "Mounted ${M_OLD} and ${M_NEW}"
@@ -482,13 +530,17 @@ while IFS= read -r line; do
   [[ -n "$cpath" ]] || continue
   [[ "$cpath" == /* ]] || cpath="/$cpath"
   rel="${cpath#/}"
-  excludes+=( --exclude="${rel}" --exclude="${rel%/}/" )
+  rel="${rel%/}"
+  [[ -n "$rel" ]] || continue
+  # Leading '/' anchors at the transfer root; unanchored "data" would skip every dir named data.
+  excludes+=( --exclude="/${rel}" )
 done < <(pct config "$OLD" | LC_ALL=C grep -aE '^mp[0-9]+:' || true)
 
 out_sub "rsync rootfs (${OLD})"
 [[ ${#excludes[@]} -gt 0 ]] && out_cmd "rsync excludes: ${excludes[*]}"
 out_detail "Mount-point excludes needed so rsync --delete does not hit bind-mounted mp= paths inside rootfs."
 out_detail "${M_NEW}/ → ${M_OLD}/"
+_OCI_REFRESH_DESTRUCTIVE=1
 rsync -aHAX --delete "${excludes[@]}" "${M_NEW}/" "${M_OLD}/"
 out_ok "rsync done"
 
@@ -509,16 +561,24 @@ if [[ -n "${PVE_OCI_COMPOSE_SVC_JSON:-}" && -n "${PVE_OCI_COMPOSE_DIR:-}" ]] \
     || die "refresh: failed to inject compose files into CT ${OLD}"
 fi
 
-trap - EXIT
-out_sub "Cleanup: unmount → sync entrypoint → destroy ${TEMP} → start ${OLD}"
+out_sub "Cleanup: unmount → sync entrypoint → destroy ${TEMP}"
 pct unmount "$TEMP"
 pct unmount "$OLD"
 
 pct_sync_entrypoint_from_temp "$OLD" "$TEMP"
 
 pct destroy "$TEMP"
-pct start "$OLD"
+_OCI_REFRESH_TEMP_CREATED=0
 
-out_ok "Refresh complete — CT ${OLD} running (temp VMID ${TEMP} removed)"
+if [[ "$_OCI_REFRESH_WAS_RUNNING" -eq 1 ]]; then
+  pct start "$OLD"
+  _OCI_REFRESH_ACTIVE=0
+  trap - EXIT
+  out_ok "Refresh complete — CT ${OLD} running again (temp VMID ${TEMP} removed)"
+else
+  _OCI_REFRESH_ACTIVE=0
+  trap - EXIT
+  out_ok "Refresh complete — CT ${OLD} left stopped as before (temp VMID ${TEMP} removed)"
+fi
 
 }

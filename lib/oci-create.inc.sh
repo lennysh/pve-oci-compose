@@ -89,6 +89,9 @@ oci_create_pct_failure_cleanup() {
   if pct config "$vmid" &>/dev/null; then
     echo "pve-oci-compose: removing partial CT ${vmid} after failed pct create …" >&2
     pct destroy "$vmid" --purge 2>/dev/null || pct destroy "$vmid" 2>/dev/null || true
+    if pct config "$vmid" &>/dev/null; then
+      echo "pve-oci-compose: could not remove CT ${vmid} (protection: 1?) — remove it manually before re-running apply." >&2
+    fi
   fi
 
   if [[ -n "${PVE_OCI_POOL_JUST_AUTOCREATED:-}" && -n "$pool" \
@@ -113,12 +116,12 @@ pve_oci_append_lxc_config_lines() {
   shift
   [[ "$#" -eq 0 ]] && return 0
   cfg="/etc/pve/lxc/${vmid}.conf"
-  [[ -f "$cfg" ]] || die "internal: CT config missing after create: ${cfg}"
+  [[ -f "$cfg" ]] || { echo "pve-oci-compose: CT config missing after create: ${cfg}" >&2; return 1; }
   for line in "$@"; do
     _oci_validate_lxc_config_line "$line" \
-      || die "invalid --lxc-line (expected KEY: value or KEY = value; no snapshot [section] lines): ${line:0:120}"
+      || { echo "pve-oci-compose: invalid --lxc-line (expected KEY: value or KEY = value; no snapshot [section] lines): ${line:0:120}" >&2; return 1; }
   done
-  tmp="$(mktemp "${TMPDIR:-/tmp}/pve-oci-lxc-lines.XXXXXX")" || die "mktemp failed"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/pve-oci-lxc-lines.XXXXXX")" || return 1
   # Strip legacy # BEGIN/END comment blocks (Proxmox shows # lines from .conf in the CT Notes UI).
   awk '
     /^# BEGIN pve-oci-compose lxc_config_lines$/ { skip=1; next }
@@ -126,11 +129,12 @@ pve_oci_append_lxc_config_lines() {
     !skip { print }
   ' "$cfg" >"$tmp" || {
     rm -f "$tmp"
-    die "failed to read ${cfg}"
+    echo "pve-oci-compose: failed to read ${cfg}" >&2
+    return 1
   }
   newf="$(mktemp "${TMPDIR:-/tmp}/pve-oci-lxc-lines-new.XXXXXX")" || {
     rm -f "$tmp"
-    die "mktemp failed"
+    return 1
   }
   {
     cat "$tmp"
@@ -139,12 +143,14 @@ pve_oci_append_lxc_config_lines() {
     done
   } >"$newf" || {
     rm -f "$tmp" "$newf"
-    die "write failed (${cfg})"
+    echo "pve-oci-compose: write failed (${cfg})" >&2
+    return 1
   }
   # pmxcfs (/etc/pve/…): GNU mv warns or fails on --preserve for ownership/mode; overwrite in place.
   if ! cat "$newf" >"$cfg"; then
     rm -f "$tmp" "$newf"
-    die "failed to write ${cfg}"
+    echo "pve-oci-compose: failed to write ${cfg}" >&2
+    return 1
   fi
   rm -f "$tmp" "$newf"
 }
@@ -658,8 +664,8 @@ oci_registry_pull() {
     echo >&2
     echo "oci-registry-pull only supports the same storages the UI can write an OCI .tar to (dir, nfs, cifs, …), not zfspool." >&2
     echo "Pass the Datacenter → Storage **id** where your Container templates path lives (vztmpl on your mount), not your CT disk pool:" >&2
-    echo "  $0 --list-template-storages" >&2
-      echo "Then e.g.:  --storage <that-id> --reference ${REFERENCE} --rootfs Storage:8 ..." >&2
+    echo "  pvesm status --content vztmpl" >&2
+    echo "Then set template_storage: <that-id> on the service in compose." >&2
   elif [[ "$ref" == *@sha256:* ]]; then
     echo "Digest ref pull failed and there is no host vztmpl path for a direct skopeo copy." >&2
     echo "Use an explicit version tag, a registry that lists non-latest tags for this manifest, or template storage with a resolvable directory path." >&2
@@ -842,15 +848,16 @@ done
 [[ -n "$BWLIMIT" ]] && cmd+=(--bwlimit "$BWLIMIT")
 [[ -n "$START" ]] && cmd+=(--start "$START")
 
-local _pct_log _pct_ec
+local _pct_log _pct_ec _cmd_shown
+_cmd_shown="$(pve_oci_redact_cmd "${cmd[@]}")"
 _pct_log="$(mktemp "${TMPDIR:-/tmp}/pve-oci-pct.XXXXXX")" || die "mktemp failed for pct log"
 _pct_ec=0
 if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
-  out_cmd "$(printf '%q ' "${cmd[@]}")"
+  out_cmd "$_cmd_shown"
   "${cmd[@]}" >"$_pct_log" 2>&1 || _pct_ec=$?
 else
   out_step "run" "" "pct create"
-  out_cmd "$(printf '%q ' "${cmd[@]}")"
+  out_cmd "$_cmd_shown"
   "${cmd[@]}" >"$_pct_log" 2>&1 || _pct_ec=$?
 fi
 if [[ "$_pct_ec" -ne 0 ]]; then
@@ -881,12 +888,17 @@ if [[ "$_def_json" != "{}" || "$_svc_json" != "{}" || ${#_pve_oci_compose_env[@]
   else
     out_sub "Merge env (image → defaults → service)"
   fi
-  pve_oci_pct_env_merge_set "$VMID" "$_def_json" "$_svc_json" "${_pve_oci_compose_env[@]}" \
-    || die "failed to merge env into CT ${VMID} config"
+  if ! pve_oci_pct_env_merge_set "$VMID" "$_def_json" "$_svc_json" "${_pve_oci_compose_env[@]}"; then
+    oci_create_pct_failure_cleanup "$VMID" "$POOL" ""
+    die "failed to merge env into CT ${VMID} config (new CT removed)"
+  fi
 fi
 unset _def_json _svc_json _pve_oci_compose_env 2>/dev/null || true
 if [[ "${#LXC_LINE_SPECS[@]}" -gt 0 ]]; then
-  pve_oci_append_lxc_config_lines "$VMID" "${LXC_LINE_SPECS[@]}"
+  if ! pve_oci_append_lxc_config_lines "$VMID" "${LXC_LINE_SPECS[@]}"; then
+    oci_create_pct_failure_cleanup "$VMID" "$POOL" ""
+    die "failed to write lxc_config_lines for CT ${VMID} (new CT removed)"
+  fi
   if [[ "$_PVE_OCI_CREATE_QUIET" -eq 1 ]]; then
     out_muted "Wrote ${#LXC_LINE_SPECS[@]} lxc_config_lines to /etc/pve/lxc/${VMID}.conf"
   else
