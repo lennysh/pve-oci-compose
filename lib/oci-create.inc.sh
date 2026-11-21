@@ -522,8 +522,12 @@ resolve_floating_latest_ref() {
   picked=""
   json_at=$(skopeo inspect "docker://${name}@${digest}" 2>/dev/null) || json_at=""
   if [[ -n "$json_at" ]]; then
+    # Prefer a concrete non-latest tag for the same digest. Skip cosign/notation
+    # signature tags (*.sig) — those are OCI artifacts, not runnable images, and
+    # sort -V often ranks them last so :latest wrongly resolved to name:….sig.
     picked=$(printf '%s\n' "$json_at" | jq -r '(.RepoTags // [])[]' \
-      | awk 'tolower($0) != "latest"' | sort -V | tail -n1)
+      | awk 'tolower($0) != "latest" && $0 !~ /\.sig$/ && $0 !~ /^sha256-/' \
+      | sort -V | tail -n1)
   fi
 
   if [[ -n "$picked" ]]; then
