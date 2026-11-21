@@ -482,7 +482,9 @@ while IFS= read -r line; do
   [[ -n "$cpath" ]] || continue
   [[ "$cpath" == /* ]] || cpath="/$cpath"
   rel="${cpath#/}"
-  excludes+=( --exclude="${rel}" --exclude="${rel%/}/" )
+  rel="${rel%/}"
+  [[ -n "$rel" ]] || continue
+  excludes+=( --exclude="/${rel}" )
 done < <(pct config "$OLD" | LC_ALL=C grep -aE '^mp[0-9]+:' || true)
 
 out_sub "rsync rootfs (${OLD})"
