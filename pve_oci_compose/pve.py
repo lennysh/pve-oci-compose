@@ -6,6 +6,7 @@ Mutating calls go through :meth:`Pve.mutate`, which only prints them in dry-run 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import socket
@@ -293,6 +294,26 @@ class Pve:
             return json.loads(raw)
         except json.JSONDecodeError:
             return None
+
+    def registry_digest(self, ref: str) -> str | None:
+        """Current manifest digest of a (normalized) registry ref, or None if unreachable.
+
+        sha256 of the raw top-level manifest (multi-arch index or single manifest) — the
+        same value the registry reports as the tag's digest. One manifest GET, no blobs.
+        """
+        if "@sha256:" in ref:
+            return ref.split("@", 1)[1]
+        try:
+            cp = subprocess.run(
+                ["skopeo", "inspect", "--raw", f"docker://{ref}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            return None
+        if cp.returncode != 0 or not cp.stdout:
+            return None
+        return "sha256:" + hashlib.sha256(cp.stdout).hexdigest()
 
     def pvesm_path(self, volid: str) -> str | None:
         out = self.out(["pvesm", "path", volid])

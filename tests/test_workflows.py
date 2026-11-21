@@ -38,7 +38,8 @@ def test_apply_creates_tags_marks_writes_back_and_starts(setup, tmp_path):
     commands.apply(pve, C.load(p), commands.Options())
     assert 200 in pve.cts
     root = tmp_path / "lxc/200/rootfs"
-    assert json.loads((root / "etc/pve-oci-compose.json").read_text()) == {"service": "web", "ref": "ghcr.io/o/web:1.0"}
+    assert json.loads((root / "etc/pve-oci-compose.json").read_text()) == {
+        "service": "web", "ref": "ghcr.io/o/web:1.0", "digest": "sha256:" + "0" * 64}
     assert (root / "etc/app.conf").read_text() == "hello\n"
     conf = (ctconf.CONF_DIR / "200.conf").read_text()
     assert "tags: pve-oci-compose" in conf
@@ -172,3 +173,102 @@ def test_select_filters(tmp_path):
     assert [s.name for s in commands.select(c, commands.Options(vmid=105))] == ["web"]
     with pytest.raises(ComposeError):
         commands.select(c, commands.Options(service="nope"))
+
+
+# ---- digest drift ---------------------------------------------------------------------
+
+D_OLD, D_NEW = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+
+
+def _same_ref(pve, tmp_path, digest=D_OLD, registry=D_NEW, image="ghcr.io/o/web:1.0"):
+    root = _managed(pve, tmp_path, ref=image)
+    blob = {"service": "web", "ref": image}
+    if digest:
+        blob["digest"] = digest
+    (root / "etc/pve-oci-compose.json").write_text(json.dumps(blob))
+    pve.digests[image] = registry
+    return root, _refresh_compose(tmp_path, image)
+
+
+def test_refresh_when_tag_moved_on_registry(tmp_path):
+    pve = FakePve(tmp_path)
+    root, c = _same_ref(pve, tmp_path)
+    commands.refresh(pve, c, commands.Options())
+    assert pve.cmds("rsync")
+    assert json.loads((root / "etc/pve-oci-compose.json").read_text())["digest"] == D_NEW
+
+
+def test_skip_when_digest_matches(tmp_path, capsys):
+    pve = FakePve(tmp_path)
+    _, c = _same_ref(pve, tmp_path, registry=D_OLD)
+    commands.refresh(pve, c, commands.Options())
+    assert not pve.cmds("rsync")
+    assert "ref and digest match" in capsys.readouterr().out
+
+
+def test_old_marker_without_digest_skips_with_hint(tmp_path, capsys):
+    pve = FakePve(tmp_path)
+    root, c = _same_ref(pve, tmp_path, digest=None)
+    commands.refresh(pve, c, commands.Options())
+    assert not pve.cmds("rsync")
+    assert "--force once" in capsys.readouterr().out
+    commands.refresh(pve, c, commands.Options(force=True))  # records the digest
+    assert json.loads((root / "etc/pve-oci-compose.json").read_text())["digest"] == D_NEW
+
+
+def test_registry_unreachable_skips(tmp_path):
+    pve = FakePve(tmp_path)
+    _, c = _same_ref(pve, tmp_path, registry=None)
+    commands.refresh(pve, c, commands.Options())
+    assert not pve.cmds("rsync")
+
+
+def test_pinned_digest_never_checks_registry(tmp_path, monkeypatch):
+    pve = FakePve(tmp_path)
+    img = "ghcr.io/o/web@" + D_OLD
+    _same_ref(pve, tmp_path, image=img)
+    monkeypatch.setattr(pve, "registry_digest", lambda r: pytest.fail("registry queried"))
+    commands.refresh(pve, _refresh_compose(tmp_path, img), commands.Options())
+    assert not pve.cmds("rsync")
+
+
+def test_plan_reports_digest_drift(tmp_path, capsys):
+    pve = FakePve(tmp_path)
+    _, c = _same_ref(pve, tmp_path)
+    commands.plan(pve, c, commands.Options())
+    out = capsys.readouterr().out
+    assert f"stored digest: {D_OLD}" in out
+    assert "would run refresh — tag ghcr.io/o/web:1.0 was updated on the registry" in out
+
+
+# ---- template reuse -----------------------------------------------------------------------
+
+
+def test_template_reused_only_when_digest_current(tmp_path, setup):
+    from pve_oci_compose import state
+    from pve_oci_compose.create import pull, resolve_template
+
+    pve, _ = setup
+    pve.digests["ghcr.io/o/web:1.0"] = D_OLD
+    t = resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None)
+    pull(pve, "pve1", t)
+    assert state.template_digest(t.ostemplate) == D_OLD and len(pve.cmds("pvesh create")) == 1
+
+    pull(pve, "pve1", t)  # same digest: reuse, no download
+    assert len(pve.cmds("pvesh create")) == 1 and not pve.cmds("pvesm free")
+
+    pve.digests["ghcr.io/o/web:1.0"] = D_NEW  # tag moved: stale tarball removed + re-pulled
+    t2 = resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None)
+    pull(pve, "pve1", t2)
+    assert pve.cmds(f"pvesm free {t.ostemplate}") and len(pve.cmds("pvesh create")) == 2
+    assert state.template_digest(t.ostemplate) == D_NEW
+
+
+def test_unknown_template_on_storage_is_replaced(tmp_path, setup):
+    from pve_oci_compose.create import pull, resolve_template
+
+    pve, _ = setup
+    t = resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None)
+    pve.volids.add(t.ostemplate)  # pulled earlier by something else: digest unknown
+    pull(pve, "pve1", t)
+    assert pve.cmds(f"pvesm free {t.ostemplate}") and pve.cmds("pvesh create")

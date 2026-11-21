@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 
 from . import compose as C
-from . import description, inject, marker, pools, ui
+from . import description, inject, marker, pools, refs, ui
 from .compose import Compose, Service
 from .create import create_ct, destroy_partial, pull, resolve_template, spec_from_service
 from .errors import ComposeError
@@ -132,7 +132,7 @@ def apply(pve: Pve, c: Compose, o: Options) -> None:
         try:
             marker.tag(pve, vmid)
             with marker.guest_root(pve, vmid) as root:
-                marker.write_at(root, svc.name, svc.image)
+                marker.write_at(root, svc.name, svc.image, template.digest)
                 _inject(pve, c, svc, vmid, "apply", root)
         except BaseException as e:
             destroy_partial(pve, vmid, autocreated)
@@ -151,6 +151,39 @@ def apply(pve: Pve, c: Compose, o: Options) -> None:
         if spec.start:
             pve.run(["pct", "start", str(vmid)])
             ui.say(f"apply: [{svc.name}] started CT {vmid}")
+
+
+# ---- drift -------------------------------------------------------------------------
+
+
+@dataclass
+class Drift:
+    refresh: bool
+    reason: str
+
+
+def drift(pve: Pve, svc: Service, m: marker.Marker) -> Drift:
+    """Should a managed CT be refreshed? Compose ref vs marker ref, then — for the same
+    ref — the tag's current registry digest vs the digest recorded at the last pull."""
+    if m.ref != svc.image:
+        return Drift(True, f"image ref changed: {m.ref} → {svc.image}")
+    if not refs.is_registry_ref(svc.image):
+        return Drift(False, "image unchanged (local template)")
+    if "@sha256:" in svc.image:
+        return Drift(False, "image unchanged (pinned digest)")
+    if not m.digest:
+        return Drift(False, "image ref unchanged; no digest recorded yet (refresh --force once to record it)")
+    current = pve.registry_digest(refs.normalize(svc.image))
+    if current is None:
+        ui.warn(f"[{svc.name}] could not read the registry digest of {svc.image} (offline / rate-limited?)")
+        return Drift(False, "image ref unchanged; registry digest unavailable")
+    if current != m.digest:
+        return Drift(True, f"tag {svc.image} was updated on the registry ({_short(m.digest)} → {_short(current)})")
+    return Drift(False, "image unchanged (ref and digest match)")
+
+
+def _short(d: str) -> str:
+    return d.split(":", 1)[-1][:12]
 
 
 # ---- refresh -------------------------------------------------------------------------
@@ -190,14 +223,17 @@ def refresh(pve: Pve, c: Compose, o: Options) -> None:
             ui.say(f"refresh: [{svc.name}] --adopt: treating unmanaged CT {vmid} as {svc.name}")
         elif m.service and m.service != svc.name and not o.adopt:
             raise ComposeError(f"refresh: [{svc.name}] CT {vmid} is bound to service '{m.service}' (use --adopt to rebind)")
-        elif m.ref == svc.image and not o.force:
-            ui.say(f"refresh: [{svc.name}] image unchanged — skip")
-            continue
+        elif not o.force:
+            d = drift(pve, svc, m)
+            if not d.refresh:
+                ui.say(f"refresh: [{svc.name}] {d.reason} — skip")
+                continue
+            ui.say(f"refresh: [{svc.name}] {d.reason}")
 
         ui.say(f"refresh: [{svc.name}] vmid {vmid} → {svc.image}")
 
-        def on_rootfs(root: str, svc=svc, vmid=vmid) -> None:
-            marker.write_at(root, svc.name, svc.image)
+        def on_rootfs(root: str, template, svc=svc, vmid=vmid) -> None:
+            marker.write_at(root, svc.name, svc.image, template.digest if template else None)
             _inject(pve, c, svc, vmid, "refresh", root)
 
         pulled = refresh_ct(pve, vmid, svc.image, _refresh_options(svc, o), on_rootfs,
@@ -220,7 +256,7 @@ def pull_only(pve: Pve, c: Compose, o: Options) -> None:
         ui.say(f"pull: [{svc.name}] {svc.image}")
         node = pve.node_name()
         t = resolve_template(pve, node, svc.image, svc.template_storage)
-        pull(pve, node, t, reuse=False)
+        pull(pve, node, t)
 
 
 # ---- plan --------------------------------------------------------------------------------
@@ -297,11 +333,12 @@ def plan(pve: Pve, c: Compose, o: Options) -> None:
             ui.say("  plan apply:    would REFUSE (wrong service name for this vmid)")
         else:
             ui.say(f"  stored ref:    {m.ref if m and m.ref else '<unreadable here>'}")
+            if m and m.digest:
+                ui.say(f"  stored digest: {m.digest}")
             if not (m and m.ref):
                 ui.say("  plan refresh:  drift check needs a readable guest marker")
-            elif m.ref == svc.image:
-                ui.say("  plan refresh:  skip (ref matches)")
             else:
-                ui.say(f"  plan refresh:  would run refresh → {svc.image}")
+                d = drift(pve, svc, m)
+                ui.say(f"  plan refresh:  {'would run refresh — ' if d.refresh else 'skip — '}{d.reason}")
             ui.say("  plan apply:    no-op (already exists, compose-managed)")
         ui.say()

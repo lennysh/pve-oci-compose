@@ -145,7 +145,7 @@ See **`compose.example.yaml`**: a minimal working service plus **long commented 
 |---------|----------|
 | **plan** | No changes. For each service: CT exists?, **`tags`** from **`pct`** / API, stored **`ref`** from the guest marker JSON (**`PVE_OCI_ROOTFS_MARKER`**), would **apply** / **refresh**? If the vmid is an **existing LXC** without compose marker/tag (e.g. OCI created outside this tool), **plan** prints a **WARNING** and **would REFUSE** for **apply** so you can verify before pulling templates. |
 | **apply** | If missing, **create**, then sentinel tag **`pve-oci-compose`** + guest JSON marker (**`pct mount`** briefly on a stopped CT). **plan**/`refresh` read the JSON through **`/proc/<pid>/root`** when running, else **`pct mount`**. Before pull/create, **apply** checks **`pvesh get /cluster/resources`** so a vmid already used by a **QEMU** guest fails immediately (LXC-only **`pct config`** is not enough). An LXC may **run on another cluster node**: **`pct config`** can fail on the member where you run the script even though the guest exists; the tool then uses the API (**hosting node** from resources + **`pvesh …/lxc/<vmid>/config`**) for **tags** and still treats the vmid as taken. If the vmid is an existing LXC without a compose marker/tag, **apply** refuses (same as “not adopted”) instead of pulling then failing at **`pct create`**. Creating a new CT is **all-or-nothing**: if env merge, **`lxc_config_lines`**, the guest marker or file inject fails after **`pct create`**, the new CT is destroyed (and an auto-created pool removed) and the compose file is not touched, so re-running **apply** starts clean. The allocated vmid is written back as soon as the CT is complete. **`start: true`** is applied by **apply** itself after the marker / file inject (not via **`pct create --start`**). |
-| **refresh** | Per service: if compose **`image`** ≠ guest marker **`ref`**, run rootfs replace (pre-backup: **`pct snapshot`**, optional **`vzdump`** fallback — see **`refresh_pre_backup`** / **`--pre-backup auto`**), **`rsync`** from a temp CT built from the new image, inject **`on_refresh`** compose files (e.g. **`/etc/resolv.conf`**) while the rootfs is mounted, sync **`entrypoint`** on the host config, destroy temp CT, then **start** the target CT again **only if it was running before**. If anything fails after **`rsync`** began, the CT is automatically **rolled back** to the pre-refresh snapshot (when one was taken; disable with **`OCI_REFRESH_NO_AUTO_ROLLBACK=1`**) and restarted if it was running; failures before that just remove the temp CT and restart the target. Skips when refs match unless **`--force`** (use **`--force`** to re-run refresh only to re-inject **`on_refresh`** files). Skips CTs with no readable marker unless **`--adopt`** (then writes marker + tag after success). **`rsync`** excludes **`mp*`** guest paths (anchored at the rootfs root) so **`--delete`** does not hit busy mountpoints. |
+| **refresh** | Per service: if compose **`image`** ≠ guest marker **`ref`** — or the ref is the same but the tag now points at a different image on the registry (see [Image updates on the same tag](#image-updates-on-the-same-tag-digest-check)) — run rootfs replace (pre-backup: **`pct snapshot`**, optional **`vzdump`** fallback — see **`refresh_pre_backup`** / **`--pre-backup auto`**), **`rsync`** from a temp CT built from the new image, inject **`on_refresh`** compose files (e.g. **`/etc/resolv.conf`**) while the rootfs is mounted, sync **`entrypoint`** on the host config, destroy temp CT, then **start** the target CT again **only if it was running before**. If anything fails after **`rsync`** began, the CT is automatically **rolled back** to the pre-refresh snapshot (when one was taken; disable with **`OCI_REFRESH_NO_AUTO_ROLLBACK=1`**) and restarted if it was running; failures before that just remove the temp CT and restart the target. Skips when ref and digest match unless **`--force`** (use **`--force`** to re-run refresh only to re-inject **`on_refresh`** files). Skips CTs with no readable marker unless **`--adopt`** (then writes marker + tag after success). **`rsync`** excludes **`mp*`** guest paths (anchored at the rootfs root) so **`--delete`** does not hit busy mountpoints. |
 | **pull** | Per service: **`oci-registry-pull`** only (**`--pull-only`**); needs **`image`** / **`reference`**, not **`rootfs`**. |
 
 ### CLI options
@@ -174,6 +174,7 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 | **`COMPOSE_FILE`** | Default compose path when **`-f`** is not passed (see above). |
 | **`PVE_OCI_COMPOSE_NO_WRITE=1`** | Same as **`--no-write-compose`** (skip vmid writeback after **apply**). |
 | **`PVE_OCI_ROOTFS_MARKER`** | Path inside the CT rootfs for the JSON marker (default **`/etc/pve-oci-compose.json`**). |
+| **`PVE_OCI_STATE_DIR`** | Node-local state directory (default **`/var/lib/pve-oci-compose`**); holds **`templates.json`**, the digest each vztmpl template was pulled at. Safe to delete (templates are re-downloaded once). |
 | **`PVE_OCI_POOL_NO_AUTOCREATE=1`** | Do not auto-create missing Datacenter resource pools; pool must exist before **apply** / **refresh**. |
 | **`PVE_OCI_VERBOSE=1`** | Show extra detail and the full **`pct`** / **`pvesh`** / **`skopeo`** command lines (passwords redacted). |
 | **`NO_COLOR=1`** | Plain output without colours (also automatic when stdout is not a terminal). |
@@ -186,7 +187,8 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 ### Image references and pulls
 
 - **Compose refs** may be bare (`ghcr.io/org/app:tag`) or prefixed with **`oci://`** / **`docker://`**. **refresh** also accepts a local vztmpl volume (`local:vztmpl/x.tar`) or path, which is used as-is without a registry pull.
-- **Floating `:latest` / `*_latest`:** before **`oci-registry-pull`**, the tool **`skopeo`**-resolves the ref to a digest or concrete tag so pulls are repeatable. Opt out with **`OCI_CT_CREATE_NO_RESOLVE_LATEST=1`** (use the compose string as-is).
+- **Floating `:latest` / `*_latest`:** before **`oci-registry-pull`**, the tool pins the ref to a concrete tag **with the same digest** (e.g. `nginx:latest` → `nginx:1.31.9`), checking the most likely tags first (dotted versions, most specific first; at most 5 registry lookups), else to `name@sha256:…`. Opt out with **`OCI_CT_CREATE_NO_RESOLVE_LATEST=1`** (use the compose string as-is).
+- **Template reuse:** a template already on storage is reused only if it was pulled at the digest the tag has now (recorded per node in **`PVE_OCI_STATE_DIR`**). Otherwise it is removed (**`pvesm free`**) and pulled again, so a moved tag never silently reuses an old tarball with the same filename.
 - **Resolved ref in Notes:** after a successful pull, the resolved ref feeds the composed CT **description** (**Image (pulled):** + **Template sync:**) when that feature is enabled for the service.
 
 ### Validation (before **apply** / **refresh** / **pull**)
@@ -198,7 +200,7 @@ Per service, the driver checks (non-exhaustive): numeric or **`next`** **`vmid`*
 Guest marker JSON (default path **`/etc/pve-oci-compose.json`**, override with **`PVE_OCI_ROOTFS_MARKER`**) stores:
 
 ```json
-{"service": "<compose service name>", "ref": "<image ref last applied>"}
+{"service": "<compose service name>", "ref": "<image ref last applied>", "digest": "sha256:<registry digest of ref at that pull>"}
 ```
 
 - **`pct rollback`** restores that file with rootfs — **`plan`**, **`--force`**, and drift checks follow the rolled-back tree.
@@ -206,7 +208,19 @@ Guest marker JSON (default path **`/etc/pve-oci-compose.json`**, override with *
 - The marker is written while the rootfs is mounted (after create, and after the **refresh** **`rsync`**), never by following symlinks inside the guest.
 - **plan** warns if marker **`service`** ≠ compose service key for that **`vmid`**.
 
-Use **pinned tags or digests** when you care exactly when **refresh** runs; floating **`:latest`** is easy to misread across machines.
+### Image updates on the same tag (digest check)
+
+Tags like **`:latest`**, **`:stable`** or **`:1.27`** can point at a new image without the compose file changing. When the compose **`image`** equals the marker **`ref`**, **plan** and **refresh** ask the registry for the tag's current digest (`skopeo inspect --raw`: one manifest request, no layer download) and compare it with the marker **`digest`**:
+
+| Situation | **refresh** |
+|-----------|-------------|
+| digest differs | refreshes (`tag … was updated on the registry (old → new)`) |
+| digest matches | skips |
+| marker has no **`digest`** (written by an older version) | skips with a hint — run **`refresh --force`** once to record it |
+| registry unreachable / rate-limited | skips with a warning |
+| compose pins a digest (`name@sha256:…`) or a local template | never queries the registry |
+
+Each **plan** / **refresh** therefore makes one registry request per managed service with a tag ref. Docker Hub counts manifest requests against its pull rate limit (lower for anonymous clients); if you run it often or have many services, give **`skopeo`** registry credentials on the node (e.g. **`skopeo login docker.io`**).
 
 ## Operational notes
 

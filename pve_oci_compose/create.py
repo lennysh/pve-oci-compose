@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from . import ctconf, refs, ui
+from . import ctconf, refs, state, ui
 from .compose import Service, as_flag, as_scalar, parse_mount_spec
 from .errors import CommandError, ComposeError
 from .pve import OCI_PULL_STORAGE_TYPES, Pve, parse_upid
@@ -58,6 +58,7 @@ class Template:
     pull_ref: str
     ostemplate: str
     local_tar: str | None
+    digest: str | None = None  # registry digest of input_ref at resolve time (before the pull)
 
 
 def resolve_template(pve: Pve, node: str, ref: str, storage: str | None) -> Template:
@@ -66,15 +67,18 @@ def resolve_template(pve: Pve, node: str, ref: str, storage: str | None) -> Temp
     norm_in = refs.normalize(ref)
     if norm_in != refs.strip_scheme(ref):
         ui.detail(f"Normalized registry ref: {ref} → {norm_in}")
+    # Fetched before the pull: if the tag moves in between, the recorded digest is the older
+    # one and the next refresh re-checks (never the other way round).
+    digest = pve.registry_digest(norm_in)
     pull_ref = norm_in
     if not os.environ.get("OCI_CT_CREATE_NO_RESOLVE_LATEST") and refs.is_floating_latest(
         norm_in, pve.normalize_content_filename(norm_in)
     ):
-        pull_ref = refs.resolve_floating(pve, norm_in)
+        pull_ref = refs.resolve_floating(pve, norm_in, digest)
     fname = pve.normalize_content_filename(pull_ref)
     d = pve.vztmpl_dir(st)
     local = os.path.join(d, f"{fname}.tar") if d and os.path.isdir(d) else None
-    return Template(st, norm_in, pull_ref, f"{st}:vztmpl/{fname}.tar", local)
+    return Template(st, norm_in, pull_ref, f"{st}:vztmpl/{fname}.tar", local, digest)
 
 
 def _template_present(pve: Pve, node: str, t: Template) -> bool:
@@ -83,9 +87,23 @@ def _template_present(pve: Pve, node: str, t: Template) -> bool:
     return pve.storage_has_volid(node, t.storage, t.ostemplate)
 
 
-def pull(pve: Pve, node: str, t: Template, quiet: bool = False, reuse: bool = False) -> None:
-    if reuse and _template_present(pve, node, t):
-        ui.muted(f"Reusing template {t.ostemplate}")
+def template_is_current(pve: Pve, node: str, t: Template) -> bool:
+    """Template on storage and pulled at the digest the tag has now (digest refs: immutable)."""
+    if not _template_present(pve, node, t):
+        return False
+    if "@sha256:" in t.pull_ref:
+        return True
+    return bool(t.digest) and state.template_digest(t.ostemplate) == t.digest
+
+
+def pull(pve: Pve, node: str, t: Template, quiet: bool = False) -> None:
+    """Make sure ``t.ostemplate`` holds the image the tag points at *now*.
+
+    Reuses the template when its recorded digest matches; otherwise a template with the
+    same filename (older pull of a moved tag, or unknown origin) is removed and re-pulled.
+    """
+    if template_is_current(pve, node, t):
+        ui.muted(f"Template {t.ostemplate} is current ({t.digest or 'digest ref'}) — reusing")
         return
     if quiet:
         ui.muted(f"Template pull on {t.storage} ({t.pull_ref})")
@@ -98,11 +116,18 @@ def pull(pve: Pve, node: str, t: Template, quiet: bool = False, reuse: bool = Fa
             ui.kv("Resolved pull ref", t.pull_ref)
         else:
             ui.kv("Image ref", t.pull_ref)
+    present = _template_present(pve, node, t)
     if pve.dry_run:
+        if present:
+            ui.say(f"DRY-RUN: pvesm free {t.ostemplate}   # stale or unknown digest")
         ui.say(f"DRY-RUN: pvesh create /nodes/{node}/storage/{t.storage}/oci-registry-pull --reference {t.pull_ref}")
         return
-    if pve.skopeo_inspect(t.pull_ref) is None:
-        raise ComposeError(f"registry image not found or not reachable: docker://{t.pull_ref}")
+    if not t.digest:
+        raise ComposeError(f"registry image not found or not reachable: docker://{t.input_ref}")
+    if present:
+        ui.muted(f"Removing outdated template {t.ostemplate} (tag moved or digest unknown)")
+        pve.run(["pvesm", "free", t.ostemplate])
+        state.record_template(t.ostemplate, None)
     cp = pve.run(
         ["pvesh", "create", f"/nodes/{node}/storage/{t.storage}/oci-registry-pull",
          "--reference", t.pull_ref, "--output-format", "json"],
@@ -116,8 +141,11 @@ def pull(pve: Pve, node: str, t: Template, quiet: bool = False, reuse: bool = Fa
         if not quiet:
             ui.kv("Task UPID", upid)
         pve.wait_task(upid, node)
-    elif re.search(r"refusing to override|already exists|existing file", out, re.I) and _template_present(pve, node, t):
-        ui.muted(f"Template {t.ostemplate} already on storage (delete it there to force a re-download)")
+    elif re.search(r"refusing to override|already exists|existing file", out, re.I):
+        raise ComposeError(
+            f"template {t.ostemplate} reappeared during the pull (concurrent run?) — re-run, or remove it with "
+            f"pvesm free {t.ostemplate}"
+        )
     elif "@sha256:" in t.pull_ref and t.local_tar and re.search(
         r"parameter verification|invalid|does not match|malformed|bad request", out, re.I
     ):
@@ -137,6 +165,7 @@ def pull(pve: Pve, node: str, t: Template, quiet: bool = False, reuse: bool = Fa
         time.sleep(1)
     else:
         raise ComposeError(f"template {t.ostemplate} did not appear on storage after pull")
+    state.record_template(t.ostemplate, t.digest)
     if not quiet:
         ui.ok("Template on storage")
 

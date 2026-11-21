@@ -19,6 +19,8 @@ class FakePve(Pve):
         self.fail: dict[str, int] = {}  # argv[0:2] joined ("rsync", "pct create") -> exit code
         self.pools: dict[str, list[int]] = {}
         self.qemu: set[int] = set()
+        self.digests: dict[str, str | None] = {}  # normalized ref -> registry digest (fake registry)
+        self.volids: set[str] = set()  # templates on storage
         ctconf.CONF_DIR = tmp / "pve-lxc"
         ctconf.CONF_DIR.mkdir(exist_ok=True)
 
@@ -73,8 +75,15 @@ class FakePve(Pve):
             self.pools.setdefault(argv[argv.index("--poolid") + 1], [])
         elif argv[:2] == ["pvesh", "set"] and argv[2].startswith("/pools/"):
             self.pools.setdefault(argv[2][len("/pools/"):], []).append(int(argv[argv.index("--vms") + 1]))
-        elif argv[:2] == ["pvesh", "create"] and argv[2].endswith(("/oci-registry-pull", "/vzdump")):
+        elif argv[:2] == ["pvesh", "create"] and argv[2].endswith("/oci-registry-pull"):
+            st = argv[2].split("/")[4]
+            ref = argv[argv.index("--reference") + 1]
+            self.volids.add(f"{st}:vztmpl/{self.normalize_content_filename(ref)}.tar")
             return '"UPID:pve1:0001:task:"'
+        elif argv[:2] == ["pvesh", "create"] and argv[2].endswith("/vzdump"):
+            return '"UPID:pve1:0002:task:"'
+        elif argv[:2] == ["pvesm", "free"]:
+            self.volids.discard(argv[2])
         return ""
 
     def _set_conf(self, vmid: int, key: str, val: str) -> None:
@@ -134,7 +143,12 @@ class FakePve(Pve):
                 {"storage": "local-zfs", "type": "zfspool", "content": "rootdir,images"}]
 
     def storage_has_volid(self, node, storage, volid):
-        return True
+        return volid in self.volids
+
+    def registry_digest(self, ref):
+        if "@sha256:" in ref:
+            return ref.split("@", 1)[1]
+        return self.digests.get(ref, "sha256:" + "0" * 64)
 
     def normalize_content_filename(self, ref):
         return ref.replace("/", "_").replace(":", "_")

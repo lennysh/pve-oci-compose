@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from . import ctconf, ui
+from . import ctconf, refs, ui
 from .create import CreateSpec, Template, create_ct, pull, resolve_template
 from .errors import ComposeError
 from .pve import Pve, parse_config, parse_upid
@@ -65,10 +65,6 @@ def rsync_excludes(config_lines: list[str]) -> list[str]:
     return out
 
 
-def _is_registry_ref(ref: str) -> bool:
-    return not (ref.startswith(("/", "./", "../", "http://", "https://")) or ":vztmpl/" in ref or ":import/" in ref)
-
-
 def _vzdump(pve: Pve, vmid: int, opts: RefreshOptions, hostname: str) -> None:
     node = pve.node_name()
     argv = ["pvesh", "create", f"/nodes/{node}/vzdump", "--vmid", str(vmid), "--storage", str(opts.vzdump_storage),
@@ -92,7 +88,7 @@ def refresh_ct(
     vmid: int,
     image: str,
     opts: RefreshOptions,
-    on_rootfs: Callable[[str], None] | None = None,
+    on_rootfs: Callable[[str, Template | None], None] | None = None,
     env_layers: list[dict[str, str]] | None = None,
 ) -> str | None:
     """Replace CT ``vmid``'s rootfs with ``image``. Returns the pulled ref (registry refs)."""
@@ -107,7 +103,7 @@ def refresh_ct(
     node = pve.node_name()
 
     template: Template | None = None
-    if _is_registry_ref(image):
+    if refs.is_registry_ref(image):
         template = resolve_template(pve, node, image, opts.template_storage)
 
     temp = opts.temp_vmid or pve.nextid()
@@ -174,7 +170,7 @@ def refresh_ct(
         spec = CreateSpec(vmid=temp, rootfs=alloc, args=args)
         temp_created = True
         if template:
-            pull(pve, node, template, quiet=True, reuse=False)
+            pull(pve, node, template, quiet=True)
             create_ct(pve, template, spec, quiet=True)
         else:
             create_ct(pve, Template("", image, image, image, None), spec, quiet=True)
@@ -193,7 +189,7 @@ def refresh_ct(
         pve.run(["rsync", "-aHAX", "--delete", *excludes, f"{m_new}/", f"{m_old}/"], stream=True)
         ui.ok("rsync done")
         if on_rootfs:
-            on_rootfs(m_old)
+            on_rootfs(m_old, template)
         unmount_all()
 
         # 5. host config that comes from the image: entrypoint + env

@@ -15,6 +15,11 @@ def strip_scheme(ref: str) -> str:
     return ref
 
 
+def is_registry_ref(ref: str) -> bool:
+    """False for local templates (``local:vztmpl/x.tar``) and paths / URLs."""
+    return not (ref.startswith(("/", "./", "../", "http://", "https://")) or ":vztmpl/" in ref or ":import/" in ref)
+
+
 def normalize(ref: str) -> str:
     """Docker Hub short refs → fully qualified (``nginx:1`` → ``docker.io/library/nginx:1``).
 
@@ -37,28 +42,53 @@ def is_floating_latest(ref: str, normalized_filename: str) -> bool:
     return ref.lower().endswith(":latest") or normalized_filename.endswith("_latest")
 
 
-def pick_tag(tags: list[str]) -> str | None:
-    """Best concrete tag for a digest: skip latest, cosign/notation .sig and sha256-* tags."""
+_PLAIN_VERSION = re.compile(r"^v?\d+(\.\d+)*$")
+MAX_TAG_PROBES = 5  # each probe is one registry manifest GET (Docker Hub rate limits)
+
+
+def _version_key(t: str):
+    return [(0, int(x), "") if x.isdigit() else (1, 0, x) for x in re.split(r"(\d+)", t) if x]
+
+
+def tag_candidates(tags: list[str]) -> list[str]:
+    """Tags worth probing for a floating ref, best first: dotted versions (1.27.3, v2.1), then
+    bare numbers (e.g. date snapshots), then anything else — each by version descending.
+    Skips latest, cosign/notation .sig and sha256-*."""
     cands = [t for t in tags if t.lower() != "latest" and not t.endswith(".sig") and not t.startswith("sha256-")]
-    if not cands:
-        return None
+
+    def tier(t: str) -> int:
+        if _PLAIN_VERSION.match(t):
+            return 0 if "." in t else 1  # 3.22.2 / v1.2 before bare numbers (often date snapshots)
+        return 2
 
     def key(t: str):
-        return [(0, int(x), "") if x.isdigit() else (1, 0, x) for x in re.split(r"(\d+)", t) if x]
+        v = t[1:] if tier(t) < 2 and t[:1] in "vV" else t
+        # trailing (2, …) sorts after any further component, so 3.24.1 comes before 3.24
+        return (tier(t), [_neg(k) for k in _version_key(v)] + [(2, 0, "")])
 
-    return sorted(cands, key=key)[-1]
+    return sorted(cands, key=key)
 
 
-def resolve_floating(pve, ref: str) -> str:
-    """Pin a floating :latest ref to a same-digest concrete tag, else name@digest."""
+def _neg(k):
+    # sort helper: descending version order inside a tier
+    kind, num, txt = k
+    return (kind, -num, "".join(chr(0x10FFFF - ord(c)) for c in txt))
+
+
+def resolve_floating(pve, ref: str, digest: str | None) -> str:
+    """Pin a floating ref (``:latest``) to a concrete tag **with the same digest**, else
+    ``name@digest``. ``RepoTags`` lists every tag of the repository, so candidates are
+    verified by digest (a few probes, most likely first) rather than trusted."""
     info = pve.skopeo_inspect(ref)
-    if not info or not info.get("Name") or not info.get("Digest"):
+    if not info or not info.get("Name"):
         raise ComposeError(f"skopeo inspect failed for docker://{ref} (or set OCI_CT_CREATE_NO_RESOLVE_LATEST=1)")
-    name, digest = info["Name"], info["Digest"]
-    at = pve.skopeo_inspect(f"{name}@{digest}") or {}
-    tag = pick_tag(list(at.get("RepoTags") or []))
-    if tag:
-        ui.muted(f"Resolved floating tag to same-digest ref: {name}:{tag}")
-        return f"{name}:{tag}"
-    ui.muted("No non-latest tag for this manifest; using digest ref")
+    name = info["Name"]
+    digest = digest or info.get("Digest")
+    if not digest:
+        raise ComposeError(f"could not read the digest of docker://{ref}")
+    for tag in tag_candidates(list(info.get("RepoTags") or []))[:MAX_TAG_PROBES]:
+        if pve.registry_digest(f"{name}:{tag}") == digest:
+            ui.muted(f"Resolved floating tag to same-digest ref: {name}:{tag}")
+            return f"{name}:{tag}"
+    ui.muted(f"No concrete tag found for this digest; using {name}@{digest}")
     return f"{name}@{digest}"

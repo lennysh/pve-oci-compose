@@ -104,9 +104,41 @@ def test_normalize(ref, exp):
     assert refs.normalize(ref) == exp
 
 
-def test_pick_tag():
-    assert refs.pick_tag(["latest", "1.9", "1.10", "sha256-abc.sig", "1.10.sig"]) == "1.10"
-    assert refs.pick_tag(["latest"]) is None
+def test_tag_candidates_order():
+    tags = ["latest", "1.9", "1.10", "1.10-alpine", "sha256-abc.sig", "1.10.sig", "v2.0", "mainline"]
+    assert refs.tag_candidates(tags) == ["v2.0", "1.10", "1.9", "1.10-alpine", "mainline"]
+    # most specific first; dotted versions before date-style snapshots
+    assert refs.tag_candidates(["3.24", "3.24.1", "20260805", "3.9.9", "edge"]) == [
+        "3.24.1", "3.24", "3.9.9", "20260805", "edge"]
+    assert refs.tag_candidates(["latest"]) == []
+
+
+class _Reg:
+    """Minimal registry: RepoTags lists every tag of the repo, digests differ per tag."""
+
+    def __init__(self, digests):
+        self.digests = digests
+        self.probes = []
+
+    def skopeo_inspect(self, ref):
+        return {"Name": "docker.io/library/nginx", "Digest": self.digests["latest"], "RepoTags": list(self.digests)}
+
+    def registry_digest(self, ref):
+        self.probes.append(ref)
+        return self.digests.get(ref.rsplit(":", 1)[1])
+
+
+def test_resolve_floating_verifies_digest_not_just_highest_tag():
+    # highest tag 1.29.0 is a *different* image than latest (= 1.28.2)
+    reg = _Reg({"latest": "sha256:L", "1.29.0": "sha256:X", "1.28.2": "sha256:L", "1.27.0": "sha256:Y"})
+    assert refs.resolve_floating(reg, "docker.io/library/nginx:latest", "sha256:L") == "docker.io/library/nginx:1.28.2"
+
+
+def test_resolve_floating_falls_back_to_digest():
+    reg = _Reg({"latest": "sha256:L", **{f"1.{i}.0": f"sha256:{i}" for i in range(20)}})
+    out = refs.resolve_floating(reg, "docker.io/library/nginx:latest", "sha256:L")
+    assert out == "docker.io/library/nginx@sha256:L"
+    assert len(reg.probes) == refs.MAX_TAG_PROBES
 
 
 # ---- create args ------------------------------------------------------------------------
@@ -193,3 +225,11 @@ def test_rootfs_alloc(line, exp):
 def test_rsync_excludes_are_anchored():
     lines = ["mp0: local:vol,mp=/data,backup=1", "mp1: /mnt/nfs,mp=/mnt/media/,shared=1", "[snap]", "mp2: x,mp=/old"]
     assert rsync_excludes(lines) == ["--exclude=/data", "--exclude=/mnt/media"]
+
+
+def test_marker_roundtrip_with_and_without_digest():
+    from pve_oci_compose import marker
+
+    assert marker.parse(marker.encode("web", "x:1", "sha256:d")) == marker.Marker("web", "x:1", "sha256:d")
+    assert marker.parse(b'{"service":"web","ref":"x:1"}') == marker.Marker("web", "x:1", None)
+    assert b"digest" not in marker.encode("web", "x:1")
