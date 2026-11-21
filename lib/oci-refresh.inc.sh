@@ -343,7 +343,7 @@ create_temp_ct() {
       --rootfs "$ROOTFS_NEWVOL"
       --hostname "${HOST:-oci-refresh-temp}"
       --net0 "$net0"
-      --unprivileged "${UNPRIV:-1}"
+      --unprivileged "${UNPRIV:-0}"  # no unprivileged: line in pct config = privileged
       --onboot 0
     )
     [[ -n "${OCI_REFRESH_TEMPLATE_STORAGE:-}" ]] && oci_args+=(--storage "$OCI_REFRESH_TEMPLATE_STORAGE")

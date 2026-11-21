@@ -11,9 +11,30 @@ Declarative **Proxmox VE** LXC workflows driven by a **YAML** compose file: crea
 | `lib/ui.inc.sh` | Shared terminal output (`out_title`, `out_kv`, `out_ok`, …) for create + refresh |
 | `lib/oci-create.inc.sh` | OCI vztmpl pull + `pct create` (same behaviour as the former standalone create script) |
 | `lib/oci-refresh.inc.sh` | Rootfs refresh workflow (same behaviour as the former standalone refresh script) |
-| `pve_oci_compose/` | Python helpers used by the scripts: symlink-safe guest file writes (`guestfs.py`) and `rootfs_files` / `mount_files` injection (`inject.py`) |
+| `pve_oci_compose/` | Python implementation (**preview**, see [Python implementation](#python-implementation-preview)). The bash scripts also use its `guestfs.py` (symlink-safe guest writes) and `inject.py` (`rootfs_files` / `mount_files`). |
+| `pve-oci-compose.py` | Entry point for the Python implementation from a checkout (same commands and flags as the bash CLI) |
+| `tests/` | `pytest` suite (no Proxmox needed; includes bash-vs-Python parity checks) |
 | `compose.example.yaml` | Copy to `compose.yaml` and edit |
 | `bindep.txt` | APT package names for dependencies on Debian-based nodes |
+
+## Python implementation (preview)
+
+`pve-oci-compose.py` (package `pve_oci_compose/`) is a port of the bash CLI with the same commands, flags and compose schema. It is meant to replace the bash scripts once it has been validated on real nodes; until then, **`pve-oci-compose.sh` remains the reference**.
+
+```bash
+./pve-oci-compose.py plan            # same as ./pve-oci-compose.sh plan
+./pve-oci-compose.py -n apply        # dry-run: prints the exact pct / pvesh commands it would run
+python3 -m pytest                    # tests (dev machine; needs python3-pytest)
+```
+
+Differences from the bash version:
+
+- **Marker read/write without `pct exec`**: running CTs are read through `/proc/<pid>/root`, so `plan` / `refresh` work for distroless / scratch images that have no shell or `cat`.
+- **refresh syncs env from the new image**: the CT's `env` becomes *new image env → `defaults.env` → service `env`* (bash keeps the old image's env). Env set by hand in the UI is replaced.
+- **refresh refuses a service-name mismatch** in the guest marker unless `--adopt`.
+- **`--dry-run` is more precise**: read-only steps (storage choice, `:latest` resolution) run, and the exact `pct create` command is printed.
+- **Registry refs with a port** (`registry:5000/img`) are treated as a registry host, not a Docker Hub path.
+- **`nameserver`** lists are passed as one space-separated `--nameserver` value (what `pct` expects).
 
 ## Requirements
 

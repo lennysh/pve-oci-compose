@@ -85,9 +85,16 @@ def config_value(lines: Iterable[str], key: str) -> str | None:
 
 
 def idmap_from_config(lines: list[str], unprivileged_default: bool = True) -> IdMap:
-    """Build the id map from ``pct config`` lines (unprivileged + optional lxc.idmap)."""
+    """Build the id map from ``pct config`` lines (unprivileged + optional lxc.idmap).
+
+    ``unprivileged_default`` is only used when no config lines are available."""
     unpriv_raw = config_value(lines, "unprivileged")
-    unpriv = truthy(unpriv_raw) if unpriv_raw is not None else unprivileged_default
+    if unpriv_raw is not None:
+        unpriv = truthy(unpriv_raw)
+    elif lines:
+        unpriv = False  # readable config without unprivileged: → privileged CT (PVE default)
+    else:
+        unpriv = unprivileged_default  # config unavailable: fall back to compose / pct-create default
     im = IdMap()
     if not unpriv:
         return im

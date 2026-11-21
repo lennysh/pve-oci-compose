@@ -13,6 +13,11 @@ def test_idmap_default_unprivileged_when_config_silent():
     assert im.uid(100033) == 100033  # legacy host id passes through
 
 
+def test_idmap_readable_config_without_unprivileged_is_privileged():
+    im = idmap_from_config(["hostname: x", "rootfs: s:1"], unprivileged_default=True)
+    assert im.uid(0) == 0
+
+
 def test_idmap_privileged_identity():
     im = idmap_from_config(["unprivileged: 0"], unprivileged_default=True)
     assert im.uid(0) == 0 and im.gid(33) == 33
