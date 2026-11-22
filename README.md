@@ -228,7 +228,26 @@ Each **plan** / **refresh** therefore makes one registry request per managed ser
 - **Failed create:** if **`pct create`** or any step before the guest marker fails, the new CT is removed, and a resource pool is dropped only if this run auto-created it.
 - **Interruptions:** Ctrl-C, **`SIGTERM`** and **`SIGHUP`** (e.g. the SSH session dropping) run the same cleanup as any other failure: the temp CT is removed, a half-done **refresh** is rolled back to its snapshot, and a CT this run stopped is started again; a half-created CT from **apply** is removed. Only a hard kill (**`kill -9`**, power loss) skips cleanup — temp CTs carry the tag **`pve-oci-compose-temp`**, and **plan** / **refresh** warn about leftovers with the **`pct destroy`** command (they are never deleted automatically, since a concurrent refresh may be using one). For long refreshes over SSH, running inside **`tmux`** / **`screen`** avoids the interruption altogether.
 - **Unmanaged CTs:** LXC exists but no marker/tag → **plan** warns, **apply** refuses, **refresh** skips (or **`--adopt`** once you align the CT with compose).
-- **Log style:** phase **title** + horizontal rule, **key/value** lines, and **✓** completion. Full `pct` / `skopeo` command lines are **hidden by default**; set **`PVE_OCI_VERBOSE=1`** to show them.
+- **Log style:** each **apply** / **refresh** / **pull** prints a header (service, CT, old → new image and why), numbered steps with their duration, and a summary with total time, **downtime** (shutdown → start), backup / rollback hint and what was cleaned up. Services with nothing to do get one dimmed line. On an interactive terminal the running step shows a spinner and a live timer; in logs / cron the layout is the same without the animation. Output from **`pct`** / **`rsync`** is captured (shown if a step fails); **`PVE_OCI_VERBOSE=1`** turns the spinner off, streams that output and prints the full commands (passwords redacted). Example:
+
+  ```text
+  ━━ app · CT 228 · refresh ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     ghcr.io/antimatterchat/antimatter
+     sha-b723ce8 → sha-2179a47   (image ref changed)
+
+   [1/5] Pull image + build temp CT 142         ✓  1m 12s
+   [2/5] Shut down CT 228                       ✓      4s
+         ── downtime starts ──
+   [3/5] Backup: vzdump → nfs-backups           ✓  2m 03s
+   [4/5] Sync rootfs (rsync)                    ✓     38s
+         6 files injected (/antimatter/config/.keep, /antimatter/data/.keep, +4 more)
+   [5/5] Apply config + start CT 228            ✓      3s
+         env rebuilt: new image env + compose env
+
+   ✓ Refreshed in 3m 59s · downtime 2m 48s
+     backup   nfs-backups (vzdump, protected)
+     temp CT 142 removed
+  ```
 - **OCI pull “Waiting for pull task …”** polls `pvesh get /nodes/<node>/tasks/<UPID>/status`. UPIDs contain colons—the tool **URL-encodes** the UPID for that path and **retries** with the raw UPID if the first response is empty. If a pull still hangs after the task logged OK in the UI, check the node name (**`pvecm nodename`**) and the task log.
 - **Entrypoint**: **`pct` `entrypoint`** lives in **`/etc/pve/lxc/<vmid>.conf`**, not in the root disk. After **`refresh`**, that value is synced from the temp CT built from the new image (or **`--delete entrypoint`** if the new template has none). The CT's **`env`** is rebuilt the same way: new image env, then **`defaults.env`**, then service **`env`** (env set by hand in the UI is replaced). Other config keys (**`ostype`**, **`features`**, …) stay as they were.
 - **Why a scratch CT for refresh:** Proxmox turns an OCI template into a runnable root tree via **`pct create`** (unpack + metadata). There is no supported one-step “re-unpack this vztmpl **onto** an existing CT’s root volume in place.” Alternatives would be hand-unpacking the **`.tar`** to a directory and **`rsync`** (still scratch space + you must mirror whatever **`pct create`** does), or a second volume you swap in (**ZFS** dataset replace, etc.)—more moving parts. The temp VMID is only a **read source** for **`rsync`** and is destroyed afterwards (also on failure).

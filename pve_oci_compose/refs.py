@@ -88,7 +88,6 @@ def resolve_floating(pve, ref: str, digest: str | None) -> str:
         raise ComposeError(f"could not read the digest of docker://{ref}")
     for tag in tag_candidates(list(info.get("RepoTags") or []))[:MAX_TAG_PROBES]:
         if pve.registry_digest(f"{name}:{tag}") == digest:
-            ui.muted(f"Resolved floating tag to same-digest ref: {name}:{tag}")
             return f"{name}:{tag}"
-    ui.muted(f"No concrete tag found for this digest; using {name}@{digest}")
+    ui.muted(f"no concrete tag found for this digest; using {name}@{digest[:19]}…")
     return f"{name}@{digest}"

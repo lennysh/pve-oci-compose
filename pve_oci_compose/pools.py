@@ -27,7 +27,7 @@ def ensure(pve: Pve, pool: str) -> bool:
         raise ComposeError(f"pool '{pool}' still not readable after create")
     created = cp.returncode == 0
     if created:
-        ui.say(f"pve-oci-compose: created resource pool '{pool}'")
+        ui.muted(f"created resource pool '{pool}'")
     return created
 
 

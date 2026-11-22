@@ -46,17 +46,18 @@ def select(c: Compose, o: Options) -> list[Service]:
     if len(out) > 1:
         raise ComposeError(f"vmid {o.vmid} matches more than one service in {c.path} (vmids must be unique)")
     what = " / ".join(x for x in (o.service and f"service '{o.service}'", o.vmid is not None and f"vmid {o.vmid}") if x)
-    ui.say(f"pve-oci-compose: filter → {what} only")
+    ui.say(f"{ui.D} · filter: {what} only{ui.R}")
     return out
 
 
 # ---- shared helpers ---------------------------------------------------------------
 
 
-def _inject(pve: Pve, c: Compose, svc: Service, vmid: int, phase: str, root: str) -> None:
+def _inject(pve: Pve, c: Compose, svc: Service, vmid: int, phase: str, root: str) -> list[str]:
+    """Inject compose files; returns the guest paths written."""
     items = svc.inject_items()
     if not items or (phase == "refresh" and not any(inject.on_refresh(i) for i in items)):
-        return
+        return []
     try:
         done = inject.run(
             phase, svc.data, str(c.dir), root, pve.config_lines(vmid) or [], pve.pvesm_path,
@@ -64,8 +65,7 @@ def _inject(pve: Pve, c: Compose, svc: Service, vmid: int, phase: str, root: str
         )
     except (GuestPathError, OSError, ValueError, KeyError) as e:
         raise ComposeError(f"[{svc.name}] file inject failed: {e}") from e
-    for _, g in done:
-        ui.say(f"pve-oci-compose: injected {g}")
+    return [g for _, g in done]
 
 
 def _finalize_description(pve: Pve, c: Compose, svc: Service, vmid: int, pulled: str | None) -> None:
@@ -107,50 +107,70 @@ def apply(pve: Pve, c: Compose, o: Options) -> None:
 
         if _existing_lxc(pve, vmid):
             _check_binding(pve, svc, vmid, "apply")
-            ui.say(f"apply: [{svc.name}] vmid {vmid} already exists — skip create")
             if pool:
                 pools.ensure_member(pve, pool, vmid)
+            ui.skip(svc.name, f"CT {vmid}", "exists, compose-managed — nothing to create")
             continue
         if pve.vmid_kind(vmid) == "qemu":
             raise ComposeError(f"apply: [{svc.name}] vmid {vmid} is used by a QEMU VM (LXC and VM ids share one namespace)")
 
-        ui.say(f"apply: [{svc.name}] creating vmid {vmid} from {svc.image}")
+        has_files = bool(svc.inject_items())
+        start = (C.as_flag(svc.get("start")) == "1")
+        tl = ui.Timeline(3 + int(start))
+        tl.header(svc.name, f"CT {vmid}" + (" (next free)" if spec_vmid == "next" else ""), "create", new=svc.image)
         node = pve.node_name()
         template = resolve_template(pve, node, svc.image, svc.template_storage)
-        pull(pve, node, template)
-        autocreated = pool if (pool and pools.ensure(pve, pool)) else None
-        spec = spec_from_service(svc, vmid, pool, description.build(c, svc))
-        create_ct(pve, template, spec, pool_autocreated=autocreated)
-
-        if pve.dry_run:
-            ui.say(f"apply: [{svc.name}] DRY-RUN: would tag CT, write guest marker"
-                   + (f", inject {len(svc.inject_items())} file(s)" if svc.inject_items() else "")
-                   + (", pct start" if spec.start else ""))
-            continue
-
-        # Everything up to the marker is all-or-nothing for a new CT.
+        autocreated = None
         try:
-            marker.tag(pve, vmid)
-            with marker.guest_root(pve, vmid) as root:
-                marker.write_at(root, svc.name, svc.image, template.digest)
-                _inject(pve, c, svc, vmid, "apply", root)
-        except BaseException as e:
-            destroy_partial(pve, vmid, autocreated)
-            raise ComposeError(f"apply: [{svc.name}] setup of new CT {vmid} failed — CT removed: {e}") from e
-        ui.say(f"apply: [{svc.name}] sentinel tag + guest marker ({marker.marker_path()})")
+            with tl.step(f"Pull image → {template.storage}"):
+                pull(pve, node, template)
+            with tl.step(f"Create CT {vmid}"):
+                autocreated = pool if (pool and pools.ensure(pve, pool)) else None
+                spec = spec_from_service(svc, vmid, pool, description.build(c, svc))
+                create_ct(pve, template, spec, pool_autocreated=autocreated)
+            if pve.dry_run:
+                with tl.step("Write marker" + (" + inject files" if has_files else "")):
+                    ui.say("DRY-RUN: pct set --tags …pve-oci-compose; write guest marker"
+                           + (f"; inject {len(svc.inject_items())} file(s)" if has_files else ""))
+                if start:
+                    with tl.step(f"Start CT {vmid}"):
+                        ui.say(f"DRY-RUN: pct start {vmid}")
+                tl.done("Dry run")
+                continue
 
+            # Everything up to the marker is all-or-nothing for a new CT.
+            with tl.step("Write marker" + (" + inject files" if has_files else "")):
+                try:
+                    marker.tag(pve, vmid)
+                    with marker.guest_root(pve, vmid) as root:
+                        marker.write_at(root, svc.name, svc.image, template.digest)
+                        injected = _inject(pve, c, svc, vmid, "apply", root)
+                except BaseException as e:
+                    destroy_partial(pve, vmid, autocreated)
+                    raise ComposeError(f"apply: [{svc.name}] setup of new CT {vmid} failed — CT removed: {e}") from e
+                if injected:
+                    tl.note(ui.summarize_paths(injected))
+        except BaseException:
+            tl.failed("Create")
+            raise
+
+        extra: list[tuple[str, str]] = []
         if spec_vmid == "next":
             if o.write_compose:
                 C.write_vmid(c.path, svc.name, vmid)
-                ui.say(f"pve-oci-compose: updated vmid for service '{svc.name}' → {vmid} in {c.path}")
+                extra.append(("vmid", f"{vmid} written to {c.path.name}"))
             else:
-                ui.say(f"apply: [{svc.name}] vmid was 'next' — set vmid: {vmid} in {c.path}")
+                extra.append(("vmid", f"{vmid} — set it in {c.path.name} (--no-write-compose)"))
         _finalize_description(pve, c, svc, vmid, template.pull_ref)
         if pool:
             pools.ensure_member(pve, pool, vmid)
-        if spec.start:
-            pve.run(["pct", "start", str(vmid)])
-            ui.say(f"apply: [{svc.name}] started CT {vmid}")
+            extra.append(("pool", pool))
+        if start:
+            with tl.step(f"Start CT {vmid}"):
+                pve.run(["pct", "start", str(vmid)])
+        else:
+            extra.append(("", f"CT {vmid} left stopped — pct start {vmid} (or start: true)"))
+        tl.done(f"Created CT {vmid}", extra)
 
 
 # ---- drift -------------------------------------------------------------------------
@@ -224,35 +244,41 @@ def refresh(pve: Pve, c: Compose, o: Options) -> None:
             raise ComposeError(f"refresh: [{svc.name}] vmid {vmid} does not exist (or pct config failed here)")
 
         m = marker.read(pve, vmid)
+        old_ref = m.ref if m else None
         if not (m and m.ref):
             if not o.adopt:
-                ui.say(f"refresh: [{svc.name}] CT {vmid} has no readable guest marker — skip (use --adopt for unmanaged CTs)")
+                ui.skip(svc.name, f"CT {vmid}", "no readable guest marker (use --adopt for unmanaged CTs)")
                 continue
-            ui.say(f"refresh: [{svc.name}] --adopt: treating unmanaged CT {vmid} as {svc.name}")
+            reason = "adopting unmanaged CT"
         elif m.service and m.service != svc.name and not o.adopt:
             raise ComposeError(f"refresh: [{svc.name}] CT {vmid} is bound to service '{m.service}' (use --adopt to rebind)")
-        elif not o.force:
+        elif o.force:
+            reason = "--force"
+        else:
             d = drift(pve, svc, m)
             if not d.refresh:
-                ui.say(f"refresh: [{svc.name}] {d.reason} — skip")
+                ui.skip(svc.name, f"CT {vmid}", d.reason)
                 continue
-            ui.say(f"refresh: [{svc.name}] {d.reason}")
+            reason = "tag updated on the registry" if m.ref == svc.image else "image ref changed"
 
-        ui.say(f"refresh: [{svc.name}] vmid {vmid} → {svc.image}")
+        tl = ui.Timeline(5)
+        tl.header(svc.name, f"CT {vmid}", "refresh", old=old_ref, new=svc.image, reason=reason)
 
-        def on_rootfs(root: str, template, svc=svc, vmid=vmid) -> None:
+        def on_rootfs(root: str, template, svc=svc, vmid=vmid) -> list[str]:
             marker.write_at(root, svc.name, svc.image, template.digest if template else None)
-            _inject(pve, c, svc, vmid, "refresh", root)
+            return _inject(pve, c, svc, vmid, "refresh", root)
 
-        pulled = refresh_ct(pve, vmid, svc.image, _refresh_options(svc, o), on_rootfs,
-                            env_layers=[svc.defaults_env, svc.service_env])
+        res = refresh_ct(pve, vmid, svc.image, _refresh_options(svc, o), on_rootfs,
+                         env_layers=[svc.defaults_env, svc.service_env], tl=tl)
         if pve.dry_run:
+            tl.done("Dry run")
             continue
         marker.tag(pve, vmid)
-        _finalize_description(pve, c, svc, vmid, pulled)
+        _finalize_description(pve, c, svc, vmid, res.pulled_ref)
         pool = svc.pool(c.project)
         if pool:
             pools.ensure_member(pve, pool, vmid)
+        tl.done("Refreshed", res.summary)
 
 
 # ---- pull ------------------------------------------------------------------------------
@@ -261,10 +287,17 @@ def refresh(pve: Pve, c: Compose, o: Options) -> None:
 def pull_only(pve: Pve, c: Compose, o: Options) -> None:
     for svc in select(c, o):
         C.validate(svc, c.dir, need_rootfs=False)
-        ui.say(f"pull: [{svc.name}] {svc.image}")
         node = pve.node_name()
         t = resolve_template(pve, node, svc.image, svc.template_storage)
-        pull(pve, node, t)
+        tl = ui.Timeline(1)
+        tl.header(svc.name, "template", "pull", new=svc.image)
+        try:
+            with tl.step(f"Pull image → {t.storage}"):
+                pull(pve, node, t)
+        except BaseException:
+            tl.failed("Pull")
+            raise
+        tl.done("Pulled" if not pve.dry_run else "Dry run", [("file", t.ostemplate)])
 
 
 # ---- plan --------------------------------------------------------------------------------

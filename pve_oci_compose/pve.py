@@ -77,6 +77,7 @@ class Pve:
         input_text: str | None = None,
     ) -> subprocess.CompletedProcess:
         ui.cmd(argv)
+        stream = stream and ui.verbose()  # otherwise captured: keeps the step timeline intact
         try:
             if stream:
                 cp = subprocess.run(argv, text=True, input=input_text)

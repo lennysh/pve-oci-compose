@@ -39,7 +39,7 @@ def pick_template_storage(pve: Pve, node: str, requested: str | None) -> str:
             )
         return requested.strip()
     if len(cands) == 1:
-        ui.muted(f"Auto-selected template storage '{cands[0]}' (only vztmpl+OCI candidate on '{node}')")
+        ui.detail(f"template storage {cands[0]} (only OCI-capable store on {node})")
         return cands[0]
     if not cands:
         raise ComposeError(
@@ -96,26 +96,17 @@ def template_is_current(pve: Pve, node: str, t: Template) -> bool:
     return bool(t.digest) and state.template_digest(t.ostemplate) == t.digest
 
 
-def pull(pve: Pve, node: str, t: Template, quiet: bool = False) -> None:
+def pull(pve: Pve, node: str, t: Template) -> None:
     """Make sure ``t.ostemplate`` holds the image the tag points at *now*.
 
     Reuses the template when its recorded digest matches; otherwise a template with the
     same filename (older pull of a moved tag, or unknown origin) is removed and re-pulled.
     """
     if template_is_current(pve, node, t):
-        ui.muted(f"Template {t.ostemplate} is current ({t.digest or 'digest ref'}) — reusing")
+        ui.muted(f"template already current on {t.storage} — reused")
         return
-    if quiet:
-        ui.muted(f"Template pull on {t.storage} ({t.pull_ref})")
-    else:
-        ui.title("Registry pull (vztmpl · oci-registry-pull)")
-        ui.kv("Node", node)
-        ui.kv("Storage", t.storage)
-        if t.input_ref != t.pull_ref:
-            ui.kv("Compose ref", t.input_ref)
-            ui.kv("Resolved pull ref", t.pull_ref)
-        else:
-            ui.kv("Image ref", t.pull_ref)
+    if t.input_ref != t.pull_ref:
+        ui.muted(f"pinned {t.input_ref.rsplit('/', 1)[-1]} → {t.pull_ref.rsplit('/', 1)[-1]}")
     present = _template_present(pve, node, t)
     if pve.dry_run:
         if present:
@@ -125,7 +116,7 @@ def pull(pve: Pve, node: str, t: Template, quiet: bool = False) -> None:
     if not t.digest:
         raise ComposeError(f"registry image not found or not reachable: docker://{t.input_ref}")
     if present:
-        ui.muted(f"Removing outdated template {t.ostemplate} (tag moved or digest unknown)")
+        ui.muted("replaced outdated template (tag moved or digest unknown)")
         pve.run(["pvesm", "free", t.ostemplate])
         state.record_template(t.ostemplate, None)
     cp = pve.run(
@@ -138,8 +129,7 @@ def pull(pve: Pve, node: str, t: Template, quiet: bool = False) -> None:
         upid = parse_upid(out)
         if not upid:
             raise ComposeError(f"could not parse task UPID from oci-registry-pull: {out[:300]}")
-        if not quiet:
-            ui.kv("Task UPID", upid)
+        ui.detail(f"task {upid}")
         pve.wait_task(upid, node)
     elif re.search(r"refusing to override|already exists|existing file", out, re.I):
         raise ComposeError(
@@ -166,8 +156,6 @@ def pull(pve: Pve, node: str, t: Template, quiet: bool = False) -> None:
     else:
         raise ComposeError(f"template {t.ostemplate} did not appear on storage after pull")
     state.record_template(t.ostemplate, t.digest)
-    if not quiet:
-        ui.ok("Template on storage")
 
 
 # ---- pct create -----------------------------------------------------------------
@@ -268,17 +256,12 @@ def destroy_partial(pve: Pve, vmid: int, pool_autocreated: str | None = None) ->
             ui.err(f"pve-oci-compose: removed auto-created pool '{pool_autocreated}'")
 
 
-def create_ct(pve: Pve, t: Template, spec: CreateSpec, quiet: bool = False,
+def create_ct(pve: Pve, t: Template, spec: CreateSpec,
               pool_autocreated: str | None = None) -> None:
     """pct create + post-create config. Any failure destroys the new CT, then re-raises."""
     if pve.exists_here(spec.vmid):
         raise ComposeError(f"VMID {spec.vmid} already exists")
     argv = ["pct", "create", str(spec.vmid), t.ostemplate, "--rootfs", spec.rootfs, *spec.args]
-    if not quiet:
-        ui.title("pct create · from vztmpl OCI tarball")
-        ui.kv("VMID", spec.vmid)
-        ui.kv("Ostemplate", t.ostemplate)
-        ui.kv("Rootfs", spec.rootfs)
     if pve.dry_run:
         ui.say(f"DRY-RUN: {ui.redact(argv)}")
         if any(spec.env_layers):
@@ -304,5 +287,3 @@ def create_ct(pve: Pve, t: Template, spec: CreateSpec, quiet: bool = False,
     except BaseException as e:
         destroy_partial(pve, spec.vmid, pool_autocreated)
         raise ComposeError(f"post-create config of CT {spec.vmid} failed ({e}); new CT removed") from e
-    if not quiet:
-        ui.ok(f"CT {spec.vmid} created (stopped)")
