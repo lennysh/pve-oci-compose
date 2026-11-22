@@ -1,0 +1,23 @@
+[project]
+name = "pve-oci-compose"
+dynamic = ["version"]
+description = "Declarative OCI LXC containers on Proxmox VE from a compose YAML file"
+requires-python = ">=3.11"
+dependencies = ["PyYAML"]
+
+[project.scripts]
+pve-oci-compose = "pve_oci_compose.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pve_oci_compose"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pve_oci_compose.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]

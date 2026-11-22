@@ -2,9 +2,9 @@
 # Requires: python3 + PyYAML (on PVE: apt install python3-yaml)
 #
 # Copy:  cp compose.example.yaml compose.yaml
-# Flow:  ./pve-oci-compose.sh plan | apply | pull | refresh
-# One service:  ./pve-oci-compose.sh apply --service nginx-demo
-# By vmid:       ./pve-oci-compose.sh refresh --vmid 200
+# Flow:  ./pve-oci-compose.py plan | apply | pull | refresh
+# One service:  ./pve-oci-compose.py apply --service nginx-demo
+# By vmid:       ./pve-oci-compose.py refresh --vmid 200
 #
 # Top-level keys (see README.md):
 #   name / project   — stack label; default resource pool id unless pool: overridden
