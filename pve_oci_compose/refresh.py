@@ -1,9 +1,12 @@
 """Rootfs refresh: replace a CT's root filesystem with a newer image, keeping the CTID,
 host config, mount points and volumes.
 
-    shutdown → pre-backup (snapshot / vzdump) → temp CT from the new image →
-    mount both → rsync --delete (mount points excluded) → marker + on_refresh files →
-    sync entrypoint + env from the new image → destroy temp → start if it was running
+    temp CT from the new image (target still running) → shutdown → pre-backup
+    (snapshot / vzdump) → mount both → rsync --delete (mount points excluded) →
+    marker + on_refresh files → sync entrypoint + env → destroy temp → start if it was running
+
+Downtime covers only shutdown → start: the registry pull and OCI unpack happen first,
+so a bad tag, unsupported image or full storage fails without touching the target.
 
 Failure handling: before rsync starts, the temp CT is removed and the target restarted
 if it was running. Once rsync has started the rootfs may be half-replaced, so the CT is
@@ -118,13 +121,13 @@ def refresh_ct(
     ui.kv("Pre-backup", opts.pre_backup)
 
     if pve.dry_run:
-        ui.say(f"DRY-RUN: shutdown CT {vmid}; pre-backup={opts.pre_backup}; pct create {temp} from "
-               f"{template.ostemplate if template else image}; rsync -aHAX --delete "
+        ui.say(f"DRY-RUN: pct create {temp} from {template.ostemplate if template else image}; "
+               f"shutdown CT {vmid}; pre-backup={opts.pre_backup}; rsync -aHAX --delete "
                f"{' '.join(rsync_excludes(lines))} {temp} → {vmid}; destroy {temp}")
         return template.pull_ref if template else None
 
     was_running = pve.is_active(vmid)
-    temp_created = destructive = False
+    temp_created = destructive = stopped = False
     snap: str | None = None
     mounted: list[int] = []
 
@@ -134,13 +137,32 @@ def refresh_ct(
         mounted.clear()
 
     try:
-        # 1. shutdown
+        # 1. temp CT from the new image — while the target keeps running, so the
+        #    download + unpack (and any failure there) costs no downtime
+        args = ["--hostname", "oci-refresh-temp",
+                "--net0", os.environ.get("OCI_REFRESH_TEMP_NET0") or "name=eth0,bridge=vmbr0,ip=dhcp",
+                "--onboot", "0", "--unprivileged", cfg.get("unprivileged") or "0"]
+        for k in ("ostype", "arch", "features", "memory"):
+            if cfg.get(k):
+                args += [f"--{k}", cfg[k]]
+        spec = CreateSpec(vmid=temp, rootfs=alloc, args=args)
+        temp_created = True
+        if template:
+            pull(pve, node, template, quiet=True)
+            create_ct(pve, template, spec, quiet=True)
+        else:
+            create_ct(pve, Template("", image, image, image, None), spec, quiet=True)
+        ui.ok(f"Temp CT {temp} ready (rsync source; will be destroyed)")
+
+        # 2. shutdown (downtime starts here)
         ui.sub(f"Shutdown CT {vmid}")
-        if was_running and not pve.shutdown_or_stop(vmid, opts.shutdown_timeout):
-            raise ComposeError(f"could not shut down or stop CT {vmid}")
+        if was_running:
+            stopped = True
+            if not pve.shutdown_or_stop(vmid, opts.shutdown_timeout):
+                raise ComposeError(f"could not shut down or stop CT {vmid}")
         ui.ok(f"CT {vmid} offline")
 
-        # 2. pre-backup
+        # 3. pre-backup (on the stopped CT, right before its rootfs is touched)
         if opts.pre_backup in ("snapshot", "auto"):
             name = f"pre-oci-refresh-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}UTC"
             ui.sub(f"Pre-backup ({opts.pre_backup}) — snapshot {name}")
@@ -159,22 +181,6 @@ def refresh_ct(
                 _abort_or_continue("pre-backup vzdump needs refresh_backup_storage / --backup-storage", opts)
             else:
                 _backup_or_abort(lambda: _vzdump(pve, vmid, opts, hostname), opts)
-
-        # 3. temp CT from the new image
-        args = ["--hostname", "oci-refresh-temp",
-                "--net0", os.environ.get("OCI_REFRESH_TEMP_NET0") or "name=eth0,bridge=vmbr0,ip=dhcp",
-                "--onboot", "0", "--unprivileged", cfg.get("unprivileged") or "0"]
-        for k in ("ostype", "arch", "features", "memory"):
-            if cfg.get(k):
-                args += [f"--{k}", cfg[k]]
-        spec = CreateSpec(vmid=temp, rootfs=alloc, args=args)
-        temp_created = True
-        if template:
-            pull(pve, node, template, quiet=True)
-            create_ct(pve, template, spec, quiet=True)
-        else:
-            create_ct(pve, Template("", image, image, image, None), spec, quiet=True)
-        ui.ok(f"Temp CT {temp} ready (rsync source; will be destroyed)")
 
         # 4. rsync
         ui.sub("Mount root filesystems + rsync")
@@ -216,7 +222,7 @@ def refresh_ct(
             ui.ok(f"Refresh complete — CT {vmid} left stopped as before")
         return template.pull_ref if template else None
     except BaseException as e:
-        _recover(pve, vmid, temp, temp_created, destructive, snap, was_running, opts, unmount_all)
+        _recover(pve, vmid, temp, temp_created, destructive, snap, stopped, opts, unmount_all)
         if isinstance(e, ComposeError):
             raise
         raise ComposeError(f"refresh of CT {vmid} failed: {e}") from e
@@ -236,7 +242,7 @@ def _backup_or_abort(fn: Callable[[], None], opts: RefreshOptions) -> None:
         _abort_or_continue(str(e), opts)
 
 
-def _recover(pve, vmid, temp, temp_created, destructive, snap, was_running, opts, unmount_all) -> None:
+def _recover(pve, vmid, temp, temp_created, destructive, snap, stopped, opts, unmount_all) -> None:
     ui.err(f"\n=== refresh of CT {vmid} failed ===")
     try:
         unmount_all()
@@ -261,7 +267,7 @@ def _recover(pve, vmid, temp, temp_created, destructive, snap, was_running, opts
                 ui.err(f"Rootfs may be partially replaced. Restore the pre-refresh vzdump from {opts.vzdump_storage}.")
             else:
                 ui.err(f"Rootfs may be partially replaced and no pre-refresh backup exists. CT {vmid} left stopped.")
-        if was_running and (not destructive or rolled):
+        if stopped and (not destructive or rolled):  # restart only what this run stopped
             if pve.ok(["pct", "start", str(vmid)]):
                 ui.err(f"Started CT {vmid} again (previous state).")
     except BaseException as e2:  # noqa: BLE001 - never mask the original error

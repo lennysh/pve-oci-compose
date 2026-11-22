@@ -156,7 +156,21 @@ def test_refresh_failure_before_rsync_does_not_roll_back(tmp_path):
     with pytest.raises(ComposeError):
         commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
     assert not pve.cmds("pct rollback") and not pve.cmds("rsync")
+    # the bad image failed while the target was still running: no downtime at all
+    assert not pve.cmds("pct shutdown") and not pve.cmds("pct snapshot") and not pve.cmds("pct start")
     assert pve.cts[105]["status"] == "running"
+
+
+def test_refresh_order_minimises_downtime(tmp_path):
+    pve = FakePve(tmp_path)
+    _managed(pve, tmp_path)
+    commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
+
+    def first(prefix):
+        return next(i for i, c in enumerate(pve.calls) if " ".join(c).startswith(prefix))
+
+    assert (first("pvesh create /nodes/pve1/storage") < first("pct create 200") < first("pct shutdown 105")
+            < first("pct snapshot 105") < first("rsync") < first("pct start 105"))
 
 
 def test_refresh_snapshot_failure_aborts_before_touching(tmp_path):
@@ -165,7 +179,8 @@ def test_refresh_snapshot_failure_aborts_before_touching(tmp_path):
     pve.fail["pct snapshot"] = 2
     with pytest.raises(ComposeError, match="snapshot failed"):
         commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
-    assert not pve.cmds("pct create") and pve.cts[105]["status"] == "stopped"
+    assert not pve.cmds("rsync") and pve.cts[105]["status"] == "stopped"
+    assert 200 not in pve.cts  # temp CT (created first) removed again
 
 
 def test_select_filters(tmp_path):
