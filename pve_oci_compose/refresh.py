@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from . import ctconf, refs, ui
 from .create import CreateSpec, Template, create_ct, pull, resolve_template
 from .errors import ComposeError
-from .pve import Pve, parse_config, parse_upid
+from .pve import TEMP_TAG, Pve, parse_config, parse_upid
 
 
 @dataclass
@@ -139,7 +140,7 @@ def refresh_ct(
     try:
         # 1. temp CT from the new image — while the target keeps running, so the
         #    download + unpack (and any failure there) costs no downtime
-        args = ["--hostname", "oci-refresh-temp",
+        args = ["--hostname", "oci-refresh-temp", "--tags", TEMP_TAG,
                 "--net0", os.environ.get("OCI_REFRESH_TEMP_NET0") or "name=eth0,bridge=vmbr0,ip=dhcp",
                 "--onboot", "0", "--unprivileged", cfg.get("unprivileged") or "0"]
         for k in ("ostype", "arch", "features", "memory"):
@@ -223,8 +224,8 @@ def refresh_ct(
         return template.pull_ref if template else None
     except BaseException as e:
         _recover(pve, vmid, temp, temp_created, destructive, snap, stopped, opts, unmount_all)
-        if isinstance(e, ComposeError):
-            raise
+        if isinstance(e, ComposeError) or not isinstance(e, Exception):
+            raise  # ComposeError, or Ctrl-C / SIGTERM / SIGHUP: keep the original exit status
         raise ComposeError(f"refresh of CT {vmid} failed: {e}") from e
 
 
@@ -242,8 +243,26 @@ def _backup_or_abort(fn: Callable[[], None], opts: RefreshOptions) -> None:
         _abort_or_continue(str(e), opts)
 
 
+_SHIELD = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
 def _recover(pve, vmid, temp, temp_created, destructive, snap, stopped, opts, unmount_all) -> None:
-    ui.err(f"\n=== refresh of CT {vmid} failed ===")
+    # A second Ctrl-C / SIGHUP must not abort the cleanup half-way: ignore them meanwhile.
+    saved = {}
+    for sig in _SHIELD:
+        try:
+            saved[sig] = signal.signal(sig, signal.SIG_IGN)
+        except ValueError:  # not in the main thread (tests): nothing to shield
+            pass
+    try:
+        _recover_steps(pve, vmid, temp, temp_created, destructive, snap, stopped, opts, unmount_all)
+    finally:
+        for sig, h in saved.items():
+            signal.signal(sig, h)
+
+
+def _recover_steps(pve, vmid, temp, temp_created, destructive, snap, stopped, opts, unmount_all) -> None:
+    ui.err(f"\n=== refresh of CT {vmid} failed — cleaning up ===")
     try:
         unmount_all()
         if temp_created and pve.exists_here(temp):

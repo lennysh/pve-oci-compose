@@ -17,6 +17,7 @@ class FakePve(Pve):
         self.calls: list[list[str]] = []
         self.next_id = 200
         self.fail: dict[str, int] = {}  # argv[0:2] joined ("rsync", "pct create") -> exit code
+        self.raise_on: dict[str, BaseException] = {}  # same keys -> exception raised instead
         self.pools: dict[str, list[int]] = {}
         self.qemu: set[int] = set()
         self.digests: dict[str, str | None] = {}  # normalized ref -> registry digest (fake registry)
@@ -39,6 +40,9 @@ class FakePve(Pve):
     def run(self, argv, check=True, stream=False, input_text=None):
         self.calls.append(list(argv))
         key2, key1 = " ".join(argv[:2]), argv[0]
+        exc = self.raise_on.get(key2) or self.raise_on.get(key1)
+        if exc is not None:
+            raise exc
         rc = self.fail.get(key2, self.fail.get(key1, 0))
         out = ""
         if rc == 0:
@@ -113,7 +117,11 @@ class FakePve(Pve):
         return self.next_id
 
     def cluster_guests(self):
-        return [{"type": "lxc", "vmid": v, "node": "pve1"} for v in self.cts] + [
+        def tags(v):
+            cfg = (ctconf.CONF_DIR / f"{v}.conf").read_text().splitlines()
+            return next((line[5:].strip() for line in cfg if line.startswith("tags:")), "")
+
+        return [{"type": "lxc", "vmid": v, "node": "pve1", "tags": tags(v)} for v in self.cts] + [
             {"type": "qemu", "vmid": v, "node": "pve1"} for v in self.qemu
         ]
 

@@ -287,3 +287,73 @@ def test_unknown_template_on_storage_is_replaced(tmp_path, setup):
     pve.volids.add(t.ostemplate)  # pulled earlier by something else: digest unknown
     pull(pve, "pve1", t)
     assert pve.cmds(f"pvesm free {t.ostemplate}") and pve.cmds("pvesh create")
+
+
+# ---- cleanup of the temp CT on every failure path -----------------------------------------
+
+def test_shutdown_failure_removes_temp_ct(tmp_path, monkeypatch):
+    pve = FakePve(tmp_path)
+    _managed(pve, tmp_path)
+    monkeypatch.setattr(pve, "shutdown_or_stop", lambda vmid, timeout: False)
+    with pytest.raises(ComposeError, match="could not shut down"):
+        commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
+    assert pve.cmds("pct create 200") and 200 not in pve.cts
+    assert not pve.cmds("pct snapshot") and not pve.cmds("rsync") and not pve.cmds("pct rollback")
+
+
+def test_rsync_failure_unmounts_before_destroying_temp(tmp_path):
+    pve = FakePve(tmp_path)
+    _managed(pve, tmp_path)
+    pve.fail["rsync"] = 23
+    with pytest.raises(ComposeError):
+        commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
+    calls = [" ".join(c) for c in pve.calls]
+    assert calls.index("pct unmount 200") < calls.index("pct destroy 200 --purge")
+    assert 200 not in pve.cts
+
+
+def test_sighup_during_rsync_cleans_up_and_rolls_back(tmp_path):
+    from pve_oci_compose.errors import Terminated
+
+    pve = FakePve(tmp_path)
+    _managed(pve, tmp_path)
+    pve.raise_on["rsync"] = Terminated(1)  # SSH session dropped mid-rsync
+    with pytest.raises(Terminated):  # original cause propagates (exit 129), not a generic error
+        commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
+    assert 200 not in pve.cts and pve.cmds("pct rollback 105")
+    assert pve.cts[105]["status"] == "running"
+
+
+def test_signal_during_apply_pct_create_removes_partial_ct(setup, monkeypatch):
+    from pve_oci_compose.errors import Terminated
+
+    pve, p = setup
+    real_run = pve.run
+
+    def run(argv, **kw):
+        if argv[:2] == ["pct", "create"]:
+            real_run(argv, **kw)  # the CT exists half-made…
+            raise Terminated(15)  # …when SIGTERM arrives
+        return real_run(argv, **kw)
+
+    monkeypatch.setattr(pve, "run", run)
+    with pytest.raises(Terminated):
+        commands.apply(pve, C.load(p), commands.Options())
+    assert 200 not in pve.cts and "vmid: next" in p.read_text()
+
+
+def test_leftover_temp_ct_is_reported(tmp_path, capsys):
+    pve = FakePve(tmp_path)
+    _managed(pve, tmp_path, ref="ghcr.io/o/web:1.0")
+    pve.add_ct(250, ["hostname: oci-refresh-temp", "tags: pve-oci-compose-temp"])
+    commands.plan(pve, _refresh_compose(tmp_path), commands.Options())
+    assert "CT 250 is a leftover refresh temp CT" in capsys.readouterr().err
+    assert 250 in pve.cts  # reported, never auto-deleted
+
+
+def test_temp_ct_is_tagged(tmp_path):
+    pve = FakePve(tmp_path)
+    _managed(pve, tmp_path)
+    commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
+    create = pve.cmds("pct create 200")[0]
+    assert create[create.index("--tags") + 1] == "pve-oci-compose-temp"

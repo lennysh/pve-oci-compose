@@ -233,3 +233,38 @@ def test_marker_roundtrip_with_and_without_digest():
     assert marker.parse(marker.encode("web", "x:1", "sha256:d")) == marker.Marker("web", "x:1", "sha256:d")
     assert marker.parse(b'{"service":"web","ref":"x:1"}') == marker.Marker("web", "x:1", None)
     assert b"digest" not in marker.encode("web", "x:1")
+
+
+def test_ui_survives_dead_terminal(monkeypatch):
+    import sys
+
+    from pve_oci_compose import ui
+
+    class Dead:
+        def write(self, *_):
+            raise OSError(5, "Input/output error")  # EIO after the SSH session is gone
+
+        def flush(self):
+            raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(sys, "stdout", Dead())
+    monkeypatch.setattr(sys, "stderr", Dead())
+    ui.say("x"); ui.err("y"); ui.warn("z"); ui.ok("w"); ui.title("t")  # must not raise
+
+
+def test_signal_handlers_raise_terminated():
+    import os
+    import signal
+
+    from pve_oci_compose.cli import install_signal_handlers
+    from pve_oci_compose.errors import Terminated
+
+    old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        install_signal_handlers()
+        with pytest.raises(Terminated) as ei:
+            os.kill(os.getpid(), signal.SIGHUP)
+        assert ei.value.signum == signal.SIGHUP
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)

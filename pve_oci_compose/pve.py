@@ -19,6 +19,7 @@ from . import ui
 from .errors import CommandError, ComposeError
 
 MARKER_TAG = "pve-oci-compose"
+TEMP_TAG = "pve-oci-compose-temp"  # disposable refresh source CTs
 OCI_PULL_STORAGE_TYPES = ("dir", "nfs", "cifs")
 
 
@@ -148,6 +149,14 @@ class Pve:
             if int(g.get("vmid", -1)) == vmid:
                 return g["type"]
         return "free"
+
+    def tagged_lxcs(self, tag: str) -> list[int]:
+        """vmids of LXCs on this node carrying ``tag`` (from /cluster/resources)."""
+        me = self.node_name()
+        return sorted(
+            int(g["vmid"]) for g in self.cluster_guests() or []
+            if g.get("type") == "lxc" and g.get("node") == me and tag in split_tags(str(g.get("tags") or ""))
+        )
 
     def lxc_node(self, vmid: int) -> str | None:
         for g in self.cluster_guests() or []:

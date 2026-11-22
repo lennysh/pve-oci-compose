@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import sys
 
-from . import __version__, commands
+from . import __version__, commands, ui
 from . import compose as C
-from .errors import ComposeError
+from .errors import ComposeError, Terminated
 from .pve import Pve
 
 EPILOG = """\
@@ -69,8 +70,21 @@ def _preflight(need: list[str]) -> None:
         raise ComposeError(f"missing tools: {', '.join(missing)} (see bindep.txt)")
 
 
+def _raise_terminated(signum, _frame):
+    raise Terminated(signum)
+
+
+def install_signal_handlers() -> None:
+    """Turn SIGTERM / SIGHUP into an exception so an interrupted refresh/apply still runs
+    its cleanup (remove temp CT, roll back, restart). Without this, an SSH drop (SIGHUP)
+    kills the process mid-refresh with nothing cleaned up."""
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _raise_terminated)
+
+
 def main(argv: list[str] | None = None) -> int:
     a = parser().parse_args(argv)
+    install_signal_handlers()
     try:
         _check_args(a)
         if a.vmid is not None and a.vmid < 0:
@@ -90,11 +104,14 @@ def main(argv: list[str] | None = None) -> int:
          "pull": commands.pull_only}[a.command](pve, c, o)
         return 0
     except ComposeError as e:
-        print(f"pve-oci-compose: {e}", file=sys.stderr)
+        ui.err(f"pve-oci-compose: {e}")
         return 1
     except KeyboardInterrupt:
-        print("pve-oci-compose: interrupted", file=sys.stderr)
+        ui.err("pve-oci-compose: interrupted")
         return 130
+    except Terminated as e:
+        ui.err(f"pve-oci-compose: {e}")
+        return 128 + e.signum
 
 
 if __name__ == "__main__":

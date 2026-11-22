@@ -11,7 +11,7 @@ from .compose import Compose, Service
 from .create import create_ct, destroy_partial, pull, resolve_template, spec_from_service
 from .errors import ComposeError
 from .guestfs import GuestPathError
-from .pve import Pve
+from .pve import TEMP_TAG, Pve
 from .refresh import RefreshOptions, refresh_ct
 
 
@@ -186,6 +186,13 @@ def _short(d: str) -> str:
     return d.split(":", 1)[-1][:12]
 
 
+def warn_leftover_temps(pve: Pve) -> None:
+    """Temp CTs left by a refresh that was killed hard (kill -9, power loss)."""
+    for v in pve.tagged_lxcs(TEMP_TAG):
+        ui.warn(f"CT {v} is a leftover refresh temp CT (tag {TEMP_TAG}) from an interrupted run. "
+                f"If no refresh is running right now, remove it: pct destroy {v} --purge")
+
+
 # ---- refresh -------------------------------------------------------------------------
 
 
@@ -201,6 +208,7 @@ def _refresh_options(svc: Service, o: Options) -> RefreshOptions:
 
 
 def refresh(pve: Pve, c: Compose, o: Options) -> None:
+    warn_leftover_temps(pve)
     for svc in select(c, o):
         if svc.vmid is None:
             raise ComposeError(f"service {svc.name}: refresh needs a numeric vmid (still 'next' — run apply first)")
@@ -267,6 +275,7 @@ def plan(pve: Pve, c: Compose, o: Options) -> None:
     if c.project:
         ui.say(f"Project: {c.project}")
     services = select(c, o)
+    warn_leftover_temps(pve)
     ui.say()
     for svc in services:
         C.validate(svc, c.dir)

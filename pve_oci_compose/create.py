@@ -286,7 +286,11 @@ def create_ct(pve: Pve, t: Template, spec: CreateSpec, quiet: bool = False,
         if spec.lxc_lines:
             ui.say(f"DRY-RUN: append {len(spec.lxc_lines)} lxc_config_lines to /etc/pve/lxc/{spec.vmid}.conf")
         return
-    cp = pve.run(argv, check=False)
+    try:
+        cp = pve.run(argv, check=False)
+    except BaseException:  # Ctrl-C / SIGTERM / SIGHUP while pct create runs
+        destroy_partial(pve, spec.vmid, pool_autocreated)
+        raise
     if cp.returncode != 0:
         ui.err(cp.stdout or "")
         destroy_partial(pve, spec.vmid, pool_autocreated)

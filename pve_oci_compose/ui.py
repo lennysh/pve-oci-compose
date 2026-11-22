@@ -27,41 +27,50 @@ def _width() -> int:
     return max(48, min(100, shutil.get_terminal_size((80, 24)).columns - 4))
 
 
+def _out(msg: str, stream=None) -> None:
+    """print() that survives a vanished terminal (EIO / EPIPE after an SSH drop):
+    losing a log line must never abort cleanup."""
+    try:
+        print(msg, file=stream or sys.stdout, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 def say(msg: str = "") -> None:
-    print(msg, flush=True)
+    _out(msg)
 
 
 def title(msg: str) -> None:
-    print(f"\n{B}{M}{msg}{R}\n{D}{'─' * _width()}{R}", flush=True)
+    _out(f"\n{B}{M}{msg}{R}\n{D}{'─' * _width()}{R}")
 
 
 def sub(msg: str) -> None:
-    print(f"\n{B}{msg}{R}", flush=True)
+    _out(f"\n{B}{msg}{R}")
 
 
 def kv(key: str, value: object) -> None:
-    print(f"  {key:<20}  {value}", flush=True)
+    _out(f"  {key:<20}  {value}")
 
 
 def muted(msg: str) -> None:
-    print(f"  {D}{msg}{R}", flush=True)
+    _out(f"  {D}{msg}{R}")
 
 
 def detail(msg: str) -> None:
     if verbose():
-        print(f"  {D}{msg}{R}", flush=True)
+        _out(f"  {D}{msg}{R}")
 
 
 def ok(msg: str) -> None:
-    print(f"{G}✓ {msg}{R}", flush=True)
+    _out(f"{G}✓ {msg}{R}")
 
 
 def warn(msg: str) -> None:
-    print(f"{Y}! {msg}{R}", file=sys.stderr, flush=True)
+    _out(f"{Y}! {msg}{R}", sys.stderr)
 
 
 def err(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    _out(msg, sys.stderr)
 
 
 SECRET_FLAGS = frozenset({"--password"})
@@ -83,4 +92,4 @@ def redact(cmd: list[str]) -> str:
 
 def cmd(argv: list[str]) -> None:
     if verbose():
-        print(f"  {D}{redact(argv)}{R}", flush=True)
+        _out(f"  {D}{redact(argv)}{R}")
