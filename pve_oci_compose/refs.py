@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 
-from . import ui
 from .errors import ComposeError
 
 
@@ -13,6 +12,16 @@ def strip_scheme(ref: str) -> str:
         if ref.startswith(p):
             return ref[len(p) :]
     return ref
+
+
+def split_ref(ref: str) -> tuple[str, str, str]:
+    """``reg:5000/a/b:tag@sha256:x`` → (``reg:5000/a/b``, ``tag``, ``sha256:x``); parts may be ''."""
+    name, _, digest = ref.partition("@")
+    head, _, last = name.rpartition("/")
+    tag = ""
+    if ":" in last:
+        last, _, tag = last.rpartition(":")
+    return (f"{head}/{last}" if head else last), tag, digest
 
 
 def is_registry_ref(ref: str) -> bool:
@@ -38,12 +47,7 @@ def normalize(ref: str) -> str:
     return f"docker.io/library/{ref}"
 
 
-def is_floating_latest(ref: str, normalized_filename: str) -> bool:
-    return ref.lower().endswith(":latest") or normalized_filename.endswith("_latest")
-
-
 _PLAIN_VERSION = re.compile(r"^v?\d+(\.\d+)*$")
-MAX_TAG_PROBES = 5  # each probe is one registry manifest GET (Docker Hub rate limits)
 
 
 def _version_key(t: str):
@@ -73,21 +77,3 @@ def _neg(k):
     # sort helper: descending version order inside a tier
     kind, num, txt = k
     return (kind, -num, "".join(chr(0x10FFFF - ord(c)) for c in txt))
-
-
-def resolve_floating(pve, ref: str, digest: str | None) -> str:
-    """Pin a floating ref (``:latest``) to a concrete tag **with the same digest**, else
-    ``name@digest``. ``RepoTags`` lists every tag of the repository, so candidates are
-    verified by digest (a few probes, most likely first) rather than trusted."""
-    info = pve.skopeo_inspect(ref)
-    if not info or not info.get("Name"):
-        raise ComposeError(f"skopeo inspect failed for docker://{ref} (or set OCI_CT_CREATE_NO_RESOLVE_LATEST=1)")
-    name = info["Name"]
-    digest = digest or info.get("Digest")
-    if not digest:
-        raise ComposeError(f"could not read the digest of docker://{ref}")
-    for tag in tag_candidates(list(info.get("RepoTags") or []))[:MAX_TAG_PROBES]:
-        if pve.registry_digest(f"{name}:{tag}") == digest:
-            return f"{name}:{tag}"
-    ui.muted(f"no concrete tag found for this digest; using {name}@{digest[:19]}…")
-    return f"{name}@{digest}"

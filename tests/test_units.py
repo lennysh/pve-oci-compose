@@ -114,35 +114,77 @@ def test_tag_candidates_order():
 
 
 class _Reg:
-    """Minimal registry: RepoTags lists every tag of the repo, digests differ per tag."""
+    """Minimal registry for version identification tests."""
 
-    def __init__(self, digests):
-        self.digests = digests
+    def __init__(self, digests, labels=None, web=None):
+        self.digests = digests  # tag -> digest
+        self.labels = labels or {}
+        self.web = web or {}
         self.probes = []
 
     def skopeo_inspect(self, ref):
-        return {"Name": "docker.io/library/nginx", "Digest": self.digests["latest"], "RepoTags": list(self.digests)}
+        return {"RepoTags": list(self.digests), "Labels": self.labels}
 
     def registry_digest(self, ref):
         self.probes.append(ref)
         return self.digests.get(ref.rsplit(":", 1)[1])
 
-
-def test_resolve_floating_verifies_digest_not_just_highest_tag():
-    # highest tag 1.29.0 is a *different* image than latest (= 1.28.2)
-    reg = _Reg({"latest": "sha256:L", "1.29.0": "sha256:X", "1.28.2": "sha256:L", "1.27.0": "sha256:Y"})
-    assert refs.resolve_floating(reg, "docker.io/library/nginx:latest", "sha256:L") == "docker.io/library/nginx:1.28.2"
+    def http_json(self, url, timeout=10.0):
+        return self.web.get(url)
 
 
-def test_resolve_floating_falls_back_to_digest():
-    reg = _Reg({"latest": "sha256:L", **{f"1.{i}.0": f"sha256:{i}" for i in range(20)}})
-    out = refs.resolve_floating(reg, "docker.io/library/nginx:latest", "sha256:L")
-    assert out == "docker.io/library/nginx@sha256:L"
-    assert len(reg.probes) == refs.MAX_TAG_PROBES
+def test_identify_versionish_compose_tag_needs_no_lookup():
+    from pve_oci_compose import versions
+    reg = _Reg({})
+    assert versions.identify(reg, "ghcr.io/o/app:1.2.3", "sha256:L").version == "1.2.3"
+    assert reg.probes == []
 
 
-# ---- create args ------------------------------------------------------------------------
+def test_identify_docker_hub_tag_list():
+    from pve_oci_compose import versions
+    url = "https://hub.docker.com/v2/namespaces/library/repositories/nginx/tags?page_size=100"
+    web = {url: {"results": [
+        {"name": "latest", "digest": "sha256:L"}, {"name": "1.31", "digest": "sha256:L"},
+        {"name": "1.31.9", "digest": "sha256:L"}, {"name": "mainline", "digest": "sha256:L"},
+        {"name": "1.30.2", "digest": "sha256:OLD"}], "next": None}}
+    v = versions.identify(_Reg({}, web=web), "docker.io/library/nginx:latest", "sha256:L")
+    assert v.version == "1.31.9" and set(v.aliases) == {"1.31", "1.31.9", "mainline"}
+    assert v.source == "Docker Hub tag list"
 
+
+def test_identify_image_label_but_not_junk_label():
+    from pve_oci_compose import versions
+    reg = _Reg({"x": "sha256:Z"}, labels={"org.opencontainers.image.version": "v3.8.0"})
+    assert versions.identify(reg, "ghcr.io/t/traefik:latest", "sha256:L").version == "v3.8.0"
+    junk = _Reg({}, labels={"org.opencontainers.image.version": "latest"})  # antimatter does this
+    assert versions.identify(junk, "ghcr.io/a/antimatter:latest", "sha256:L").version is None
+
+
+def test_identify_verified_probe_frigate_style():
+    """Big GHCR repo, no label: newest plain release verified by digest (stable = 0.18.3)."""
+    from pve_oci_compose import versions
+    tags = {f"0.18.{i}": f"sha256:{i}" for i in range(3)} | {"0.18.3": "sha256:L", "0.18.3-tensorrt": "sha256:T"}
+    tags |= {f"dev-{i:04x}": f"sha256:d{i}" for i in range(40)}  # > SMALL_REPO tags
+    reg = _Reg(tags)
+    v = versions.identify(reg, "ghcr.io/blakeblackshear/frigate:stable", "sha256:L")
+    assert v.version == "0.18.3" and v.source == "verified tag"
+    assert len(reg.probes) == 1  # newest release matched on the first probe
+
+
+def test_identify_unknown_is_never_a_guess():
+    from pve_oci_compose import versions
+    tags = {f"1.{i}.0": f"sha256:{i}" for i in range(40)}  # none matches
+    reg = _Reg(tags)
+    v = versions.identify(reg, "ghcr.io/o/app:latest", "sha256:L")
+    assert v.version is None and v.aliases == []
+    assert len(reg.probes) == versions.MAX_PROBES
+
+
+def test_identify_small_repo_probes_every_tag():
+    from pve_oci_compose import versions
+    reg = _Reg({"sha-2179a47": "sha256:L", "sha-b723ce8": "sha256:O", "main": "sha256:L"})
+    v = versions.identify(reg, "ghcr.io/antimatterchat/antimatter:latest", "sha256:L")
+    assert set(v.aliases) == {"sha-2179a47", "main"} and v.version in v.aliases
 
 def test_spec_from_service_flags():
     svc = C.Service("web", {
@@ -292,3 +334,11 @@ def test_privileged_plan_restore_gets_only_volumes():
 
 def test_unprivileged_spec_is_not_converted():
     assert not spec_from_service(C.Service("x", {"rootfs": "s:1"}), 1, None, None).privileged
+
+
+def test_normalize_conf_matches_pct_config_view():
+    from pve_oci_compose.pve import normalize_conf
+    raw = ("#user notes\narch: amd64\nlxc.environment.runtime: PATH=/bin\nlxc.environment.runtime: VERSION=2.1.4\n"
+           "lxc.init.cwd: /\n\n[snap]\nmemory: 1\n")
+    assert normalize_conf(raw) == ["arch: amd64", "lxc.init.cwd: /", "", "env: PATH=/bin\0VERSION=2.1.4"]
+    assert normalize_conf("env: A=1\nlxc.environment.runtime: B=2\n") == ["env: A=1"]  # explicit env wins

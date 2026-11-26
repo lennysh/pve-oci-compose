@@ -45,9 +45,19 @@ def _ports(gp) -> list[str]:
     return out
 
 
+MAX_ALIASES = 8
+
+
 def build(
-    compose: Compose, svc: Service, pulled_ref: str | None = None, synced_at: str | None = None
+    compose: Compose,
+    svc: Service,
+    digest: str | None = None,
+    version: str | None = None,
+    aliases: list[str] | None = None,
+    synced_at: str | None = None,
 ) -> str | None:
+    """Composed CT notes. ``digest`` / ``version`` / ``aliases`` describe the image actually
+    pulled (digest = exact identity; version + aliases only when known for sure)."""
     body_user = _s(svc.get("description"))
     img = svc.image
     about = "\n\n".join(x for x in (_s(compose.about), _s(svc.get("about"))) if x)
@@ -63,12 +73,16 @@ def build(
         f"- **Stack:** {compose.project}" if compose.project else "- **Stack:** _(compose file)_",
         f"- **Service:** {svc.name}",
     ]
-    if pulled_ref:
-        lines.append(f"- **Image (pulled):** `{pulled_ref}`")
-        if img and img != pulled_ref:
-            lines.append(f"- **Compose file ref:** `{img}`")
-    elif img:
+    if img:
         lines.append(f"- **Image:** `{img}`")
+    if version:
+        lines.append(f"- **Version:** {version}")
+    shown = [a for a in (aliases or []) if a != version]
+    if shown:
+        more = f", +{len(shown) - MAX_ALIASES} more" if len(shown) > MAX_ALIASES else ""
+        lines.append(f"- **Also tagged:** {', '.join(shown[:MAX_ALIASES])}{more}")
+    if digest:
+        lines.append(f"- **Digest:** `{digest}`")
     if synced_at:
         lines.append(f"- **Template sync:** {synced_at}")
     if body_user:

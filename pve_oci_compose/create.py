@@ -9,10 +9,10 @@ import time
 from pathlib import Path
 from dataclasses import dataclass, field
 
-from . import ctconf, refs, state, ui
+from . import ctconf, refs, ui, versions
 from .compose import Service, as_flag, as_scalar, parse_mount_spec
 from .errors import CommandError, ComposeError
-from .pve import OCI_PULL_STORAGE_TYPES, Pve, parse_upid
+from .pve import OCI_PULL_STORAGE_TYPES, Pve
 
 DEFAULT_NET0 = "name=eth0,bridge=vmbr0,ip=dhcp"
 
@@ -56,31 +56,49 @@ def pick_template_storage(pve: Pve, node: str, requested: str | None) -> str:
 @dataclass
 class Template:
     storage: str
-    input_ref: str
-    pull_ref: str
-    ostemplate: str
+    input_ref: str  # normalized compose ref, e.g. ghcr.io/blakeblackshear/frigate:stable
+    digest: str  # what the ref resolved to — the image that gets pulled and runs
+    ostemplate: str  # <storage>:vztmpl/<name>_sha256-<digest16>.tar
     local_tar: str | None
-    digest: str | None = None  # registry digest of input_ref at resolve time (before the pull)
+    version: versions.VersionInfo = field(default_factory=versions.VersionInfo)
+
+    @property
+    def repo(self) -> str:
+        return refs.split_ref(self.input_ref)[0]
+
+    @property
+    def pull_ref(self) -> str:
+        """Exact, immutable reference: repo@sha256:…"""
+        return f"{self.repo}@{self.digest}"
 
 
-def resolve_template(pve: Pve, node: str, ref: str, storage: str | None) -> Template:
-    """Read-only: choose storage, normalize + pin the ref, compute the vztmpl volume id."""
+DIGEST_LEN = 16  # hex chars of the digest in template filenames
+
+
+def template_basename(pve: Pve, ref: str) -> str:
+    """Stable per-ref prefix (``frigate_stable``); digest-named files share it."""
+    name = ref.split("@")[0]
+    return pve.normalize_content_filename(name)
+
+
+def resolve_template(pve: Pve, node: str, ref: str, storage: str | None, identify: bool = True) -> Template:
+    """Resolve ``ref`` to its current digest (read-only). The digest — not a tag name — is
+    what gets pulled, so a compose file can stay on :latest / :stable and still get exactly
+    the image the registry serves right now. The version is looked up for display only."""
     st = pick_template_storage(pve, node, storage)
-    norm_in = refs.normalize(ref)
-    if norm_in != refs.strip_scheme(ref):
-        ui.detail(f"Normalized registry ref: {ref} → {norm_in}")
-    # Fetched before the pull: if the tag moves in between, the recorded digest is the older
-    # one and the next refresh re-checks (never the other way round).
-    digest = pve.registry_digest(norm_in)
-    pull_ref = norm_in
-    if not os.environ.get("OCI_CT_CREATE_NO_RESOLVE_LATEST") and refs.is_floating_latest(
-        norm_in, pve.normalize_content_filename(norm_in)
-    ):
-        pull_ref = refs.resolve_floating(pve, norm_in, digest)
-    fname = pve.normalize_content_filename(pull_ref)
+    norm = refs.normalize(ref)
+    if norm != refs.strip_scheme(ref):
+        ui.detail(f"Normalized registry ref: {ref} → {norm}")
+    digest = pve.registry_digest(norm)
+    if not digest:
+        raise ComposeError(f"registry image not found or not reachable: docker://{norm}")
+    fname = f"{template_basename(pve, norm)}_sha256-{digest.split(':', 1)[1][:DIGEST_LEN]}"
     d = pve.vztmpl_dir(st)
     local = os.path.join(d, f"{fname}.tar") if d and os.path.isdir(d) else None
-    return Template(st, norm_in, pull_ref, f"{st}:vztmpl/{fname}.tar", local, digest)
+    t = Template(st, norm, digest, f"{st}:vztmpl/{fname}.tar", local)
+    if identify:
+        t.version = versions.identify(pve, norm, digest)
+    return t
 
 
 def _template_present(pve: Pve, node: str, t: Template) -> bool:
@@ -89,75 +107,56 @@ def _template_present(pve: Pve, node: str, t: Template) -> bool:
     return pve.storage_has_volid(node, t.storage, t.ostemplate)
 
 
-def template_is_current(pve: Pve, node: str, t: Template) -> bool:
-    """Template on storage and pulled at the digest the tag has now (digest refs: immutable)."""
-    if not _template_present(pve, node, t):
-        return False
-    if "@sha256:" in t.pull_ref:
-        return True
-    return bool(t.digest) and state.template_digest(t.ostemplate) == t.digest
+def prune_templates(pve: Pve, node: str, t: Template) -> list[str]:
+    """Remove older digest-named templates of the same ref (``<base>_sha256-*.tar``) that this
+    tool pulled. Containers never need their template after create. Files with other names
+    (UI pulls, other tools) are never touched. PVE_OCI_KEEP_TEMPLATES=1 disables this."""
+    if os.environ.get("PVE_OCI_KEEP_TEMPLATES") == "1" or not t.local_tar:
+        return []
+    d = os.path.dirname(t.local_tar)
+    base = os.path.basename(t.local_tar).rsplit("_sha256-", 1)[0]
+    pat = re.compile(rf"^{re.escape(base)}_sha256-[0-9a-f]{{{DIGEST_LEN}}}\.tar$")
+    removed = []
+    for f in sorted(os.listdir(d)):
+        if pat.match(f) and f != os.path.basename(t.local_tar):
+            volid = f"{t.storage}:vztmpl/{f}"
+            if pve.ok(["pvesm", "free", volid]):
+                removed.append(f)
+    return removed
 
 
 def pull(pve: Pve, node: str, t: Template) -> None:
-    """Make sure ``t.ostemplate`` holds the image the tag points at *now*.
+    """Put exactly ``t.digest`` on storage as ``t.ostemplate`` (skopeo copy repo@digest).
 
-    Reuses the template when its recorded digest matches; otherwise a template with the
-    same filename (older pull of a moved tag, or unknown origin) is removed and re-pulled.
-    """
-    if template_is_current(pve, node, t):
-        ui.muted(f"template already current on {t.storage} — reused")
+    Proxmox's oci-registry-pull only accepts ``name:tag``, which would re-resolve the tag
+    (and could fetch a different image than the one checked). Copying by digest is exact;
+    the file name contains the digest, so an existing file is always the right image."""
+    if t.version.version:
+        ui.muted(f"{t.input_ref.rsplit('/', 1)[-1]} = {t.version.version} ({t.version.source})")
+    if _template_present(pve, node, t):
+        ui.muted(f"template for {t.digest[:19]}… already on {t.storage} — reused")
         return
-    if t.input_ref != t.pull_ref:
-        ui.muted(f"pinned {t.input_ref.rsplit('/', 1)[-1]} → {t.pull_ref.rsplit('/', 1)[-1]}")
-    present = _template_present(pve, node, t)
     if pve.dry_run:
-        if present:
-            ui.say(f"DRY-RUN: pvesm free {t.ostemplate}   # stale or unknown digest")
-        ui.say(f"DRY-RUN: pvesh create /nodes/{node}/storage/{t.storage}/oci-registry-pull --reference {t.pull_ref}")
+        ui.say(f"DRY-RUN: skopeo copy docker://{t.pull_ref} oci-archive:{t.local_tar or t.ostemplate}")
         return
-    if not t.digest:
-        raise ComposeError(f"registry image not found or not reachable: docker://{t.input_ref}")
-    if present:
-        ui.muted("replaced outdated template (tag moved or digest unknown)")
-        pve.run(["pvesm", "free", t.ostemplate])
-        state.record_template(t.ostemplate, None)
-    cp = pve.run(
-        ["pvesh", "create", f"/nodes/{node}/storage/{t.storage}/oci-registry-pull",
-         "--reference", t.pull_ref, "--output-format", "json"],
-        check=False,
-    )
-    out = cp.stdout or ""
-    if cp.returncode == 0:
-        upid = parse_upid(out)
-        if not upid:
-            raise ComposeError(f"could not parse task UPID from oci-registry-pull: {out[:300]}")
-        ui.detail(f"task {upid}")
-        pve.wait_task(upid, node)
-    elif re.search(r"refusing to override|already exists|existing file", out, re.I):
-        raise ComposeError(
-            f"template {t.ostemplate} reappeared during the pull (concurrent run?) — re-run, or remove it with "
-            f"pvesm free {t.ostemplate}"
-        )
-    elif "@sha256:" in t.pull_ref and t.local_tar and re.search(
-        r"parameter verification|invalid|does not match|malformed|bad request", out, re.I
-    ):
-        ui.muted("oci-registry-pull rejected the digest ref; copying with skopeo")
-        tmp = f"{t.local_tar}.pulltmp.{os.getpid()}"
-        try:
-            pve.run(["skopeo", "copy", f"docker://{t.pull_ref}", f"oci-archive:{tmp}"], stream=True)
-            os.replace(tmp, t.local_tar)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-    else:
-        raise ComposeError(f"oci-registry-pull failed on storage '{t.storage}': {out.strip()[-600:]}")
+    if not t.local_tar:
+        raise ComposeError(f"template storage '{t.storage}' has no host directory for vztmpl (need dir/nfs/cifs)")
+    tmp = f"{t.local_tar}.pulltmp.{os.getpid()}"
+    try:
+        pve.run(["skopeo", "copy", "--quiet", f"docker://{t.pull_ref}", f"oci-archive:{tmp}"], stream=True)
+        os.replace(tmp, t.local_tar)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     for _ in range(20):
         if _template_present(pve, node, t):
             break
         time.sleep(1)
     else:
         raise ComposeError(f"template {t.ostemplate} did not appear on storage after pull")
-    state.record_template(t.ostemplate, t.digest)
+    old = prune_templates(pve, node, t)
+    if old:
+        ui.muted(f"removed {len(old)} older template(s) of this image")
 
 
 # ---- pct create -----------------------------------------------------------------

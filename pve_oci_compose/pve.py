@@ -51,6 +51,26 @@ def merge_marker_tag(existing: str | None) -> str:
     return ";".join(parts)
 
 
+def normalize_conf(text: str) -> list[str]:
+    """Raw /etc/pve/lxc/<vmid>.conf → the current-config lines ``pct config`` would print:
+    snapshot sections and ``#`` (description) lines dropped, and ``lxc.environment.runtime``
+    lines folded into one NUL-separated ``env:`` line (how pct config presents them)."""
+    out: list[str] = []
+    runtime: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("["):
+            break
+        if line.startswith("#"):
+            continue
+        if line.startswith("lxc.environment.runtime:"):
+            runtime.append(line.split(":", 1)[1].strip())
+            continue
+        out.append(line)
+    if runtime and not any(line.startswith("env:") for line in out):
+        out.append("env: " + "\0".join(runtime))
+    return out
+
+
 def parse_config(lines: list[str]) -> dict[str, str]:
     """``pct config`` lines → {key: value} for the current config (stops at [snapshot])."""
     out: dict[str, str] = {}
@@ -166,9 +186,19 @@ class Pve:
         return None
 
     # ---- containers ----------------------------------------------------------
+    CONF_DIR = "/etc/pve/lxc"  # pmxcfs view of *this* node's CTs (same scope as pct config)
+
     def config_lines(self, vmid: int) -> list[str] | None:
-        raw = self.out(["pct", "config", str(vmid)])
-        return raw.splitlines() if raw is not None else None
+        """Current config of a CT on this node, as ``pct config`` shows it — read straight from
+        /etc/pve/lxc/<vmid>.conf (each pct call costs ~2 s of Perl/pmxcfs startup)."""
+        try:
+            with open(f"{self.CONF_DIR}/{vmid}.conf", encoding="utf-8", errors="surrogateescape") as f:
+                return normalize_conf(f.read())
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raw = self.out(["pct", "config", str(vmid)])
+            return raw.splitlines() if raw is not None else None
 
     def config(self, vmid: int) -> dict[str, str] | None:
         lines = self.config_lines(vmid)
@@ -192,6 +222,12 @@ class Pve:
         return ""
 
     def status(self, vmid: int) -> str:
+        """running | stopped | frozen | '' — via lxc-info (fast), else pct status."""
+        if not self.exists_here(vmid):
+            return ""
+        raw = self.out(["lxc-info", "-n", str(vmid), "-s", "-H"])
+        if raw and raw.strip():
+            return raw.strip().lower()
         raw = self.out(["pct", "status", str(vmid)]) or ""
         return raw.replace("status:", "").strip()
 
@@ -324,6 +360,17 @@ class Pve:
         if cp.returncode != 0 or not cp.stdout:
             return None
         return "sha256:" + hashlib.sha256(cp.stdout).hexdigest()
+
+    def http_json(self, url: str, timeout: float = 10.0):
+        """GET a JSON document (registry web APIs); None on any failure."""
+        import urllib.request
+
+        req = urllib.request.Request(url, headers={"User-Agent": "pve-oci-compose", "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - optional metadata source, never fatal
+            return None
 
     def pvesm_path(self, volid: str) -> str | None:
         out = self.out(["pvesm", "path", volid])

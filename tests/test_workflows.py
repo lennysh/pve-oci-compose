@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -39,7 +40,7 @@ def test_apply_creates_tags_marks_writes_back_and_starts(setup, tmp_path):
     assert 200 in pve.cts
     root = tmp_path / "lxc/200/rootfs"
     assert json.loads((root / "etc/pve-oci-compose.json").read_text()) == {
-        "service": "web", "ref": "ghcr.io/o/web:1.0", "digest": "sha256:" + "0" * 64}
+        "service": "web", "ref": "ghcr.io/o/web:1.0", "digest": "sha256:" + "0" * 64, "version": "1.0"}
     assert (root / "etc/app.conf").read_text() == "hello\n"
     conf = (ctconf.CONF_DIR / "200.conf").read_text()
     assert "tags: pve-oci-compose" in conf
@@ -169,7 +170,7 @@ def test_refresh_order_minimises_downtime(tmp_path):
     def first(prefix):
         return next(i for i, c in enumerate(pve.calls) if " ".join(c).startswith(prefix))
 
-    assert (first("pvesh create /nodes/pve1/storage") < first("pct create 200") < first("pct shutdown 105")
+    assert (first("skopeo copy") < first("pct create 200") < first("pct shutdown 105")
             < first("pct snapshot 105") < first("rsync") < first("pct start 105"))
 
 
@@ -259,34 +260,45 @@ def test_plan_reports_digest_drift(tmp_path, capsys):
 # ---- template reuse -----------------------------------------------------------------------
 
 
-def test_template_reused_only_when_digest_current(tmp_path, setup):
-    from pve_oci_compose import state
+def test_pull_is_by_exact_digest_into_digest_named_template(tmp_path, setup):
     from pve_oci_compose.create import pull, resolve_template
 
     pve, _ = setup
     pve.digests["ghcr.io/o/web:1.0"] = D_OLD
     t = resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None)
+    assert t.ostemplate == f"local:vztmpl/ghcr.io_o_web_1.0_sha256-{'a' * 16}.tar"
     pull(pve, "pve1", t)
-    assert state.template_digest(t.ostemplate) == D_OLD and len(pve.cmds("pvesh create")) == 1
-
-    pull(pve, "pve1", t)  # same digest: reuse, no download
-    assert len(pve.cmds("pvesh create")) == 1 and not pve.cmds("pvesm free")
-
-    pve.digests["ghcr.io/o/web:1.0"] = D_NEW  # tag moved: stale tarball removed + re-pulled
-    t2 = resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None)
-    pull(pve, "pve1", t2)
-    assert pve.cmds(f"pvesm free {t.ostemplate}") and len(pve.cmds("pvesh create")) == 2
-    assert state.template_digest(t.ostemplate) == D_NEW
+    copy = pve.cmds("skopeo copy")[0]
+    assert f"docker://ghcr.io/o/web@{D_OLD}" in copy  # never re-resolves the tag
+    pull(pve, "pve1", t)  # same digest: file exists → reused
+    assert len(pve.cmds("skopeo copy")) == 1
 
 
-def test_unknown_template_on_storage_is_replaced(tmp_path, setup):
+def test_moved_tag_pulls_new_file_and_prunes_only_own_old_templates(tmp_path, setup):
     from pve_oci_compose.create import pull, resolve_template
 
     pve, _ = setup
-    t = resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None)
-    pve.volids.add(t.ostemplate)  # pulled earlier by something else: digest unknown
-    pull(pve, "pve1", t)
-    assert pve.cmds(f"pvesm free {t.ostemplate}") and pve.cmds("pvesh create")
+    tdir = Path(pve.vztmpl_dir("local"))
+    (tdir / "ghcr.io_o_web_1.0.tar").write_bytes(b"pulled in the UI")  # foreign name: never touched
+    pve.digests["ghcr.io/o/web:1.0"] = D_OLD
+    t1 = resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None)
+    pull(pve, "pve1", t1)
+    pve.digests["ghcr.io/o/web:1.0"] = D_NEW
+    t2 = resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None)
+    pull(pve, "pve1", t2)
+    names = sorted(f.name for f in tdir.iterdir())
+    assert names == ["ghcr.io_o_web_1.0.tar", f"ghcr.io_o_web_1.0_sha256-{'b' * 16}.tar"]
+
+
+def test_keep_templates_env_disables_pruning(tmp_path, setup, monkeypatch):
+    from pve_oci_compose.create import pull, resolve_template
+
+    monkeypatch.setenv("PVE_OCI_KEEP_TEMPLATES", "1")
+    pve, _ = setup
+    for d in (D_OLD, D_NEW):
+        pve.digests["ghcr.io/o/web:1.0"] = d
+        pull(pve, "pve1", resolve_template(pve, "pve1", "ghcr.io/o/web:1.0", None))
+    assert len(list(Path(pve.vztmpl_dir("local")).iterdir())) == 2
 
 
 # ---- cleanup of the temp CT on every failure path -----------------------------------------
@@ -452,3 +464,35 @@ def test_other_privileged_create_errors_do_not_trigger_conversion(tmp_path):
     with pytest.raises(ComposeError):
         commands.apply(pve, C.load(p), commands.Options())
     assert len(pve.cmds("pct create")) == 1 and not pve.cmds("vzdump")
+
+
+def test_plan_shows_registry_version_and_config_drift(tmp_path, capsys):
+    pve = FakePve(tmp_path)
+    root = _managed(pve, tmp_path, ref="ghcr.io/o/web:stable")
+    (root / "etc/pve-oci-compose.json").write_text(json.dumps({"service": "web", "ref": "ghcr.io/o/web:stable",
+                                                                "digest": D_OLD, "version": "0.17.1"}))
+    pve.digests["ghcr.io/o/web:stable"] = D_NEW
+    pve.digests["ghcr.io/o/web:0.18.3"] = D_NEW
+    pve.inspects["ghcr.io/o/web"] = {"RepoTags": ["stable", "0.18.3", "0.17.1"], "Labels": {}}
+    p = tmp_path / "compose.yaml"
+    p.write_text("services:\n  web:\n    vmid: 105\n    image: ghcr.io/o/web:stable\n    rootfs: local-zfs:8\n"
+                 "    cores: 4\n")
+    commands.plan(pve, C.load(p), commands.Options())
+    out = capsys.readouterr().out
+    assert "registry now:  0.18.3  (verified tag) · CT has 0.17.1" in out
+    assert "config drift:" in out and "cores" in out
+
+
+def test_refresh_header_and_marker_carry_versions(tmp_path, capsys):
+    pve = FakePve(tmp_path)
+    root = _managed(pve, tmp_path, ref="ghcr.io/o/web:stable")
+    (root / "etc/pve-oci-compose.json").write_text(json.dumps({"service": "web", "ref": "ghcr.io/o/web:stable",
+                                                                "digest": D_OLD, "version": "0.17.1"}))
+    pve.digests["ghcr.io/o/web:stable"] = D_NEW
+    pve.digests["ghcr.io/o/web:0.18.3"] = D_NEW
+    pve.inspects["ghcr.io/o/web"] = {"RepoTags": ["stable", "0.18.3"], "Labels": {}}
+    commands.refresh(pve, _refresh_compose(tmp_path, "ghcr.io/o/web:stable"), commands.Options())
+    assert "stable: 0.17.1 → 0.18.3" in capsys.readouterr().out
+    m = json.loads((root / "etc/pve-oci-compose.json").read_text())
+    assert (m["digest"], m["version"]) == (D_NEW, "0.18.3")
+    assert f"ghcr.io/o/web@{D_NEW}" in " ".join(pve.cmds("skopeo copy")[0])
