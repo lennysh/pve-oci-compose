@@ -18,6 +18,7 @@ class FakePve(Pve):
         self.next_id = 200
         self.fail: dict[str, int] = {}  # argv[0:2] joined ("rsync", "pct create") -> exit code
         self.raise_on: dict[str, BaseException] = {}  # same keys -> exception raised instead
+        self.privileged_oci_fixed = False  # pve-container ≤ 6.1.x: privileged OCI create fails
         self.pools: dict[str, list[int]] = {}
         self.qemu: set[int] = set()
         self.digests: dict[str, str | None] = {}  # normalized ref -> registry digest (fake registry)
@@ -40,6 +41,10 @@ class FakePve(Pve):
     def run(self, argv, check=True, stream=False, input_text=None):
         self.calls.append(list(argv))
         key2, key1 = " ".join(argv[:2]), argv[0]
+        if (argv[:2] == ["pct", "create"] and not self.privileged_oci_fixed and "--unprivileged" in argv
+                and argv[argv.index("--unprivileged") + 1] == "0"):
+            msg = f"Detected OCI archive\nunable to create CT {argv[2]} - setgid(0): Invalid argument\n"
+            return subprocess.CompletedProcess(argv, 255, msg, None)
         exc = self.raise_on.get(key2) or self.raise_on.get(key1)
         if exc is not None:
             raise exc
@@ -84,6 +89,23 @@ class FakePve(Pve):
             ref = argv[argv.index("--reference") + 1]
             self.volids.add(f"{st}:vztmpl/{self.normalize_content_filename(ref)}.tar")
             return '"UPID:pve1:0001:task:"'
+        elif argv[0] == "vzdump" and "--dumpdir" in argv:
+            d = Path(argv[argv.index("--dumpdir") + 1])
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"vzdump-lxc-{argv[1]}-2026_01_01-00_00_00.tar.zst").write_bytes(b"fake")
+        elif argv[:2] == ["pct", "restore"]:
+            vmid = int(argv[2])
+            p = ctconf.CONF_DIR / f"{vmid}.conf"
+            lines = p.read_text().splitlines()
+            flags = dict(zip(argv[4::2], argv[5::2]))
+            if flags.get("--unprivileged") == "0":  # real config simply has no unprivileged: line
+                lines = [line for line in lines if not line.startswith("unprivileged:")]
+            for f, v in flags.items():
+                key = f[2:]
+                if key in ("force", "unprivileged"):
+                    continue
+                lines = [line for line in lines if not line.startswith(f"{key}:")] + [f"{key}: {v}"]
+            p.write_text("\n".join(lines) + "\n")
         elif argv[:2] == ["pvesh", "create"] and argv[2].endswith("/vzdump"):
             return '"UPID:pve1:0002:task:"'
         elif argv[:2] == ["pvesm", "free"]:

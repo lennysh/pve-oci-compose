@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 
 from . import ctconf, refs, state, ui
@@ -170,6 +172,7 @@ class CreateSpec:
     lxc_lines: list[str] = field(default_factory=list)
     pool: str | None = None
     start: bool = False
+    privileged: bool = False  # built unprivileged, then converted (see make_privileged)
 
 
 _SCALAR_FLAGS = [
@@ -240,6 +243,7 @@ def spec_from_service(svc: Service, vmid: int, pool: str | None, description: st
         lxc_lines=svc.strings("lxc_config_lines"),
         pool=pool,
         start=as_flag(svc.get("start")) == "1",
+        privileged=as_flag(svc.get("unprivileged")) == "0",
     )
 
 
@@ -256,24 +260,109 @@ def destroy_partial(pve: Pve, vmid: int, pool_autocreated: str | None = None) ->
             ui.err(f"pve-oci-compose: removed auto-created pool '{pool_autocreated}'")
 
 
+# Options that must not be set while the CT is still the unprivileged intermediate:
+# a protected CT cannot be overwritten by the restore, and HA would race it.
+_DEFER_FOR_RESTORE = ("--protection", "--ha-managed")
+PRIVILEGED_NOTE = "privileged: built unprivileged, then converted via vzdump → pct restore --unprivileged 0"
+
+
+def _pairs(args: list[str]) -> list[tuple[str, str]]:
+    return list(zip(args[::2], args[1::2]))
+
+
+def privileged_plan(spec: CreateSpec) -> tuple[list[str], list[str], list[str]]:
+    """(create args, restore volume args, restore extra args) for a privileged CT.
+
+    Proxmox (pve-container ≤ 6.1.x) cannot unpack an OCI image into a privileged CT: the
+    layers are always extracted in a user namespace, and a privileged CT has no id map
+    (``setgid(0): Invalid argument``). So the CT is created unprivileged and converted.
+
+    The restore gets **only** the volume specs (+ deferred flags): everything else stays
+    as Proxmox derived it from the image at create time. Re-passing e.g. ``--net0`` would
+    drop the ``host-managed=1`` that OCI create enabled, and change the MAC address.
+    """
+    create: list[str] = []
+    extra: list[str] = []
+    volumes = ["--rootfs", spec.rootfs]
+    for flag, val in _pairs(spec.args):
+        if flag == "--unprivileged":
+            create += [flag, "1"]
+        elif flag in _DEFER_FOR_RESTORE:
+            extra += [flag, val]
+        else:
+            create += [flag, val]
+            if re.fullmatch(r"--mp\d+", flag):
+                volumes += [flag, val]
+    return create, volumes, extra
+
+
+def make_privileged(pve: Pve, vmid: int, volume_args: list[str], extra_args: list[str]) -> None:
+    """Convert a freshly created unprivileged CT to privileged, keeping its config.
+
+    vzdump archives the rootfs from inside the CT's id mapping (so the archive holds plain
+    0–65535 ids); restoring it with --unprivileged 0 extracts without a user namespace.
+    Mount-point volumes are recreated and their contents carried over; bind mounts kept.
+    """
+    base = Path(os.environ.get("PVE_OCI_PRIV_DUMPDIR") or "/var/tmp/pve-oci-compose")
+    d = base / f"priv-{vmid}-{os.getpid()}"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        pve.run(["vzdump", str(vmid), "--dumpdir", str(d), "--mode", "stop", "--compress", "zstd"])
+        archives = sorted(d.glob(f"vzdump-lxc-{vmid}-*.tar.zst"))
+        if not archives:
+            raise ComposeError(f"vzdump of CT {vmid} produced no archive in {d}")
+        pve.run(["pct", "restore", str(vmid), str(archives[-1]), "--force", "1", "--unprivileged", "0",
+                 *volume_args, *extra_args])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# pve-container ≤ 6.1.x: privileged OCI create dies while unpacking (no id map for the
+# user namespace). Matched to fall back to make_privileged(); once Proxmox ships the fix the
+# direct create simply succeeds and no conversion happens.
+_PRIV_OCI_BUG = re.compile(r"setgid\(0\): Invalid argument")
+
+
+def _run_create(pve: Pve, argv: list[str], vmid: int, pool_autocreated: str | None):
+    try:
+        cp = pve.run(argv, check=False)
+    except BaseException:  # Ctrl-C / SIGTERM / SIGHUP while pct create runs
+        destroy_partial(pve, vmid, pool_autocreated)
+        raise
+    if cp.returncode != 0:
+        destroy_partial(pve, vmid, None)
+    return cp
+
+
 def create_ct(pve: Pve, t: Template, spec: CreateSpec,
               pool_autocreated: str | None = None) -> None:
-    """pct create + post-create config. Any failure destroys the new CT, then re-raises."""
+    """pct create + post-create config. Any failure destroys the new CT, then re-raises.
+
+    Privileged CTs are created directly when Proxmox can; on the known OCI unpack bug they
+    are created unprivileged and converted (see privileged_plan / make_privileged)."""
     if pve.exists_here(spec.vmid):
         raise ComposeError(f"VMID {spec.vmid} already exists")
     argv = ["pct", "create", str(spec.vmid), t.ostemplate, "--rootfs", spec.rootfs, *spec.args]
     if pve.dry_run:
         ui.say(f"DRY-RUN: {ui.redact(argv)}")
+        if spec.privileged:
+            _, volumes, deferred = privileged_plan(spec)
+            ui.say("DRY-RUN: if Proxmox rejects the privileged OCI create (setgid(0) bug): create with "
+                   f"--unprivileged 1, vzdump {spec.vmid} --dumpdir …, pct restore {spec.vmid} <archive> "
+                   f"--force 1 --unprivileged 0 {' '.join(volumes + deferred)}")
         if any(spec.env_layers):
             ui.say(f"DRY-RUN: merge env into /etc/pve/lxc/{spec.vmid}.conf: {sorted({k for l in spec.env_layers for k in l})}")
         if spec.lxc_lines:
             ui.say(f"DRY-RUN: append {len(spec.lxc_lines)} lxc_config_lines to /etc/pve/lxc/{spec.vmid}.conf")
         return
-    try:
-        cp = pve.run(argv, check=False)
-    except BaseException:  # Ctrl-C / SIGTERM / SIGHUP while pct create runs
-        destroy_partial(pve, spec.vmid, pool_autocreated)
-        raise
+
+    convert: tuple[list[str], list[str]] | None = None
+    cp = _run_create(pve, argv, spec.vmid, pool_autocreated)
+    if cp.returncode != 0 and spec.privileged and _PRIV_OCI_BUG.search(cp.stdout or ""):
+        create_args, volumes, deferred = privileged_plan(spec)
+        convert = (volumes, deferred)
+        argv = ["pct", "create", str(spec.vmid), t.ostemplate, "--rootfs", spec.rootfs, *create_args]
+        cp = _run_create(pve, argv, spec.vmid, pool_autocreated)
     if cp.returncode != 0:
         ui.err(cp.stdout or "")
         destroy_partial(pve, spec.vmid, pool_autocreated)
@@ -284,6 +373,9 @@ def create_ct(pve: Pve, t: Template, spec: CreateSpec,
         if any(spec.env_layers):
             ctconf.merge_env(spec.vmid, spec.env_layers)
         ctconf.append_lines(spec.vmid, spec.lxc_lines)
+        if convert:
+            make_privileged(pve, spec.vmid, *convert)
+            ui.muted(PRIVILEGED_NOTE)
     except BaseException as e:
         destroy_partial(pve, spec.vmid, pool_autocreated)
-        raise ComposeError(f"post-create config of CT {spec.vmid} failed ({e}); new CT removed") from e
+        raise ComposeError(f"post-create setup of CT {spec.vmid} failed ({e}); new CT removed") from e

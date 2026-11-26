@@ -124,7 +124,7 @@ The file is YAML with a single top-level mapping.
 | `cmode`, `console`, `tty`, `bwlimit` | optional | **`pct --cmode`**, **`--console`**, **`--tty`**, **`--bwlimit`**. |
 | `lxc_dev` | optional | List of device specs → **`--dev0`**, **`--dev1`**, … in list order (see **`pct(1)`** / **`--dev[n]`**). |
 | `unused_disks` | optional | List of volume specs → **`--unused0`**, … (advanced; see Proxmox docs). |
-| `unprivileged`, `onboot` | optional | YAML booleans or integers; mapped to `pct` flags on create. Default **`1`** in **`compose.example.yaml`**. **`unprivileged: 0`** with OCI images fails on current **`pve-container`** releases — see [Known limitations](#privileged-containers-from-oci-images-unprivileged-0). |
+| `unprivileged`, `onboot` | optional | YAML booleans or integers; mapped to `pct` flags on create. Default **`1`** in **`compose.example.yaml`**. **`unprivileged: 0`** works despite a Proxmox OCI bug — see [Privileged containers](#privileged-containers-unprivileged-0). |
 | `mounts` | optional | List of strings **`STORAGE:GiB:/absolute/path-in-CT`** or **`STORAGE:GiB:/path:extra`** where **`extra`** is comma-separated **`pct`** `mp` flags (fourth **`:`** field: the first **`:`** after the path starts **`extra`**). The path itself must not contain **`:`**. If **`extra`** does not include **`backup=`**, **`backup=1`** is appended so **vzdump** includes the volume by default; use **`…:backup=0`** to exclude. **`bind_mounts`** stay full strings (set **`backup=`** yourself if needed). |
 | `bind_mounts` | optional | List of strings for host bind mounts: each entry is the full **`pct`** `mp` value (absolute **host** path, comma-separated options including **`mp=`** guest path), e.g. `/mnt/pve/nfs-media,mp=/mnt/Media01,shared=1,replicate=0,size=0T`. Passed as **`--mp-bind`** after **`mounts`** (indexes continue as **`mp0`**, **`mp1`**, …). Compose checks for `/` + `,mp=`; Proxmox still validates at **`pct create`**. |
 | `lxc_config_lines` | optional | List of strings appended **after** a successful **`pct create`** into **`/etc/pve/lxc/<vmid>.conf`** (low-level **`lxc.*`** / **`lxc.mount.entry`** style lines, **`KEY: value`** or **`KEY = value`**). Separate from **`env`** (see above). No **`#` comment markers** in the conf file — Proxmox surfaces **`#` lines from `.conf` in the CT Notes UI. Only runs when **apply** actually creates the CT (not when the vmid already exists). |
@@ -174,6 +174,7 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 | **`COMPOSE_FILE`** | Default compose path when **`-f`** is not passed (see above). |
 | **`PVE_OCI_COMPOSE_NO_WRITE=1`** | Same as **`--no-write-compose`** (skip vmid writeback after **apply**). |
 | **`PVE_OCI_ROOTFS_MARKER`** | Path inside the CT rootfs for the JSON marker (default **`/etc/pve-oci-compose.json`**). |
+| **`PVE_OCI_PRIV_DUMPDIR`** | Where the temporary vzdump archive goes while converting a new CT to privileged (default **`/var/tmp/pve-oci-compose`**; removed afterwards). See [Privileged containers](#privileged-containers-unprivileged-0). |
 | **`PVE_OCI_STATE_DIR`** | Node-local state directory (default **`/var/lib/pve-oci-compose`**); holds **`templates.json`**, the digest each vztmpl template was pulled at. Safe to delete (templates are re-downloaded once). |
 | **`PVE_OCI_POOL_NO_AUTOCREATE=1`** | Do not auto-create missing Datacenter resource pools; pool must exist before **apply** / **refresh**. |
 | **`PVE_OCI_VERBOSE=1`** | Show extra detail and the full **`pct`** / **`pvesh`** / **`skopeo`** command lines (passwords redacted). |
@@ -256,57 +257,25 @@ Each **plan** / **refresh** therefore makes one registry request per managed ser
 - **Short image names**: bare refs like **`traefik:v3.7.3`** are expanded to **`docker.io/library/traefik:v3.7.3`** before **oci-registry-pull** / skopeo (same rules as Docker Hub). Use a full registry path (**`ghcr.io/…`**, **`docker.io/…`**) when the image is not on Docker Hub.
 - **Clusters**: run **refresh** on the node that owns the CT (**`pct mount`** / **`rsync`** need local storage). If you run it elsewhere, the driver resolves the guest via the API (and **`node:`** in compose) and errors with the hosting node name instead of “vmid does not exist.”
 
-## Known limitations
+## Privileged containers (`unprivileged: 0`)
 
-These are **Proxmox VE / `pve-container` behaviour**, not bugs in the compose driver. The tool passes **`--unprivileged`** straight through to **`pct create`** (see **`pve_oci_compose/create.py`**); when Proxmox fails during OCI unpack, **`apply`** fails the same way a manual **`pct create`** would.
+Supported, with an automatic workaround for a Proxmox bug.
 
-### Privileged containers from OCI images (`unprivileged: 0`)
+**The bug:** `pct create … --unprivileged 0` from an OCI image fails with `setgid(0): Invalid argument` (`pve-container` 6.1.x and earlier). In **`restore_oci_archive()`**, Proxmox always unpacks the OCI layers inside a user namespace (**`run_in_userns()`**); for a privileged CT the id map is empty, so the namespace has no valid ids and the very first `setgid(0)` fails — before any file is extracted. It is not about the uids/gids in the image, so changing the image cannot avoid it. Classic tar templates and backups do not take this code path.
 
-**Symptom:** **`apply`** (or **`pct create … --unprivileged 0`**) fails with:
+**What the tool does** (`apply`, and the temp CT of a **refresh** when the target is privileged):
 
-```text
-unable to create CT <vmid> - Invalid argument
-```
+1. Try the privileged `pct create` directly. When Proxmox ships the fix this simply succeeds and nothing else happens.
+2. On that specific error: create the CT **unprivileged** (Proxmox unpacks the image and derives `entrypoint`, `cmode`, `env`, `host-managed` networking, `lxc.init.*`, … as usual).
+3. **`vzdump --mode stop`** to a local temp dir — vzdump archives an unprivileged CT from inside its id mapping, so the archive holds normal 0–65535 ids.
+4. **`pct restore --force --unprivileged 0`** with only the volume specs (`rootfs`, `mpN`) re-passed, so everything Proxmox derived from the image is kept as-is (re-passing e.g. `net0` would drop `host-managed=1` and change the MAC). `protection` / `ha_managed` are applied by this restore (a protected CT could not be overwritten). Mount-point volumes are recreated and their contents carried over; bind mounts are kept (their host files are not touched — set host ownership yourself).
+5. The temp archive is deleted; any failure removes the half-built CT like every other create failure.
 
-**Cause:** In **`restore_oci_archive()`** (`pve-container`), OCI layer extraction always runs inside a user namespace via **`run_in_userns()`**. For **unprivileged** CTs, **`parse_id_maps()`** supplies UID/GID mappings; for **privileged** CTs the map is **empty**, extraction fails with **`EINVAL`**, and create aborts. Classic **tar** LXC templates do not hit this path.
+Cost: one extra copy of the (fresh) rootfs — about 20–30 s for a small image on ZFS. For **refresh** this happens while the target is still running, so it adds no downtime. Temp archives go to **`PVE_OCI_PRIV_DUMPDIR`** (default **`/var/tmp/pve-oci-compose`**); it needs room for one compressed rootfs.
 
-**Affected in this repo:** Any service with **`unprivileged: 0`** (or YAML **`unprivileged: false`**) on **apply** or on the disposable temp CT during **refresh** when the target CT is privileged. The default in **`compose.example.yaml`** is **`unprivileged: 1`**, which avoids the issue.
+**Upstream status:** fixed in a [pve-devel patch (Nov 2025)](https://lore.proxmox.com/pve-devel/20251125141922.165771-1-f.schauer@proxmox.com/), not yet in released packages as of `pve-container` 6.1.24 ([forum report](https://forum.proxmox.com/threads/proxmox-virtual-environment-9-1-available.176255/post-818600), [independent analysis](https://github.com/bpg/terraform-provider-proxmox/issues/2513)). No change is needed here when it lands — step 1 starts succeeding.
 
-**Upstream status (check your node):** As of **`pve-container` 6.1.10**, the fix is **not** in released packages. Verify:
-
-```bash
-pveversion -v | grep pve-container
-grep -n 'if (@\$id_map)' /usr/share/perl5/PVE/LXC/Create.pm   # no output = still broken
-```
-
-When Proxmox ships the fix, the changelog should mention **oci create: fix creating privileged containers** and **`Create.pm`** will contain **`if (@$id_map)`** inside **`restore_oci_archive()`**.
-
-**References:**
-
-| Link | What it is |
-|------|------------|
-| [Proxmox pve-devel patch (Nov 2025)](https://lore.proxmox.com/pve-devel/20251125141922.165771-1-f.schauer@proxmox.com/) | Upstream one-file fix (`src/PVE/LXC/Create.pm`) — patch series, not a GitHub PR |
-| [Proxmox forum report](https://forum.proxmox.com/threads/proxmox-virtual-environment-9-1-available.176255/post-818600) | Original user report referenced in the patch |
-| [bpg/terraform-provider-proxmox #2513](https://github.com/bpg/terraform-provider-proxmox/issues/2513) | Independent write-up with root-cause analysis and links into **`pve-container`** source |
-| [`PVE/LXC/Create.pm` on git.proxmox.com](https://git.proxmox.com/?p=pve-container.git;a=blob;f=src/PVE/LXC/Create.pm;hb=HEAD) | Current upstream **`restore_oci_archive()`** |
-| [proxmox/pve-container mirror](https://github.com/proxmox/pve-container) | Read-only GitHub mirror of **`pve-container`** |
-
-**Workarounds:**
-
-1. **Prefer unprivileged** (recommended for OCI/app containers): omit **`unprivileged`** or set **`unprivileged: 1`**. Use **`features`** (**`nesting`**, **`keyctl`**, **`fuse`**, …) and bind mounts where you need extra capability — same guidance as Proxmox OCI docs.
-2. **Unprivileged create, then privileged restore:** create with **`unprivileged: 1`**, then convert once on the node (minimal same-VMID flow):
-   ```bash
-   VMID=<id> STORAGE=<backup-storage>
-   pct stop $VMID
-   vzdump $VMID --storage $STORAGE --mode stop
-   pct destroy $VMID
-   pct restore $VMID "$(ls -1t /var/lib/vz/dump/vzdump-lxc-${VMID}-*.tar.* | head -1)" --unprivileged 0
-   pct start $VMID
-   ```
-   Update compose to **`unprivileged: 0`** afterward for accurate **plan** output (**apply** will not recreate an existing CT).
-3. **Local hotfix (advanced):** Back up **`/usr/share/perl5/PVE/LXC/Create.pm`** and apply the [pve-devel patch](https://lore.proxmox.com/pve-devel/20251125141922.165771-1-f.schauer@proxmox.com/) until an official **`pve-container`** release includes it. **`apt upgrade pve-container`** will overwrite the file — re-apply or wait for upstream.
-
-**Not a workaround:** Setting **`unprivileged: 0`** in compose alone, or **`pct set`** on an existing CT — Proxmox does not support flipping privilege in place for OCI-created rootfs the way **restore** does.
+**Existing unprivileged CTs** are not converted by changing `unprivileged:` in compose (create-only setting, like Proxmox itself). To switch one, recreate it, or convert it once by hand with the same vzdump → `pct restore --unprivileged 0` sequence.
 
 ## Help
 

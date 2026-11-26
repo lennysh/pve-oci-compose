@@ -24,4 +24,5 @@ def state_dir(tmp_path, monkeypatch):
     """Keep the template digest record out of /var/lib."""
     d = tmp_path / "state"
     monkeypatch.setenv("PVE_OCI_STATE_DIR", str(d))
+    monkeypatch.setenv("PVE_OCI_PRIV_DUMPDIR", str(tmp_path / "dumps"))
     return d

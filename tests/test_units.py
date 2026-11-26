@@ -268,3 +268,27 @@ def test_signal_handlers_raise_terminated():
     finally:
         for s, h in old.items():
             signal.signal(s, h)
+
+
+def test_privileged_plan_restore_gets_only_volumes():
+    from pve_oci_compose.create import privileged_plan
+
+    svc = C.Service("x", {
+        "rootfs": "Storage:4", "unprivileged": False, "protection": True, "ha_managed": True,
+        "net0": "name=eth0,bridge=vmbr0,ip=dhcp", "mounts": ["Storage:2:/data"],
+        "bind_mounts": ["/mnt/nfs,mp=/media"], "memory": 512,
+    })
+    spec = spec_from_service(svc, 300, None, None)
+    assert spec.privileged
+    create, volumes, extra = privileged_plan(spec)
+    cpairs = dict(zip(create[::2], create[1::2]))
+    assert cpairs["--unprivileged"] == "1"  # Proxmox can only unpack OCI unprivileged
+    assert "--protection" not in cpairs and "--ha-managed" not in cpairs  # would block the restore
+    assert cpairs["--mp0"] == "Storage:2,mp=/data,backup=1" and cpairs["--memory"] == "512"
+    # restore: volumes only — re-passing net0 would drop OCI's host-managed=1 and the MAC
+    assert volumes == ["--rootfs", "Storage:4", "--mp0", "Storage:2,mp=/data,backup=1", "--mp1", "/mnt/nfs,mp=/media"]
+    assert extra == ["--protection", "1", "--ha-managed", "1"]
+
+
+def test_unprivileged_spec_is_not_converted():
+    assert not spec_from_service(C.Service("x", {"rootfs": "s:1"}), 1, None, None).privileged
