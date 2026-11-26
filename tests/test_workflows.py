@@ -357,3 +357,98 @@ def test_temp_ct_is_tagged(tmp_path):
     commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
     create = pve.cmds("pct create 200")[0]
     assert create[create.index("--tags") + 1] == "pve-oci-compose-temp"
+
+
+# ---- privileged CTs (Proxmox cannot unpack OCI images into them directly) -------------------
+
+PRIV = COMPOSE.replace("    start: true\n", "    start: true\n    unprivileged: false\n    protection: true\n")
+
+
+def test_apply_privileged_converts_via_vzdump_restore(tmp_path, chown_calls):
+    p = tmp_path / "compose.yaml"
+    p.write_text(PRIV)
+    pve = FakePve(tmp_path)
+    commands.apply(pve, C.load(p), commands.Options())
+    create = pve.cmds("pct create 200")[-1]  # [0] is the direct attempt that hits the Proxmox bug
+    assert create[create.index("--unprivileged") + 1] == "1" and "--protection" not in create
+    vz = pve.cmds("vzdump 200")[0]
+    restore = pve.cmds("pct restore 200")[0]
+    assert vz[vz.index("--mode") + 1] == "stop"
+    assert restore[4:] [:4] == ["--force", "1", "--unprivileged", "0"]
+    assert "--net0" not in restore and "--hostname" not in restore
+    assert restore[restore.index("--protection") + 1] == "1"
+    # order: create → vzdump → restore → marker/inject → start
+    calls = [" ".join(c) for c in pve.calls]
+    idx = lambda pre: next(i for i, c in enumerate(calls) if c.startswith(pre))
+    assert idx("pct create") < idx("vzdump") < idx("pct restore") < idx("pct mount 200") < idx("pct start 200")
+    conf = (ctconf.CONF_DIR / "200.conf").read_text()
+    assert "unprivileged:" not in conf and "protection: 1" in conf
+    assert "env: PATH=/usr/bin\0IMAGE_VAR=1\0APP=1" in conf  # post-create env survived the restore
+    # privileged → injected files keep real ids (no +100000 shift)
+    owners = {os.path.relpath(path, tmp_path / "lxc/200/rootfs"): (u, g) for path, u, g in chown_calls}
+    assert owners["etc/app.conf"] == (0, 0)
+    assert (tmp_path / "dumps").is_dir() and not any((tmp_path / "dumps").iterdir())  # archive removed
+
+
+def test_apply_privileged_restore_failure_removes_ct(tmp_path):
+    p = tmp_path / "compose.yaml"
+    p.write_text(PRIV)
+    pve = FakePve(tmp_path)
+    pve.fail["pct restore"] = 255
+    with pytest.raises(ComposeError, match="new CT removed"):
+        commands.apply(pve, C.load(p), commands.Options())
+    assert 200 not in pve.cts and "vmid: next" in p.read_text()
+    assert not any((tmp_path / "dumps").iterdir())  # archive removed even on failure
+
+
+def test_refresh_privileged_target_gets_privileged_temp(tmp_path):
+    pve = FakePve(tmp_path)
+    root = pve.add_ct(105, ["hostname: web", "rootfs: local-zfs:subvol-105-disk-0,size=8G",
+                            "tags: pve-oci-compose"], status="running")  # no unprivileged: line = privileged
+    (root / "etc/pve-oci-compose.json").write_text(json.dumps({"service": "web", "ref": "ghcr.io/o/web:0.9"}))
+    commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
+    calls = [" ".join(c) for c in pve.calls]
+    idx = lambda pre: next(i for i, c in enumerate(calls) if c.startswith(pre))
+    # temp CT converted to privileged *before* the target goes down (no extra downtime)
+    assert idx("pct create 200") < idx("vzdump 200") < idx("pct restore 200") < idx("pct shutdown 105")
+    assert idx("pct restore 200") < idx("rsync")
+    assert 200 not in pve.cts
+
+
+def test_refresh_unprivileged_target_skips_conversion(tmp_path):
+    pve = FakePve(tmp_path)
+    _managed(pve, tmp_path)  # unprivileged: 1
+    commands.refresh(pve, _refresh_compose(tmp_path), commands.Options())
+    assert not pve.cmds("vzdump") and not pve.cmds("pct restore")
+
+
+def test_privileged_create_direct_when_proxmox_is_fixed(tmp_path):
+    p = tmp_path / "compose.yaml"
+    p.write_text(PRIV)
+    pve = FakePve(tmp_path)
+    pve.privileged_oci_fixed = True
+    commands.apply(pve, C.load(p), commands.Options())
+    create = pve.cmds("pct create 200")
+    assert len(create) == 1 and create[0][create[0].index("--unprivileged") + 1] == "0"
+    assert not pve.cmds("vzdump") and not pve.cmds("pct restore")
+    assert "protection: 1" in (ctconf.CONF_DIR / "200.conf").read_text()
+
+
+def test_privileged_create_tries_direct_first_then_converts(tmp_path):
+    p = tmp_path / "compose.yaml"
+    p.write_text(PRIV)
+    pve = FakePve(tmp_path)
+    commands.apply(pve, C.load(p), commands.Options())
+    creates = pve.cmds("pct create 200")
+    assert [c[c.index("--unprivileged") + 1] for c in creates] == ["0", "1"]
+
+
+def test_other_privileged_create_errors_do_not_trigger_conversion(tmp_path):
+    p = tmp_path / "compose.yaml"
+    p.write_text(PRIV)
+    pve = FakePve(tmp_path)
+    pve.privileged_oci_fixed = True
+    pve.fail["pct create"] = 2  # e.g. storage full
+    with pytest.raises(ComposeError):
+        commands.apply(pve, C.load(p), commands.Options())
+    assert len(pve.cmds("pct create")) == 1 and not pve.cmds("vzdump")

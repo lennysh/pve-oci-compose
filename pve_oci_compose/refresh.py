@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from . import ctconf, refs, ui
 from .create import CreateSpec, Template, create_ct, pull, resolve_template
 from .errors import ComposeError
+from .inject import truthy as inject_truthy
 from .pve import TEMP_TAG, Pve, parse_config, parse_upid
 
 
@@ -156,7 +157,9 @@ def refresh_ct(
             for k in ("ostype", "arch", "features", "memory"):
                 if cfg.get(k):
                     args += [f"--{k}", cfg[k]]
-            spec = CreateSpec(vmid=temp, rootfs=alloc, args=args)
+            # same privilege as the target, or rsync would copy shifted (100000+) ownership
+            spec = CreateSpec(vmid=temp, rootfs=alloc, args=args,
+                              privileged=not inject_truthy(cfg.get("unprivileged")))
             temp_created = True
             if template:
                 pull(pve, node, template)
