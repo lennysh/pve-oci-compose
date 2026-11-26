@@ -21,7 +21,10 @@ class FakePve(Pve):
         self.privileged_oci_fixed = False  # pve-container ≤ 6.1.x: privileged OCI create fails
         self.pools: dict[str, list[int]] = {}
         self.qemu: set[int] = set()
-        self.digests: dict[str, str | None] = {}  # normalized ref -> registry digest (fake registry)
+        self.digests: dict[str, str | None] = {}  # normalized ref -> tag (index) digest (fake registry)
+        self.platform_digests: dict[str, str] = {}  # ref -> linux/amd64 entry of a multi-arch index
+        self.index_contents: dict[str, str] = {}  # index digest -> its linux/amd64 entry (history)
+        self.arches: dict[str, str] = {}  # ref -> arch of a single-arch image
         self.volids: set[str] = set()  # templates on storage
         self.inspects: dict[str, dict] = {}  # repo -> skopeo inspect result (Labels, RepoTags)
         self.web: dict[str, object] = {}  # url -> JSON (registry web APIs)
@@ -182,10 +185,25 @@ class FakePve(Pve):
     def storage_has_volid(self, node, storage, volid):
         return volid in self.volids or (Path(self.vztmpl_dir(storage)) / volid.split("vztmpl/", 1)[1]).is_file()
 
-    def registry_digest(self, ref):
+    def registry_resolve(self, ref):
+        """Fake registry: ``digests`` = what a tag points at (index); ``platform_digests`` =
+        its linux/amd64 entry (default: single-arch, same digest); ``arches`` = arch of a
+        single-arch image (non-amd64 → no image for this node)."""
+        from pve_oci_compose.pve import Resolved
+
         if "@sha256:" in ref:
-            return ref.split("@", 1)[1]
-        return self.digests.get(ref, "sha256:" + "0" * 64)
+            idx = ref.split("@", 1)[1]
+            plat = self.index_contents.get(idx, idx)
+            return Resolved(idx, plat, ["linux/amd64"], plat != idx)
+        idx = self.digests.get(ref, "sha256:" + "0" * 64)
+        if idx is None:
+            return None
+        if ref in self.arches and self.arches[ref] != "amd64":
+            return Resolved(idx, None, [f"linux/{self.arches[ref]}"], False)
+        plat = self.platform_digests.get(ref, idx)
+        if plat != idx:
+            self.index_contents[idx] = plat
+        return Resolved(idx, plat, ["linux/amd64", "linux/arm64"] if plat != idx else ["linux/amd64"], plat != idx)
 
     def normalize_content_filename(self, ref):
         return ref.replace("/", "_").replace(":", "_")

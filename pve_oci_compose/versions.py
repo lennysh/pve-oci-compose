@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass, field
 
 from . import refs
+from .pve import host_arch
 
 VERSIONISH = re.compile(r"^v?\d+(\.\d+)+([-+_.][0-9A-Za-z.]+)?$")
 MAX_PROBES = 5  # registry manifest GETs for big repos (rate limits)
@@ -38,8 +39,16 @@ def best_version(tags: list[str]) -> str | None:
     return cands[0] if cands else None
 
 
-def _docker_hub(pve, repo: str, digest: str) -> list[str] | None:
-    """Tags pointing at ``digest`` via the Docker Hub API (tags + digests in one call)."""
+def _hub_match(t: dict, digest: str, index_digest: str, arch: str) -> bool:
+    if index_digest and t.get("digest") == index_digest:
+        return True
+    return any(isinstance(i, dict) and i.get("digest") == digest and i.get("architecture") == arch
+               and (i.get("os") in (None, "linux")) for i in t.get("images") or [])
+
+
+def _docker_hub(pve, repo: str, digest: str, index_digest: str = "") -> list[str] | None:
+    """Tags whose image for this node's platform is ``digest``, via the Docker Hub API
+    (tag list with per-architecture digests, one call per 100 tags)."""
     if not repo.startswith("docker.io/"):
         return None
     path = repo[len("docker.io/"):]
@@ -53,7 +62,7 @@ def _docker_hub(pve, repo: str, digest: str) -> list[str] | None:
         if not isinstance(doc, dict):
             return found or None
         for t in doc.get("results") or []:
-            if isinstance(t, dict) and t.get("digest") == digest:
+            if isinstance(t, dict) and _hub_match(t, digest, index_digest, host_arch()):
                 found.append(str(t.get("name")))
         url = doc.get("next")
         if found or not url:
@@ -61,13 +70,15 @@ def _docker_hub(pve, repo: str, digest: str) -> list[str] | None:
     return found
 
 
-def identify(pve, ref: str, digest: str, inspect: dict | None = None) -> VersionInfo:
-    """Version of the image ``ref`` currently resolves to (``digest``)."""
+def identify(pve, ref: str, digest: str, index_digest: str = "", inspect: dict | None = None) -> VersionInfo:
+    """Version of the image ``ref`` currently resolves to. ``digest`` is the image for this
+    node's platform; a candidate tag matches when it resolves to that same image."""
+    index_digest = index_digest or digest  # single-arch image: the tag points straight at it
     repo, tag, _ = refs.split_ref(ref)
     if tag and VERSIONISH.match(tag):
         return VersionInfo(tag, [], "compose tag")
 
-    hub = _docker_hub(pve, repo, digest)
+    hub = _docker_hub(pve, repo, digest, index_digest)
     if hub:
         others = [t for t in hub if t != tag]
         v = best_version(hub)
@@ -91,7 +102,8 @@ def identify(pve, ref: str, digest: str, inspect: dict | None = None) -> Version
         cands = [t for t in cands if VERSIONISH.match(t)][:MAX_PROBES]
     matches = []
     for t in cands:
-        if pve.registry_digest(f"{repo}:{t}") == digest:
+        res = pve.registry_resolve(f"{repo}:{t}")
+        if res is not None and res.digest == digest:
             matches.append(t)
             if not small:  # big repo: the first verified (= most specific) release is enough
                 break

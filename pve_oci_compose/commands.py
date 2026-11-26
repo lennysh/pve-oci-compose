@@ -73,7 +73,7 @@ def _describe(c: Compose, svc: Service, t: Template | None) -> str | None:
     if t is None:
         return description.build(c, svc)
     return description.build(c, svc, t.digest, t.version.version, t.version.aliases,
-                             time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+                             time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()), t.platform or None)
 
 
 def _finalize_description(pve: Pve, c: Compose, svc: Service, vmid: int, t: Template | None) -> None:
@@ -152,7 +152,7 @@ def apply(pve: Pve, c: Compose, o: Options) -> None:
                 try:
                     marker.tag(pve, vmid)
                     with marker.guest_root(pve, vmid) as root:
-                        marker.write_at(root, svc.name, svc.image, template.digest, template.version.version)
+                        marker.write_at(root, svc.name, svc.image, template)
                         injected = _inject(pve, c, svc, vmid, "apply", root)
                 except BaseException as e:
                     destroy_partial(pve, vmid, autocreated)
@@ -201,13 +201,27 @@ def drift(pve: Pve, svc: Service, m: marker.Marker) -> Drift:
         return Drift(False, "image unchanged (pinned digest)")
     if not m.digest:
         return Drift(False, "image ref unchanged; no digest recorded yet (refresh --force once to record it)")
-    current = pve.registry_digest(refs.normalize(svc.image))
-    if current is None:
+    cur = pve.registry_resolve(refs.normalize(svc.image))
+    if cur is None:
         ui.warn(f"[{svc.name}] could not read the registry digest of {svc.image} (offline / rate-limited?)")
         return Drift(False, "image ref unchanged; registry digest unavailable")
-    if current != m.digest:
-        return Drift(True, f"tag {svc.image} was updated on the registry ({_short(m.digest)} → {_short(current)})")
-    return Drift(False, "image unchanged (ref and digest match)")
+    if cur.digest is None:
+        ui.warn(f"[{svc.name}] {svc.image} now has no {cur.platform} image (offered: {', '.join(cur.platforms) or '?'})")
+        return Drift(False, f"tag no longer offers a {cur.platform} image — not refreshing")
+    old = m.digest
+    if not m.platform:
+        # Marker from before platform digests: it holds the tag's *index* digest.
+        if m.digest == cur.index_digest:
+            return Drift(False, "image unchanged (ref and digest match)")
+        prev = pve.registry_resolve(f"{refs.split_ref(refs.normalize(svc.image))[0]}@{m.digest}")
+        if prev is None or prev.digest is None:
+            return Drift(True, f"tag {svc.image} was updated on the registry ({_short(m.digest)} → {_short(cur.index_digest)})")
+        old = prev.digest
+    if old == cur.digest:
+        if (m.index_digest or m.digest) != cur.index_digest:
+            return Drift(False, f"image unchanged for {cur.platform} (tag moved, only other architectures changed)")
+        return Drift(False, "image unchanged (ref and digest match)")
+    return Drift(True, f"tag {svc.image} was updated on the registry ({_short(old)} → {_short(cur.digest)})")
 
 
 def _short(d: str) -> str:
@@ -285,11 +299,12 @@ def refresh(pve: Pve, c: Compose, o: Options) -> None:
         tl = ui.Timeline(5)
         tl.header(svc.name, f"CT {vmid}", "refresh", old=old_ref, new=svc.image, reason=reason,
                   old_version=m.version if m else None, new_version=template.version.version if template else None,
-                  old_digest=m.digest if m else None, new_digest=template.digest if template else None)
+                  old_digest=m.digest if (m and m.platform) else None,  # legacy markers hold an index digest
+                  new_digest=template.digest if template else None)
         _warn_config_drift(pve, svc, vmid)
 
         def on_rootfs(root: str, t, svc=svc, vmid=vmid) -> list[str]:
-            marker.write_at(root, svc.name, svc.image, t.digest if t else None, t.version.version if t else None)
+            marker.write_at(root, svc.name, svc.image, t)
             return _inject(pve, c, svc, vmid, "refresh", root)
 
         res = refresh_ct(pve, vmid, svc.image, ro, on_rootfs,
@@ -330,12 +345,13 @@ def pull_only(pve: Pve, c: Compose, o: Options) -> None:
 def _plan_available(pve: Pve, svc: Service, m: marker.Marker) -> None:
     """What the compose ref resolves to right now (digest + version when known)."""
     norm = refs.normalize(svc.image)
-    digest = pve.registry_digest(norm)
-    if not digest:
+    res = pve.registry_resolve(norm)
+    if not res or not res.digest:
         return
+    digest = res.digest
     from . import versions  # network lookups only when an update is in play
 
-    v = versions.identify(pve, norm, digest)
+    v = versions.identify(pve, norm, digest, res.index_digest)
     now = v.version or ui.short_digest(digest)
     was = m.version or (ui.short_digest(m.digest) if m.digest else "unknown (older marker)")
     ui.say(f"  registry now:  {now}" + (f"  ({v.source})" if v.version else "  (version unknown)")

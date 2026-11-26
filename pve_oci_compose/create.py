@@ -57,10 +57,12 @@ def pick_template_storage(pve: Pve, node: str, requested: str | None) -> str:
 class Template:
     storage: str
     input_ref: str  # normalized compose ref, e.g. ghcr.io/blakeblackshear/frigate:stable
-    digest: str  # what the ref resolved to — the image that gets pulled and runs
+    digest: str  # the image for this node's platform — what gets pulled and runs
     ostemplate: str  # <storage>:vztmpl/<name>_sha256-<digest16>.tar
     local_tar: str | None
     version: versions.VersionInfo = field(default_factory=versions.VersionInfo)
+    index_digest: str = ""  # what the tag points at (multi-arch index); "" = same as digest
+    platform: str = ""  # e.g. linux/amd64
 
     @property
     def repo(self) -> str:
@@ -82,22 +84,33 @@ def template_basename(pve: Pve, ref: str) -> str:
 
 
 def resolve_template(pve: Pve, node: str, ref: str, storage: str | None, identify: bool = True) -> Template:
-    """Resolve ``ref`` to its current digest (read-only). The digest — not a tag name — is
-    what gets pulled, so a compose file can stay on :latest / :stable and still get exactly
-    the image the registry serves right now. The version is looked up for display only."""
+    """Resolve ``ref`` to the digest of the image for this node's platform (read-only).
+
+    That digest — not a tag name — is what gets pulled, so a compose file can stay on
+    :latest / :stable and still get exactly the image the registry serves right now. For a
+    multi-arch tag it is the linux/<arch> entry (so rebuilds of other architectures do not
+    look like updates); an image without a variant for this node is refused here, before
+    anything is touched. The version is looked up for display only."""
     st = pick_template_storage(pve, node, storage)
     norm = refs.normalize(ref)
     if norm != refs.strip_scheme(ref):
         ui.detail(f"Normalized registry ref: {ref} → {norm}")
-    digest = pve.registry_digest(norm)
-    if not digest:
+    res = pve.registry_resolve(norm)
+    if res is None:
         raise ComposeError(f"registry image not found or not reachable: docker://{norm}")
+    if res.digest is None:
+        offered = ", ".join(res.platforms) or "unknown"
+        raise ComposeError(
+            f"{norm} has no {res.platform} image (offered: {offered}) — it cannot run on this node"
+        )
+    digest = res.digest
     fname = f"{template_basename(pve, norm)}_sha256-{digest.split(':', 1)[1][:DIGEST_LEN]}"
     d = pve.vztmpl_dir(st)
     local = os.path.join(d, f"{fname}.tar") if d and os.path.isdir(d) else None
-    t = Template(st, norm, digest, f"{st}:vztmpl/{fname}.tar", local)
+    t = Template(st, norm, digest, f"{st}:vztmpl/{fname}.tar", local,
+                 index_digest=res.index_digest, platform=res.platform)
     if identify:
-        t.version = versions.identify(pve, norm, digest)
+        t.version = versions.identify(pve, norm, digest, res.index_digest)
     return t
 
 

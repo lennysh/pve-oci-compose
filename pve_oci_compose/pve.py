@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import platform
 import re
 import socket
 import subprocess
@@ -21,6 +23,43 @@ from .errors import CommandError, ComposeError
 MARKER_TAG = "pve-oci-compose"
 TEMP_TAG = "pve-oci-compose-temp"  # disposable refresh source CTs
 OCI_PULL_STORAGE_TYPES = ("dir", "nfs", "cifs")
+
+
+_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "arm", "i686": "386"}
+
+
+def host_arch() -> str:
+    """OCI architecture name of this node (PVE_OCI_ARCH overrides)."""
+    return os.environ.get("PVE_OCI_ARCH") or _ARCH.get(platform.machine().lower(), platform.machine().lower())
+
+
+@dataclass
+class Resolved:
+    """What a registry ref points to, seen from this node."""
+
+    index_digest: str  # digest of what the tag points at (multi-arch index or single manifest)
+    digest: str | None  # the image for this node's platform; None = not available for it
+    platforms: list[str]  # platforms offered ("linux/amd64", …)
+    multi: bool  # True when the tag points at a multi-arch index
+
+    @property
+    def platform(self) -> str:
+        return f"linux/{host_arch()}"
+
+
+def pick_platform(doc: dict, arch: str) -> tuple[str | None, list[str]]:
+    """From an OCI index / Docker manifest list: (digest for linux/<arch>, offered platforms).
+    Skips buildx attestation entries (platform unknown/unknown)."""
+    chosen, plats = None, []
+    for m in doc.get("manifests") or []:
+        p = m.get("platform") or {}
+        os_, a = p.get("os"), p.get("architecture")
+        if not a or os_ == "unknown" or a == "unknown":
+            continue
+        plats.append(f"{os_}/{a}" + (f"/{p['variant']}" if p.get("variant") else ""))
+        if chosen is None and os_ == "linux" and a == arch:
+            chosen = m.get("digest")
+    return chosen, plats
 
 
 def unwrap(doc):
@@ -341,14 +380,7 @@ class Pve:
         except json.JSONDecodeError:
             return None
 
-    def registry_digest(self, ref: str) -> str | None:
-        """Current manifest digest of a (normalized) registry ref, or None if unreachable.
-
-        sha256 of the raw top-level manifest (multi-arch index or single manifest) — the
-        same value the registry reports as the tag's digest. One manifest GET, no blobs.
-        """
-        if "@sha256:" in ref:
-            return ref.split("@", 1)[1]
+    def _raw_manifest(self, ref: str) -> bytes | None:
         try:
             cp = subprocess.run(
                 ["skopeo", "inspect", "--raw", f"docker://{ref}"],
@@ -357,9 +389,35 @@ class Pve:
             )
         except FileNotFoundError:
             return None
-        if cp.returncode != 0 or not cp.stdout:
+        return cp.stdout if cp.returncode == 0 and cp.stdout else None
+
+    def registry_resolve(self, ref: str) -> Resolved | None:
+        """Resolve a ref to the image for this node's platform; None if unreachable.
+
+        One manifest GET: its sha256 is the tag's (index) digest, and for a multi-arch index
+        the linux/<arch> entry is the image that will actually be pulled and run. A
+        single-arch image costs one more request (its config) to verify the architecture.
+        """
+        raw = self._raw_manifest(ref)
+        if raw is None:
             return None
-        return "sha256:" + hashlib.sha256(cp.stdout).hexdigest()
+        index_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            doc = {}
+        arch = host_arch()
+        if isinstance(doc, dict) and "manifests" in doc:
+            chosen, plats = pick_platform(doc, arch)
+            return Resolved(index_digest, chosen, plats, True)
+        from .refs import split_ref
+
+        info = self.skopeo_inspect(f"{split_ref(ref)[0]}@{index_digest}") or {}
+        a, o = info.get("Architecture"), info.get("Os") or "linux"
+        if not a:  # cannot tell — do not block (rare: registry without config access)
+            return Resolved(index_digest, index_digest, [], False)
+        ok = a == arch and o == "linux"
+        return Resolved(index_digest, index_digest if ok else None, [f"{o}/{a}"], False)
 
     def http_json(self, url: str, timeout: float = 10.0):
         """GET a JSON document (registry web APIs); None on any failure."""

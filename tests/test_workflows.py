@@ -40,7 +40,8 @@ def test_apply_creates_tags_marks_writes_back_and_starts(setup, tmp_path):
     assert 200 in pve.cts
     root = tmp_path / "lxc/200/rootfs"
     assert json.loads((root / "etc/pve-oci-compose.json").read_text()) == {
-        "service": "web", "ref": "ghcr.io/o/web:1.0", "digest": "sha256:" + "0" * 64, "version": "1.0"}
+        "service": "web", "ref": "ghcr.io/o/web:1.0", "digest": "sha256:" + "0" * 64, "version": "1.0",
+        "platform": "linux/amd64"}
     assert (root / "etc/app.conf").read_text() == "hello\n"
     conf = (ctconf.CONF_DIR / "200.conf").read_text()
     assert "tags: pve-oci-compose" in conf
@@ -243,7 +244,7 @@ def test_pinned_digest_never_checks_registry(tmp_path, monkeypatch):
     pve = FakePve(tmp_path)
     img = "ghcr.io/o/web@" + D_OLD
     _same_ref(pve, tmp_path, image=img)
-    monkeypatch.setattr(pve, "registry_digest", lambda r: pytest.fail("registry queried"))
+    monkeypatch.setattr(pve, "registry_resolve", lambda r: pytest.fail("registry queried"))
     commands.refresh(pve, _refresh_compose(tmp_path, img), commands.Options())
     assert not pve.cmds("rsync")
 
@@ -496,3 +497,70 @@ def test_refresh_header_and_marker_carry_versions(tmp_path, capsys):
     m = json.loads((root / "etc/pve-oci-compose.json").read_text())
     assert (m["digest"], m["version"]) == (D_NEW, "0.18.3")
     assert f"ghcr.io/o/web@{D_NEW}" in " ".join(pve.cmds("skopeo copy")[0])
+
+
+# ---- architecture: pull the image for this node, ignore other-arch rebuilds ------------------
+
+def test_apply_refuses_image_without_this_platform(tmp_path, setup):
+    pve, p = setup
+    pve.arches["ghcr.io/o/web:1.0"] = "arm64"
+    with pytest.raises(ComposeError, match="has no linux/amd64 image.*linux/arm64"):
+        commands.apply(pve, C.load(p), commands.Options())
+    assert not pve.cmds("skopeo copy") and not pve.cmds("pct create") and not pve.cts
+
+
+def test_multi_arch_pull_uses_platform_digest(tmp_path, setup):
+    pve, p = setup
+    pve.digests["ghcr.io/o/web:1.0"] = "sha256:" + "1" * 64        # index
+    pve.platform_digests["ghcr.io/o/web:1.0"] = "sha256:" + "a" * 64  # its linux/amd64 entry
+    commands.apply(pve, C.load(p), commands.Options())
+    copy = " ".join(pve.cmds("skopeo copy")[0])
+    assert f"ghcr.io/o/web@sha256:{'a' * 64}" in copy and f"_sha256-{'a' * 16}.tar" in copy
+    m = json.loads((tmp_path / "lxc/200/rootfs/etc/pve-oci-compose.json").read_text())
+    assert (m["digest"], m["index_digest"], m["platform"]) == ("sha256:" + "a" * 64, "sha256:" + "1" * 64, "linux/amd64")
+
+
+def _multi_arch_ct(pve, tmp_path, marker_extra):
+    root = _managed(pve, tmp_path, ref="ghcr.io/o/web:stable")
+    (root / "etc/pve-oci-compose.json").write_text(json.dumps({"service": "web", "ref": "ghcr.io/o/web:stable",
+                                                                **marker_extra}))
+    return _refresh_compose(tmp_path, "ghcr.io/o/web:stable")
+
+
+IDX1, IDX2, AMD1, AMD2 = ("sha256:" + c * 64 for c in "1234")
+
+
+def test_other_arch_rebuild_does_not_refresh(tmp_path, capsys):
+    pve = FakePve(tmp_path)
+    c = _multi_arch_ct(pve, tmp_path, {"digest": AMD1, "index_digest": IDX1, "platform": "linux/amd64"})
+    pve.digests["ghcr.io/o/web:stable"] = IDX2          # index moved (arm64 rebuilt) …
+    pve.platform_digests["ghcr.io/o/web:stable"] = AMD1  # … amd64 entry identical
+    commands.refresh(pve, c, commands.Options())
+    assert not pve.cmds("rsync")
+    assert "only other architectures changed" in capsys.readouterr().out
+
+
+def test_this_arch_change_refreshes(tmp_path):
+    pve = FakePve(tmp_path)
+    c = _multi_arch_ct(pve, tmp_path, {"digest": AMD1, "index_digest": IDX1, "platform": "linux/amd64"})
+    pve.digests["ghcr.io/o/web:stable"] = IDX2
+    pve.platform_digests["ghcr.io/o/web:stable"] = AMD2
+    commands.refresh(pve, c, commands.Options())
+    assert pve.cmds("rsync")
+
+
+def test_legacy_index_digest_marker_compat(tmp_path, capsys):
+    """Markers from before platform digests store the tag's index digest."""
+    pve = FakePve(tmp_path)
+    pve.index_contents[IDX1] = AMD1  # what the old index contained for amd64
+    c = _multi_arch_ct(pve, tmp_path, {"digest": IDX1})
+    pve.digests["ghcr.io/o/web:stable"] = IDX1  # unchanged index → no refresh
+    pve.platform_digests["ghcr.io/o/web:stable"] = AMD1
+    commands.refresh(pve, c, commands.Options())
+    assert not pve.cmds("rsync")
+    pve.digests["ghcr.io/o/web:stable"] = IDX2  # index moved, same amd64 image → still no refresh
+    commands.refresh(pve, c, commands.Options())
+    assert not pve.cmds("rsync") and "only other architectures changed" in capsys.readouterr().out
+    pve.platform_digests["ghcr.io/o/web:stable"] = AMD2  # amd64 really changed → refresh
+    commands.refresh(pve, c, commands.Options())
+    assert pve.cmds("rsync")

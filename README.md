@@ -179,6 +179,7 @@ Global options may appear **before or after** the command (`plan`, `apply`, `ref
 | **`PVE_OCI_VERBOSE=1`** | Show extra detail and the full **`pct`** / **`pvesh`** / **`skopeo`** command lines (passwords redacted). |
 | **`NO_COLOR=1`** | Plain output without colours (also automatic when stdout is not a terminal). |
 | **`OCI_CT_CREATE_NET0`** | Default **`pct --net0`** when compose sets no **`netN`** keys (default: `name=eth0,bridge=vmbr0,ip=dhcp`). |
+| **`PVE_OCI_ARCH`** | Override the node architecture used to pick the image from a multi-arch tag (default: detected, e.g. `amd64`). |
 | **`PVE_OCI_KEEP_TEMPLATES=1`** | Keep older digest-named templates of an image instead of removing them after a newer pull (see [Floating tags](#floating-tags-latest-stable--digests-and-versions)). |
 | **`OCI_REFRESH_TEMP_NET0`** | Default **`pct --net0`** for the **disposable temp CT** during **refresh** (default: `name=eth0,bridge=vmbr0,ip=dhcp`). |
 | **`OCI_REFRESH_NO_AUTO_ROLLBACK=1`** | On a **refresh** failure after **`rsync`** started, do **not** **`pct rollback`** automatically; leave the CT stopped and print the rollback command. |
@@ -199,7 +200,8 @@ Per service, the driver checks (non-exhaustive): numeric or **`next`** **`vmid`*
 Guest marker JSON (default path **`/etc/pve-oci-compose.json`**, override with **`PVE_OCI_ROOTFS_MARKER`**) stores:
 
 ```json
-{"service": "<compose service name>", "ref": "<image ref last applied>", "digest": "sha256:<exact image pulled>", "version": "<if known>"}
+{"service": "<compose service name>", "ref": "<image ref last applied>", "digest": "sha256:<image pulled for this platform>",
+ "platform": "linux/amd64", "index_digest": "sha256:<multi-arch index the tag pointed at>", "version": "<if known>"}
 ```
 
 - **`pct rollback`** restores that file with rootfs — **`plan`**, **`--force`**, and drift checks follow the rolled-back tree.
@@ -211,7 +213,7 @@ Guest marker JSON (default path **`/etc/pve-oci-compose.json`**, override with *
 
 Leave the compose file on `latest` / `stable` / `1` / `edge` — it works the same every time:
 
-- **The digest decides what runs.** The ref is resolved to its current digest once, and exactly that digest is copied to template storage (`skopeo copy repo@sha256:…`). Proxmox's own `oci-registry-pull` only accepts `name:tag` (it would re-resolve the tag), so the tool copies by digest itself; any template storage that can hold OCI images is a dir / nfs / cifs store with a host path.
+- **The digest decides what runs.** The ref is resolved once, and exactly that image is copied to template storage (`skopeo copy repo@sha256:…`). For a multi-arch tag this is the entry for the node's platform (`linux/amd64`), so the right architecture is always pulled — and a rebuild of only other architectures (e.g. arm64) is **not** treated as an update. An image with no variant for the node (e.g. arm64-only) is refused before anything is touched: `… has no linux/amd64 image (offered: linux/arm64)`. Proxmox's own `oci-registry-pull` only accepts `name:tag` (it would re-resolve the tag), so the tool copies by digest itself; any template storage that can hold OCI images is a dir / nfs / cifs store with a host path.
 - **Templates are named by digest**: `frigate_stable_sha256-d1a3e0008557bb3f.tar`. An existing file is therefore always the right image (reused as-is); after a newer pull, older `…_sha256-*.tar` files of the same image + tag that this tool created are removed (containers never need their template after create; files with other names are never touched; `PVE_OCI_KEEP_TEMPLATES=1` keeps them).
 - **The version is for humans only, and never guessed.** It comes from, in order: the compose tag itself when it looks like a version (`1.2.3`); Docker Hub's tag list (tags + digests in one request — all aliases of the digest); the image's `org.opencontainers.image.version` label when it looks like a version; digest-verified checks of the newest plain release tags (up to 5 requests; every tag for repos with ≤ 30 tags). A digest match is proof; no match means *unknown* and only the digest is shown.
 - The version and digest appear in the run header (`stable: 0.17.1 → 0.18.3`), in `plan` (`registry now: 0.18.3 (verified tag) · CT has 0.17.1`), in the guest marker, and in the CT notes (**Image**, **Version**, **Also tagged**, **Digest**).
@@ -222,9 +224,12 @@ Tags like **`:latest`**, **`:stable`** or **`:1.27`** can point at a new image w
 
 | Situation | **refresh** |
 |-----------|-------------|
-| digest differs | refreshes (`tag … was updated on the registry (old → new)`) |
+| image for the node's platform differs | refreshes (`tag … was updated on the registry (old → new)`) |
+| tag moved but only other architectures changed | skips (`image unchanged for linux/amd64`) |
+| tag no longer offers the node's platform | skips with a warning |
 | digest matches | skips |
 | marker has no **`digest`** (written by an older version) | skips with a hint — run **`refresh --force`** once to record it |
+| marker has an index **`digest`** but no **`platform`** (written by the previous version) | compared correctly by looking up that index's entry for the node's platform — no extra refresh |
 | registry unreachable / rate-limited | skips with a warning |
 | compose pins a digest (`name@sha256:…`) or a local template | never queries the registry |
 

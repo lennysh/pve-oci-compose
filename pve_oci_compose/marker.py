@@ -27,8 +27,10 @@ def marker_path() -> str:
 class Marker:
     service: str | None
     ref: str | None
-    digest: str | None = None  # registry digest of `ref` when it was pulled (None: older marker)
+    digest: str | None = None  # image pulled (for `platform`); older markers: the tag's index digest
     version: str | None = None  # human version of that digest, if known (display only)
+    index_digest: str | None = None  # what the tag pointed at when pulled (multi-arch index)
+    platform: str | None = None  # e.g. linux/amd64 — set by markers that store a platform digest
 
 
 @contextmanager
@@ -60,7 +62,7 @@ def parse(blob: bytes | None) -> Marker | None:
     def s(k):
         return str(d[k]) if d.get(k) is not None else None
 
-    return Marker(s("service"), s("ref"), s("digest"), s("version"))
+    return Marker(s("service"), s("ref"), s("digest"), s("version"), s("index_digest"), s("platform"))
 
 
 def read(pve: Pve, vmid: int) -> Marker | None:
@@ -74,18 +76,23 @@ def read(pve: Pve, vmid: int) -> Marker | None:
         return None
 
 
-def encode(service: str, ref: str, digest: str | None = None, version: str | None = None) -> bytes:
+def encode(service: str, ref: str, digest: str | None = None, version: str | None = None,
+           index_digest: str | None = None, platform: str | None = None) -> bytes:
     d = {"service": service, "ref": ref}
-    if digest:
-        d["digest"] = digest
-    if version:
-        d["version"] = version
+    for k, v in (("digest", digest), ("platform", platform), ("index_digest", index_digest), ("version", version)):
+        if v:
+            d[k] = v
     return (json.dumps(d, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
 
 
-def write_at(root: str, service: str, ref: str, digest: str | None = None, version: str | None = None) -> None:
+def write_at(root: str, service: str, ref: str, t=None) -> None:
+    """Marker for ``service`` running ``ref``; ``t`` (create.Template) adds digest/platform/version."""
+    blob = encode(service, ref) if t is None else encode(
+        service, ref, t.digest, t.version.version,
+        t.index_digest if t.index_digest and t.index_digest != t.digest else None,  # multi-arch only
+        t.platform or None)
     try:
-        write_file(root, marker_path(), encode(service, ref, digest, version), mode=0o644)
+        write_file(root, marker_path(), blob, mode=0o644)
     except (GuestPathError, OSError) as e:
         raise ComposeError(f"could not write guest marker {marker_path()}: {e}") from e
 

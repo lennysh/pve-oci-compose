@@ -125,9 +125,11 @@ class _Reg:
     def skopeo_inspect(self, ref):
         return {"RepoTags": list(self.digests), "Labels": self.labels}
 
-    def registry_digest(self, ref):
+    def registry_resolve(self, ref):
+        from pve_oci_compose.pve import Resolved
         self.probes.append(ref)
-        return self.digests.get(ref.rsplit(":", 1)[1])
+        d = self.digests.get(ref.rsplit(":", 1)[1])
+        return Resolved(d, d, ["linux/amd64"], False) if d else None
 
     def http_json(self, url, timeout=10.0):
         return self.web.get(url)
@@ -342,3 +344,61 @@ def test_normalize_conf_matches_pct_config_view():
            "lxc.init.cwd: /\n\n[snap]\nmemory: 1\n")
     assert normalize_conf(raw) == ["arch: amd64", "lxc.init.cwd: /", "", "env: PATH=/bin\0VERSION=2.1.4"]
     assert normalize_conf("env: A=1\nlxc.environment.runtime: B=2\n") == ["env: A=1"]  # explicit env wins
+
+
+# ---- platform selection ----------------------------------------------------------------------
+
+INDEX = {
+    "mediaType": "application/vnd.oci.image.index.v1+json",
+    "manifests": [
+        {"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}},
+        {"digest": "sha256:amd", "platform": {"os": "linux", "architecture": "amd64"}},
+        {"digest": "sha256:att", "platform": {"os": "unknown", "architecture": "unknown"}},  # buildx attestation
+    ],
+}
+
+
+def test_pick_platform_skips_attestations():
+    from pve_oci_compose.pve import pick_platform
+    assert pick_platform(INDEX, "amd64") == ("sha256:amd", ["linux/arm64/v8", "linux/amd64"])
+    assert pick_platform(INDEX, "riscv64")[0] is None
+
+
+def _pve_with(monkeypatch, raw: bytes, inspect: dict | None = None):
+    from pve_oci_compose.pve import Pve
+    pve = Pve()
+    monkeypatch.setattr(pve, "_raw_manifest", lambda ref: raw)
+    monkeypatch.setattr(pve, "skopeo_inspect", lambda ref: inspect)
+    monkeypatch.setenv("PVE_OCI_ARCH", "amd64")
+    return pve
+
+
+def test_registry_resolve_multi_arch(monkeypatch):
+    import hashlib
+    import json
+    raw = json.dumps(INDEX).encode()
+    r = _pve_with(monkeypatch, raw).registry_resolve("ghcr.io/o/app:stable")
+    assert r.index_digest == "sha256:" + hashlib.sha256(raw).hexdigest()
+    assert r.digest == "sha256:amd" and r.multi and r.platform == "linux/amd64"
+
+
+def test_registry_resolve_single_arch_guard(monkeypatch):
+    raw = b'{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}'
+    arm = _pve_with(monkeypatch, raw, {"Architecture": "arm64", "Os": "linux"}).registry_resolve("x/y:1")
+    assert arm.digest is None and arm.platforms == ["linux/arm64"]
+    amd = _pve_with(monkeypatch, raw, {"Architecture": "amd64", "Os": "linux"}).registry_resolve("x/y:1")
+    assert amd.digest == amd.index_digest and not amd.multi
+
+
+def test_identify_docker_hub_matches_on_this_platforms_image():
+    """A tag whose index differs (e.g. arm64 rebuilt) but whose amd64 image is the same still matches."""
+    from pve_oci_compose import versions
+    url = "https://hub.docker.com/v2/namespaces/library/repositories/nginx/tags?page_size=100"
+    web = {url: {"results": [
+        {"name": "1.31.9", "digest": "sha256:OTHER-INDEX",
+         "images": [{"architecture": "amd64", "os": "linux", "digest": "sha256:amd"},
+                    {"architecture": "arm64", "os": "linux", "digest": "sha256:arm-new"}]},
+        {"name": "1.30.0", "digest": "sha256:X", "images": [{"architecture": "amd64", "digest": "sha256:old"}]},
+    ], "next": None}}
+    v = versions.identify(_Reg({}, web=web), "docker.io/library/nginx:latest", "sha256:amd", "sha256:IDX")
+    assert v.version == "1.31.9"

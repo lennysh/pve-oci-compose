@@ -55,6 +55,7 @@ def build(
     version: str | None = None,
     aliases: list[str] | None = None,
     synced_at: str | None = None,
+    platform: str | None = None,
 ) -> str | None:
     """Composed CT notes. ``digest`` / ``version`` / ``aliases`` describe the image actually
     pulled (digest = exact identity; version + aliases only when known for sure)."""
@@ -82,7 +83,7 @@ def build(
         more = f", +{len(shown) - MAX_ALIASES} more" if len(shown) > MAX_ALIASES else ""
         lines.append(f"- **Also tagged:** {', '.join(shown[:MAX_ALIASES])}{more}")
     if digest:
-        lines.append(f"- **Digest:** `{digest}`")
+        lines.append(f"- **Digest:** `{digest}`" + (f" ({platform})" if platform else ""))
     if synced_at:
         lines.append(f"- **Template sync:** {synced_at}")
     if body_user:
