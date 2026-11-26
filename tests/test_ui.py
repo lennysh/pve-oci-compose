@@ -37,8 +37,8 @@ def test_timeline_layout(capsys):
     tl.done("Refreshed", [("rollback", "pct rollback 228 snap"), ("", "temp CT 9 removed")])
     out = capsys.readouterr().out.splitlines()
     assert out[1].startswith("━━ app · CT 228 · refresh ━━")
-    assert out[2] == "   ghcr.io/o/app" and out[3].startswith("   v1 → v2") and "(image ref changed)" in out[3]
-    i = next(n for n, line in enumerate(out) if "[1/3] Pull image" in line)
+    assert out[2] == "   ghcr.io/o/app" and out[3].startswith("   v1 → v2") and "(image ref changed)" in out[4]
+    i = next(n for n, line in enumerate(out) if "[1/3] Pull image" in line)  # header now 5 lines
     assert "✓" in out[i] and "pinned x → y" in out[i + 1]
     assert "── downtime starts ──" in out[i + 3]
     assert "–" in out[i + 4] and out[i + 4].rstrip().endswith("skipped")
@@ -69,3 +69,18 @@ def test_header_full_refs_when_repo_changes(capsys):
     ui.Timeline(1).header("a", "CT 1", "refresh", old="docker.io/x/a:1", new="ghcr.io/y/a:1")
     out = capsys.readouterr().out
     assert "   docker.io/x/a:1" in out and "   → ghcr.io/y/a:1" in out
+
+
+def test_image_lines_variants():
+    assert ui.image_lines(None, "docker.io/library/nginx:latest", new_version="1.31.9") == [
+        "   docker.io/library/nginx:latest = 1.31.9"]
+    assert ui.image_lines("ghcr.io/b/frigate:stable", "ghcr.io/b/frigate:stable", "0.17.1", "0.18.3")[1] == \
+        "   stable: 0.17.1 → 0.18.3"
+    # older marker (no digest/version), new version unknown → short digest, never a guess
+    assert ui.image_lines("ghcr.io/b/f:stable", "ghcr.io/b/f:stable", new_digest="sha256:d1a3e0008557bb3f")[1] == \
+        "   stable: previous → d1a3e0008557"
+
+
+def test_image_lines_forced_refresh_same_digest():
+    assert ui.image_lines("r/x:latest", "r/x:latest", "2.1.4", "2.1.4", "sha256:a", "sha256:a")[1] == \
+        "   latest: 2.1.4 (unchanged)"

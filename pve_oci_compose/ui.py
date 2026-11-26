@@ -161,6 +161,44 @@ def split_image(ref: str) -> tuple[str, str]:
     return ref, ""
 
 
+def short_digest(d: str | None) -> str:
+    return d.split(":", 1)[-1][:12] if d else "?"
+
+
+def _ident(tag: str, version: str | None, digest: str | None) -> str:
+    """How to name one side of a change: version if known (and not just the tag), else digest."""
+    if version and version != tag:
+        return version
+    return short_digest(digest) if (digest and not version) else (version or tag or short_digest(digest))
+
+
+def image_lines(old: str | None, new: str, old_version=None, new_version=None,
+                old_digest=None, new_digest=None) -> list[str]:
+    """Header lines for an image (create) or an image change (refresh).
+
+    same ref, moved tag:   ghcr.io/x/frigate · stable: 0.17.1 → 0.18.3
+    tag changed:           ghcr.io/x/app · sha-b723ce8 → sha-2179a47
+    create:                docker.io/library/nginx:latest = 1.31.9
+    """
+    nrepo, ntag = split_image(new)
+    if not old:
+        v = f" = {B}{new_version}{R}" if new_version and new_version != ntag else ""
+        d = f"  {D}{short_digest(new_digest)}{R}" if new_digest and not new_version else ""
+        return [f"   {new}{v}{d}"]
+    orepo, otag = split_image(old)
+    if orepo != nrepo:
+        return [f"   {old}", f"   → {B}{new}{R}"]
+    if otag == ntag:  # floating tag moved (or --force)
+        left = _ident(otag, old_version, old_digest) if (old_version or old_digest) else "previous"
+        right = _ident(ntag, new_version, new_digest)
+        if old_digest and new_digest and old_digest == new_digest:
+            return [f"   {nrepo}", f"   {ntag}: {right} {D}(unchanged){R}"]
+        return [f"   {nrepo}", f"   {ntag}: {left} → {B}{right}{R}"]
+    lv = f" ({old_version})" if old_version and old_version != otag else ""
+    rv = f" ({new_version})" if new_version and new_version != ntag else ""
+    return [f"   {nrepo}", f"   {otag or '(no tag)'}{lv} → {B}{ntag or '(no tag)'}{rv}{R}"]
+
+
 class _Spinner:
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -227,21 +265,16 @@ class Timeline:
 
     # header ---------------------------------------------------------------------------
     def header(self, name: str, what: str, verb: str, old: str | None = None,
-               new: str | None = None, reason: str | None = None) -> None:
+               new: str | None = None, reason: str | None = None,
+               old_version: str | None = None, new_version: str | None = None,
+               old_digest: str | None = None, new_digest: str | None = None) -> None:
         head = f"━━ {name} · {what} · {verb} "
         _write(f"\n{B}{M}{head}{'━' * max(3, _width() - len(head))}{R}", sys.stdout)
         if new:
-            nrepo, ntag = split_image(new)
-            orepo, otag = split_image(old) if old else (None, None)
-            why = f"   {D}({reason}){R}" if reason else ""
-            if old and orepo == nrepo and otag != ntag:
-                _write(f"   {nrepo}", sys.stdout)
-                _write(f"   {otag or '(no tag)'} → {B}{ntag or '(no tag)'}{R}{why}", sys.stdout)
-            elif old and old != new:
-                _write(f"   {old}", sys.stdout)
-                _write(f"   → {B}{new}{R}{why}", sys.stdout)
-            else:
-                _write(f"   {new}{why}", sys.stdout)
+            for line in image_lines(old, new, old_version, new_version, old_digest, new_digest):
+                _write(line, sys.stdout)
+            if reason:
+                _write(f"   {D}({reason}){R}", sys.stdout)
         _write("", sys.stdout)
 
     # steps ----------------------------------------------------------------------------

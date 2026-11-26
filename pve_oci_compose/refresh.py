@@ -100,6 +100,7 @@ def refresh_ct(
     on_rootfs: Callable[[str, Template | None], list[str] | None] | None = None,
     env_layers: list[dict[str, str]] | None = None,
     tl: ui.Timeline | None = None,
+    template: Template | None = None,
 ) -> RefreshResult:
     """Replace CT ``vmid``'s rootfs with ``image``.
 
@@ -116,8 +117,7 @@ def refresh_ct(
     hostname = cfg.get("hostname") or f"vmid{vmid}"
     node = pve.node_name()
 
-    template: Template | None = None
-    if refs.is_registry_ref(image):
+    if template is None and refs.is_registry_ref(image):
         template = resolve_template(pve, node, image, opts.template_storage)
 
     temp = opts.temp_vmid or pve.nextid()
@@ -125,6 +125,8 @@ def refresh_ct(
         raise ComposeError("temp vmid equals the CT being refreshed")
 
     if pve.dry_run:
+        if template:
+            pull(pve, node, template)
         ui.say(f"DRY-RUN: pct create {temp} from {template.ostemplate if template else image} "
                f"(rootfs {alloc}); shutdown CT {vmid}; pre-backup={opts.pre_backup}; rsync -aHAX --delete "
                f"{' '.join(rsync_excludes(lines))} {temp} → {vmid}; destroy {temp}")

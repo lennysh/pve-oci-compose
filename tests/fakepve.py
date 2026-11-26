@@ -23,6 +23,8 @@ class FakePve(Pve):
         self.qemu: set[int] = set()
         self.digests: dict[str, str | None] = {}  # normalized ref -> registry digest (fake registry)
         self.volids: set[str] = set()  # templates on storage
+        self.inspects: dict[str, dict] = {}  # repo -> skopeo inspect result (Labels, RepoTags)
+        self.web: dict[str, object] = {}  # url -> JSON (registry web APIs)
         ctconf.CONF_DIR = tmp / "pve-lxc"
         ctconf.CONF_DIR.mkdir(exist_ok=True)
 
@@ -110,6 +112,11 @@ class FakePve(Pve):
             return '"UPID:pve1:0002:task:"'
         elif argv[:2] == ["pvesm", "free"]:
             self.volids.discard(argv[2])
+            st, _, rest = argv[2].partition(":vztmpl/")
+            (Path(self.vztmpl_dir(st)) / rest).unlink(missing_ok=True)
+        elif argv[:2] == ["skopeo", "copy"]:
+            dest = next(a for a in argv if a.startswith("oci-archive:"))[len("oci-archive:"):]
+            Path(dest).write_bytes(b"oci archive of " + argv[-2].encode())
         return ""
 
     def _set_conf(self, vmid: int, key: str, val: str) -> None:
@@ -173,7 +180,7 @@ class FakePve(Pve):
                 {"storage": "local-zfs", "type": "zfspool", "content": "rootdir,images"}]
 
     def storage_has_volid(self, node, storage, volid):
-        return volid in self.volids
+        return volid in self.volids or (Path(self.vztmpl_dir(storage)) / volid.split("vztmpl/", 1)[1]).is_file()
 
     def registry_digest(self, ref):
         if "@sha256:" in ref:
@@ -184,10 +191,15 @@ class FakePve(Pve):
         return ref.replace("/", "_").replace(":", "_")
 
     def vztmpl_dir(self, storage):
-        return None
+        d = self.tmp / "vztmpl" / storage
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
 
     def skopeo_inspect(self, ref):
-        return {"Name": ref.split(":")[0], "Digest": "sha256:abc", "RepoTags": ["1.0", "latest"]}
+        return self.inspects.get(ref.split("@")[0].rsplit(":", 1)[0], {"RepoTags": [], "Labels": {}})
+
+    def http_json(self, url, timeout=10.0):
+        return self.web.get(url)
 
     def wait_task(self, upid, node=None, max_wait=7200):
         return None

@@ -6,9 +6,9 @@ import time
 from dataclasses import dataclass
 
 from . import compose as C
-from . import description, inject, marker, pools, refs, ui
+from . import configdrift, description, inject, marker, pools, refs, ui
 from .compose import Compose, Service
-from .create import create_ct, destroy_partial, pull, resolve_template, spec_from_service
+from .create import Template, create_ct, destroy_partial, pull, resolve_template, spec_from_service
 from .errors import ComposeError
 from .guestfs import GuestPathError
 from .pve import TEMP_TAG, Pve
@@ -68,10 +68,18 @@ def _inject(pve: Pve, c: Compose, svc: Service, vmid: int, phase: str, root: str
     return [g for _, g in done]
 
 
-def _finalize_description(pve: Pve, c: Compose, svc: Service, vmid: int, pulled: str | None) -> None:
+def _describe(c: Compose, svc: Service, t: Template | None) -> str | None:
+    """CT notes including the exact image (digest) and its version when known."""
+    if t is None:
+        return description.build(c, svc)
+    return description.build(c, svc, t.digest, t.version.version, t.version.aliases,
+                             time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+
+
+def _finalize_description(pve: Pve, c: Compose, svc: Service, vmid: int, t: Template | None) -> None:
     if not description.needs_runtime_update(c, svc):
         return
-    text = description.build(c, svc, pulled or svc.image, time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+    text = _describe(c, svc, t)
     if text:
         pve.mutate(["pct", "set", str(vmid), "--description", text], check=False)
 
@@ -116,17 +124,18 @@ def apply(pve: Pve, c: Compose, o: Options) -> None:
 
         has_files = bool(svc.inject_items())
         start = (C.as_flag(svc.get("start")) == "1")
-        tl = ui.Timeline(3 + int(start))
-        tl.header(svc.name, f"CT {vmid}" + (" (next free)" if spec_vmid == "next" else ""), "create", new=svc.image)
         node = pve.node_name()
         template = resolve_template(pve, node, svc.image, svc.template_storage)
+        tl = ui.Timeline(3 + int(start))
+        tl.header(svc.name, f"CT {vmid}" + (" (next free)" if spec_vmid == "next" else ""), "create",
+                  new=svc.image, new_version=template.version.version, new_digest=template.digest)
         autocreated = None
         try:
             with tl.step(f"Pull image → {template.storage}"):
                 pull(pve, node, template)
             with tl.step(f"Create CT {vmid}"):
                 autocreated = pool if (pool and pools.ensure(pve, pool)) else None
-                spec = spec_from_service(svc, vmid, pool, description.build(c, svc))
+                spec = spec_from_service(svc, vmid, pool, _describe(c, svc, template))
                 create_ct(pve, template, spec, pool_autocreated=autocreated)
             if pve.dry_run:
                 with tl.step("Write marker" + (" + inject files" if has_files else "")):
@@ -143,7 +152,7 @@ def apply(pve: Pve, c: Compose, o: Options) -> None:
                 try:
                     marker.tag(pve, vmid)
                     with marker.guest_root(pve, vmid) as root:
-                        marker.write_at(root, svc.name, svc.image, template.digest)
+                        marker.write_at(root, svc.name, svc.image, template.digest, template.version.version)
                         injected = _inject(pve, c, svc, vmid, "apply", root)
                 except BaseException as e:
                     destroy_partial(pve, vmid, autocreated)
@@ -161,7 +170,6 @@ def apply(pve: Pve, c: Compose, o: Options) -> None:
                 extra.append(("vmid", f"{vmid} written to {c.path.name}"))
             else:
                 extra.append(("vmid", f"{vmid} — set it in {c.path.name} (--no-write-compose)"))
-        _finalize_description(pve, c, svc, vmid, template.pull_ref)
         if pool:
             pools.ensure_member(pve, pool, vmid)
             extra.append(("pool", pool))
@@ -213,6 +221,16 @@ def warn_leftover_temps(pve: Pve) -> None:
                 f"If no refresh is running right now, remove it: pct destroy {v} --purge")
 
 
+def _warn_config_drift(pve: Pve, svc: Service, vmid: int) -> None:
+    diffs = configdrift.compare(svc, pve.config_lines(vmid) or [])
+    if diffs:
+        names = list(dict.fromkeys(d.key.split(" ")[0] if d.key.startswith(("env ", "mount ")) else d.key
+                                   for d in diffs))
+        ui.warn(f"compose differs from CT {vmid} in {len(diffs)} setting(s): "
+                f"{', '.join(names[:6])}{'…' if len(names) > 6 else ''} — refresh keeps the "
+                "CT's config (only env + entrypoint follow the new image/compose); see plan")
+
+
 # ---- refresh -------------------------------------------------------------------------
 
 
@@ -261,20 +279,26 @@ def refresh(pve: Pve, c: Compose, o: Options) -> None:
                 continue
             reason = "tag updated on the registry" if m.ref == svc.image else "image ref changed"
 
+        ro = _refresh_options(svc, o)
+        template = (resolve_template(pve, pve.node_name(), svc.image, ro.template_storage)
+                    if refs.is_registry_ref(svc.image) else None)
         tl = ui.Timeline(5)
-        tl.header(svc.name, f"CT {vmid}", "refresh", old=old_ref, new=svc.image, reason=reason)
+        tl.header(svc.name, f"CT {vmid}", "refresh", old=old_ref, new=svc.image, reason=reason,
+                  old_version=m.version if m else None, new_version=template.version.version if template else None,
+                  old_digest=m.digest if m else None, new_digest=template.digest if template else None)
+        _warn_config_drift(pve, svc, vmid)
 
-        def on_rootfs(root: str, template, svc=svc, vmid=vmid) -> list[str]:
-            marker.write_at(root, svc.name, svc.image, template.digest if template else None)
+        def on_rootfs(root: str, t, svc=svc, vmid=vmid) -> list[str]:
+            marker.write_at(root, svc.name, svc.image, t.digest if t else None, t.version.version if t else None)
             return _inject(pve, c, svc, vmid, "refresh", root)
 
-        res = refresh_ct(pve, vmid, svc.image, _refresh_options(svc, o), on_rootfs,
-                         env_layers=[svc.defaults_env, svc.service_env], tl=tl)
+        res = refresh_ct(pve, vmid, svc.image, ro, on_rootfs,
+                         env_layers=[svc.defaults_env, svc.service_env], tl=tl, template=template)
         if pve.dry_run:
             tl.done("Dry run")
             continue
         marker.tag(pve, vmid)
-        _finalize_description(pve, c, svc, vmid, res.pulled_ref)
+        _finalize_description(pve, c, svc, vmid, template)
         pool = svc.pool(c.project)
         if pool:
             pools.ensure_member(pve, pool, vmid)
@@ -290,7 +314,7 @@ def pull_only(pve: Pve, c: Compose, o: Options) -> None:
         node = pve.node_name()
         t = resolve_template(pve, node, svc.image, svc.template_storage)
         tl = ui.Timeline(1)
-        tl.header(svc.name, "template", "pull", new=svc.image)
+        tl.header(svc.name, "template", "pull", new=svc.image, new_version=t.version.version, new_digest=t.digest)
         try:
             with tl.step(f"Pull image → {t.storage}"):
                 pull(pve, node, t)
@@ -301,6 +325,21 @@ def pull_only(pve: Pve, c: Compose, o: Options) -> None:
 
 
 # ---- plan --------------------------------------------------------------------------------
+
+
+def _plan_available(pve: Pve, svc: Service, m: marker.Marker) -> None:
+    """What the compose ref resolves to right now (digest + version when known)."""
+    norm = refs.normalize(svc.image)
+    digest = pve.registry_digest(norm)
+    if not digest:
+        return
+    from . import versions  # network lookups only when an update is in play
+
+    v = versions.identify(pve, norm, digest)
+    now = v.version or ui.short_digest(digest)
+    was = m.version or (ui.short_digest(m.digest) if m.digest else "unknown (older marker)")
+    ui.say(f"  registry now:  {now}" + (f"  ({v.source})" if v.version else "  (version unknown)")
+           + (f" · CT has {was}" if m.ref == svc.image else ""))
 
 
 def plan(pve: Pve, c: Compose, o: Options) -> None:
@@ -375,6 +414,8 @@ def plan(pve: Pve, c: Compose, o: Options) -> None:
             ui.say("  plan apply:    would REFUSE (wrong service name for this vmid)")
         else:
             ui.say(f"  stored ref:    {m.ref if m and m.ref else '<unreadable here>'}")
+            if m and m.version:
+                ui.say(f"  stored version: {m.version}")
             if m and m.digest:
                 ui.say(f"  stored digest: {m.digest}")
             if not (m and m.ref):
@@ -382,5 +423,14 @@ def plan(pve: Pve, c: Compose, o: Options) -> None:
             else:
                 d = drift(pve, svc, m)
                 ui.say(f"  plan refresh:  {'would run refresh — ' if d.refresh else 'skip — '}{d.reason}")
+                if (d.refresh or not m.digest) and refs.is_registry_ref(svc.image):
+                    _plan_available(pve, svc, m)
             ui.say("  plan apply:    no-op (already exists, compose-managed)")
+            if local:
+                diffs = configdrift.compare(svc, pve.config_lines(vmid) or [])
+                if diffs:
+                    ui.say(f"  config drift:  {len(diffs)} setting(s) differ — refresh keeps the CT's values "
+                           "(except env/entrypoint); update compose or the CT to match")
+                    for dd in diffs:
+                        ui.say(f"    {dd.line()}")
         ui.say()

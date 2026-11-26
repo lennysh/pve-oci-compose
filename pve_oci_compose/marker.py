@@ -28,6 +28,7 @@ class Marker:
     service: str | None
     ref: str | None
     digest: str | None = None  # registry digest of `ref` when it was pulled (None: older marker)
+    version: str | None = None  # human version of that digest, if known (display only)
 
 
 @contextmanager
@@ -59,7 +60,7 @@ def parse(blob: bytes | None) -> Marker | None:
     def s(k):
         return str(d[k]) if d.get(k) is not None else None
 
-    return Marker(s("service"), s("ref"), s("digest"))
+    return Marker(s("service"), s("ref"), s("digest"), s("version"))
 
 
 def read(pve: Pve, vmid: int) -> Marker | None:
@@ -73,16 +74,18 @@ def read(pve: Pve, vmid: int) -> Marker | None:
         return None
 
 
-def encode(service: str, ref: str, digest: str | None = None) -> bytes:
+def encode(service: str, ref: str, digest: str | None = None, version: str | None = None) -> bytes:
     d = {"service": service, "ref": ref}
     if digest:
         d["digest"] = digest
+    if version:
+        d["version"] = version
     return (json.dumps(d, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
 
 
-def write_at(root: str, service: str, ref: str, digest: str | None = None) -> None:
+def write_at(root: str, service: str, ref: str, digest: str | None = None, version: str | None = None) -> None:
     try:
-        write_file(root, marker_path(), encode(service, ref, digest), mode=0o644)
+        write_file(root, marker_path(), encode(service, ref, digest, version), mode=0o644)
     except (GuestPathError, OSError) as e:
         raise ComposeError(f"could not write guest marker {marker_path()}: {e}") from e
 
